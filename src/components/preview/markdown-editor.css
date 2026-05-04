@@ -1,0 +1,62 @@
+/* Milkdown Crepe theme. We import the common rules + the Nord light theme
+ * unconditionally, then redefine the colour variables under `html.dark` so
+ * the editor follows the app's theme without dynamic stylesheet swapping.
+ *
+ * The dark values mirror @milkdown/crepe/theme/nord-dark.css. Keep in sync
+ * if Crepe upgrades introduce new variables. */
+
+@import "@milkdown/crepe/theme/common/style.css";
+@import "@milkdown/crepe/theme/nord.css";
+
+html.dark .milkdown {
+  --crepe-color-background: #1b1c1d;
+  --crepe-color-on-background: #f8f9ff;
+  --crepe-color-surface: #111418;
+  --crepe-color-surface-low: #191c20;
+  --crepe-color-on-surface: #e1e2e8;
+  --crepe-color-on-surface-variant: #c3c6cf;
+  --crepe-color-outline: #8d9199;
+  --crepe-color-primary: #a1c9fd;
+  --crepe-color-secondary: #3c4858;
+  --crepe-color-on-secondary: #d7e3f8;
+  --crepe-color-inverse: #e1e2e8;
+  --crepe-color-on-inverse: #2e3135;
+  --crepe-color-inline-code: #ffb4ab;
+  --crepe-color-error: #ffb4ab;
+  --crepe-color-hover: #1d2024;
+  --crepe-color-selected: #32353a;
+  --crepe-color-inline-area: #111418;
+
+  --crepe-shadow-1:
+    0 1px 2px 0 rgba(255, 255, 255, 0.3),
+    0 1px 3px 1px rgba(255, 255, 255, 0.15);
+  --crepe-shadow-2:
+    0 1px 2px 0 rgba(255, 255, 255, 0.3),
+    0 2px 6px 2px rgba(255, 255, 255, 0.15);
+}
+
+/* Override Crepe's default font stack so the editor matches the rest of
+ * the ProcessFox UI. Crepe's title font falls back to Times New Roman
+ * when Rubik isn't installed (it isn't, in our bundle), which is why
+ * headings looked serif by default. */
+.milkdown {
+  --crepe-font-default:
+    'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system,
+    'Segoe UI', sans-serif;
+  --crepe-font-title:
+    'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system,
+    'Segoe UI', sans-serif;
+}
+
+/* Make Crepe stretch to the available height — by default it fits-content. */
+.preview-md-host > .milkdown {
+  height: 100%;
+  overflow-y: auto;
+}
+
+/* Crepe ships with print-style padding (60px / 120px) tuned for a
+ * standalone editor page. In our preview pane that wastes most of the
+ * horizontal space, so we tighten it to feel like an inline editor. */
+.preview-md-host .milkdown .ProseMirror {
+  padding: 16px 20px;
+}
