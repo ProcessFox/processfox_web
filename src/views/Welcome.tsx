@@ -1,4 +1,4 @@
-import { Check, Cpu, FolderOpen, Sparkles } from "lucide-react";
+import { Bot, Check, KeyRound, Sparkles } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -8,13 +8,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { Agent } from "@/types/agent";
-import type { InstalledModel } from "@/types/models";
 import type { Settings } from "@/types/settings";
 
 type Props = {
   open: boolean;
   settings: Settings | null;
-  installedModels: InstalledModel[];
   hasApiKey: boolean | null;
   agents: Agent[];
   onOpenSettings: () => void;
@@ -22,20 +20,18 @@ type Props = {
   onFinish: () => void;
 };
 
-/** Three-step first-run flow: intro → model setup → first agent → done.
- *  Each step shows a checkmark once its precondition is satisfied; the
- *  user can revisit any step until they hit "Fertig". */
+/** Two-step first-run flow: configure a cloud API key → create the first
+ *  agent. Each step shows a checkmark once its precondition is satisfied. */
 export function WelcomeDialog({
   open,
   settings,
-  installedModels,
   hasApiKey,
   agents,
   onOpenSettings,
   onCreateAgent,
   onFinish,
 }: Props) {
-  const modelReady = isModelReady(settings, installedModels, hasApiKey);
+  const modelReady = isModelReady(settings, hasApiKey);
   const agentReady = agents.length > 0;
   const allReady = modelReady && agentReady;
 
@@ -55,20 +51,19 @@ export function WelcomeDialog({
 
         <div className="flex flex-col gap-4 py-2">
           <p className="text-sm text-muted-foreground">
-            ProcessFox ist eine Desktop-App für KI-Agenten, die mit deinen
-            eigenen Dateien arbeiten — lokal auf deinem Rechner. Drei kurze
-            Schritte und du kannst loslegen:
+            ProcessFox lässt dein Team KI-Agenten auf gemeinsam genutzten
+            Dateien arbeiten. Zwei kurze Schritte und ihr könnt loslegen:
           </p>
 
           <Step
             number={1}
             done={modelReady}
-            icon={Cpu}
-            title="Modell einrichten"
+            icon={KeyRound}
+            title="Cloud-API einrichten"
             description={
               modelReady
-                ? "Modell ist konfiguriert."
-                : "Lade ein lokales Modell herunter (empfohlen) oder hinterlege einen Cloud-API-Key."
+                ? "API-Key ist hinterlegt."
+                : "Hinterlege einen API-Key (Anthropic, OpenAI oder OpenRouter) und wähle ein Default-Modell."
             }
             actionLabel={modelReady ? "Ändern" : "Einstellungen öffnen"}
             onAction={onOpenSettings}
@@ -77,12 +72,12 @@ export function WelcomeDialog({
           <Step
             number={2}
             done={agentReady}
-            icon={FolderOpen}
+            icon={Bot}
             title="Ersten Agenten anlegen"
             description={
               agentReady
                 ? `${agents.length} Agent${agents.length === 1 ? "" : "en"} angelegt.`
-                : "Gib deinem Agenten einen Namen und einen Ordner, in dem er arbeiten darf."
+                : "Gib deinem Agenten einen Namen und einen System-Prompt."
             }
             actionLabel={agentReady ? "Weiteren anlegen" : "Agent anlegen"}
             onAction={onCreateAgent}
@@ -112,7 +107,7 @@ function Step({
 }: {
   number: number;
   done: boolean;
-  icon: typeof Cpu;
+  icon: typeof Bot;
   title: string;
   description: string;
   actionLabel: string;
@@ -157,15 +152,8 @@ function Step({
 
 function isModelReady(
   settings: Settings | null,
-  installedModels: InstalledModel[],
   hasApiKey: boolean | null,
 ): boolean {
-  const provider = settings?.defaultProvider;
-  if (!provider) return false;
-  if (provider === "local") {
-    const modelId = settings?.defaultModels?.[provider];
-    if (!modelId) return false;
-    return installedModels.some((m) => m.filename === modelId);
-  }
+  if (!settings?.defaultProvider) return false;
   return hasApiKey === true;
 }

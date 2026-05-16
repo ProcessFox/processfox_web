@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, FileStack } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -8,7 +7,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { agentApi } from "@/lib/tauri";
+import { agentApi, fileApi } from "@/lib/tauri";
 import type { Agent, AttachmentKind } from "@/types/agent";
 
 type Props = {
@@ -36,12 +35,11 @@ type Props = {
 
 const ATTACHMENT_CONFIG: Record<
   AttachmentKind,
-  { label: string; dialogTitle: string; extensions: string[] }
+  { label: string; accept: string }
 > = {
   template: {
     label: "Vorlage",
-    dialogTitle: "Vorlage wählen",
-    extensions: ["docx"],
+    accept: ".docx",
   },
 };
 
@@ -150,10 +148,10 @@ export function ChatInput({
   );
 }
 
-function attachmentPath(agent: Agent, kind: AttachmentKind): string | null {
+function attachmentFileId(agent: Agent, kind: AttachmentKind): string | null {
   switch (kind) {
     case "template":
-      return agent.attachments.templatePath ?? null;
+      return agent.attachments.templateFileId ?? null;
   }
 }
 
@@ -167,52 +165,62 @@ function AttachmentButton({
   onAgentUpdated?: (agent: Agent) => void;
 }) {
   const config = ATTACHMENT_CONFIG[kind];
-  const current = attachmentPath(agent, kind);
+  const current = attachmentFileId(agent, kind);
   const hasAttachment = current !== null;
-  const fileName = current ? current.split(/[/\\]/).pop() : null;
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
 
-  async function handlePick() {
+  async function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy(true);
     try {
-      const picked = await open({
-        directory: false,
-        multiple: false,
-        title: config.dialogTitle,
-        defaultPath: agent.folder ?? undefined,
-        filters: [{ name: config.label, extensions: config.extensions }],
-      });
-      if (typeof picked !== "string") return;
-      const updated = await agentApi.setAttachment(agent.id, kind, picked);
+      // Upload into the agent's workspace, then bind the resulting file id
+      // as the attachment (CLAUDE.md §5 — upload replaces OS file access).
+      const uploaded = await fileApi.upload(agent.workspaceId, file);
+      const updated = await agentApi.setAttachment(agent.id, kind, uploaded.id);
       onAgentUpdated?.(updated);
-    } catch (e) {
-      // Backend rejects paths outside the agent folder; show inline log only —
-      // a toast would feel heavy for a single misclick.
-      console.warn("attachment pick failed", e);
+    } catch (err) {
+      console.warn("attachment upload failed", err);
+    } finally {
+      setBusy(false);
     }
   }
 
   // Ghost variant on the left, distinct from the filled primary Send button
-  // on the right. Color: warning (amber, with a soft tint) when no path is set
-  // or after auto-clear, muted-foreground when valid.
+  // on the right. Color: warning (amber, with a soft tint) when nothing is
+  // attached yet, muted-foreground when set.
   const tone = hasAttachment
     ? "text-muted-foreground bg-muted hover:bg-accent/60"
     : "text-warning bg-warning/10 hover:bg-warning/20";
   const tooltipText = hasAttachment
-    ? `${config.label}: ${fileName}`
+    ? `${config.label} gesetzt — zum Ersetzen klicken`
     : `${config.label} wählen`;
 
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          onClick={handlePick}
-          aria-label={tooltipText}
-          className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${tone}`}
-        >
-          <FileStack className="h-3.5 w-3.5" />
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="top">{tooltipText}</TooltipContent>
-    </Tooltip>
+    <>
+      <input
+        ref={inputRef}
+        type="file"
+        accept={config.accept}
+        className="hidden"
+        onChange={handleFile}
+      />
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={() => inputRef.current?.click()}
+            disabled={busy}
+            aria-label={tooltipText}
+            className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors disabled:opacity-50 ${tone}`}
+          >
+            <FileStack className="h-3.5 w-3.5" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="top">{tooltipText}</TooltipContent>
+      </Tooltip>
+    </>
   );
 }

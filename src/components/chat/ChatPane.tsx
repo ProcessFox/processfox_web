@@ -3,7 +3,6 @@ import { AlertCircle, Check, Copy, Loader2, Square, X } from "lucide-react";
 
 import { AskUserCard } from "@/components/chat/AskUserCard";
 import { ChatInput } from "@/components/chat/ChatInput";
-import { fileApi } from "@/lib/tauri";
 import type { StarterPrompt } from "@/lib/starterPrompts";
 import { HitlCard } from "@/components/chat/HitlCard";
 import { MessageMarkdown } from "@/components/chat/MessageMarkdown";
@@ -170,13 +169,6 @@ export function ChatPane({
       {error && (
         <div className="flex items-start gap-2 border-t border-destructive/30 bg-destructive/15 px-4 py-2 text-xs text-destructive">
           <div className="flex-1">{error}</div>
-          <button
-            onClick={() => fileApi.openLogsFolder().catch(() => {})}
-            className="shrink-0 rounded-sm border border-destructive/40 bg-destructive/15 px-2 py-0.5 text-xs hover:bg-destructive/20"
-            title="Log-Ordner im Finder öffnen"
-          >
-            Logs öffnen
-          </button>
           <button
             onClick={onDismissError}
             className="text-destructive/70 hover:text-destructive"

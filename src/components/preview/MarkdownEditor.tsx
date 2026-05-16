@@ -9,8 +9,7 @@ import "./markdown-editor.css";
 const SAVE_DEBOUNCE_MS = 800;
 
 type Props = {
-  agentId: string;
-  filePath: string;
+  fileId: string;
   onStatus: (s: PreviewStatus) => void;
 };
 
@@ -27,9 +26,9 @@ type State =
 
 /** Markdown editor backed by Milkdown Crepe — Obsidian-style live preview
  *  where the rendered view IS the editor. The persistence model mirrors
- *  TextEditor: optimistic-concurrency via mtime, debounced auto-save,
- *  reload banner on external modification. */
-export function MarkdownEditor({ agentId, filePath, onStatus }: Props) {
+ *  TextEditor: optimistic-concurrency via version token, debounced auto-
+ *  save, reload banner on external modification. */
+export function MarkdownEditor({ fileId, onStatus }: Props) {
   const [state, setState] = useState<State>({ kind: "loading" });
   // Bump on each successful (re)load so CrepeView remounts with the new
   // content. Crepe doesn't expose `setMarkdown`, so destroy+recreate is the
@@ -39,16 +38,16 @@ export function MarkdownEditor({ agentId, filePath, onStatus }: Props) {
   // Latest markdown lives in a ref so the save callback can read it without
   // having to re-create the editor on each change.
   const contentRef = useRef("");
-  const mtimeRef = useRef(0);
-  const currentPathRef = useRef(filePath);
+  const versionRef = useRef("");
+  const currentIdRef = useRef(fileId);
   const saveTimerRef = useRef<number | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const res = await fileApi.readTextFile(agentId, filePath);
-      if (currentPathRef.current !== filePath) return;
+      const res = await fileApi.readTextFile(fileId);
+      if (currentIdRef.current !== fileId) return;
       contentRef.current = res.content;
-      mtimeRef.current = res.mtime;
+      versionRef.current = res.version;
       setState({
         kind: "loaded",
         initialContent: res.content,
@@ -57,15 +56,15 @@ export function MarkdownEditor({ agentId, filePath, onStatus }: Props) {
       setReloadKey((k) => k + 1);
       onStatus({ kind: "idle" });
     } catch (e: unknown) {
-      if (currentPathRef.current !== filePath) return;
+      if (currentIdRef.current !== fileId) return;
       const message = errorMessage(e);
       setState({ kind: "error", message });
       onStatus({ kind: "error", message });
     }
-  }, [agentId, filePath, onStatus]);
+  }, [fileId, onStatus]);
 
   useEffect(() => {
-    currentPathRef.current = filePath;
+    currentIdRef.current = fileId;
     setState({ kind: "loading" });
     onStatus({ kind: "idle" });
     void load();
@@ -75,27 +74,26 @@ export function MarkdownEditor({ agentId, filePath, onStatus }: Props) {
         saveTimerRef.current = null;
       }
     };
-  }, [filePath, load, onStatus]);
+  }, [fileId, load, onStatus]);
 
   const save = useCallback(async () => {
     onStatus({ kind: "saving" });
     try {
       const res = await fileApi.writeTextFile(
-        agentId,
-        filePath,
+        fileId,
         contentRef.current,
-        mtimeRef.current,
+        versionRef.current,
       );
-      if (currentPathRef.current !== filePath) return;
-      mtimeRef.current = res.mtime;
+      if (currentIdRef.current !== fileId) return;
+      versionRef.current = res.version;
       setState((cur) =>
         cur.kind === "loaded" ? { ...cur, conflict: false } : cur,
       );
       onStatus({ kind: "saved" });
     } catch (e: unknown) {
-      if (currentPathRef.current !== filePath) return;
+      if (currentIdRef.current !== fileId) return;
       const code = (e as { code?: string })?.code;
-      if (code === "mtime_conflict") {
+      if (code === "version_conflict") {
         setState((cur) =>
           cur.kind === "loaded" ? { ...cur, conflict: true } : cur,
         );
@@ -105,7 +103,7 @@ export function MarkdownEditor({ agentId, filePath, onStatus }: Props) {
         onStatus({ kind: "error", message });
       }
     }
-  }, [agentId, filePath, onStatus]);
+  }, [fileId, onStatus]);
 
   const onChange = useCallback(
     (markdown: string) => {

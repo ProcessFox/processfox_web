@@ -15,17 +15,13 @@ export function resolveAgentModel(
   settings: Settings | null,
 ): EffectiveModel | null {
   if (!agent) return null;
-  if (agent.model && agent.model.type === "cloud") {
+  if (agent.model) {
     if (agent.model.id.trim().length === 0) return null;
     return { provider: agent.model.provider, modelId: agent.model.id };
   }
-  if (agent.model && agent.model.type === "local") {
-    if (agent.model.id.trim().length === 0) return null;
-    return { provider: "local", modelId: agent.model.id };
-  }
   const provider = settings?.defaultProvider;
   if (!provider) return null;
-  const modelId = settings?.defaultModels?.[provider];
+  const modelId = settings?.defaultModel;
   if (!modelId) return null;
   return { provider, modelId };
 }

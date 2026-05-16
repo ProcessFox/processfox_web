@@ -1,13 +1,17 @@
-export type ModelRef =
-  | { type: "local"; id: string }
-  | { type: "cloud"; provider: string; id: string };
+/** Cloud-only Modellreferenz. Kein lokales GGUF in Web (CLAUDE.md §10). */
+export interface ModelRef {
+  provider: string;
+  id: string;
+}
 
 export interface SkillSetting {
   hitl?: boolean;
 }
 
 export interface AgentAttachments {
-  templatePath?: string | null;
+  /** ID einer Datei im Workspace (workspace_files), nicht mehr ein OS-Pfad.
+   *  Wird serverseitig auto-geleert, wenn die Datei gelöscht wird. */
+  templateFileId?: string | null;
 }
 
 export type AttachmentKind = "template";
@@ -22,7 +26,8 @@ export interface Agent {
   id: string;
   name: string;
   icon: string;
-  folder: string | null;
+  /** Der Workspace, zu dem dieser Agent gehört (ersetzt den OS-Ordner). */
+  workspaceId: string;
   systemPrompt: string;
   model: ModelRef | null;
   skills: string[];
@@ -37,7 +42,7 @@ export interface Agent {
 export interface AgentDraft {
   name: string;
   icon?: string;
-  folder?: string;
+  workspaceId: string;
   systemPrompt?: string;
   model?: ModelRef;
   skills?: string[];
@@ -48,7 +53,6 @@ export interface AgentDraft {
 export interface AgentUpdate {
   name?: string;
   icon?: string;
-  folder?: string;
   systemPrompt?: string;
   model?: ModelRef;
   skills?: string[];

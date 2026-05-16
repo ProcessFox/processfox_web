@@ -3,8 +3,7 @@ import { useEffect, useState } from "react";
 import { previewApi } from "@/lib/tauri";
 
 type Props = {
-  agentId: string;
-  filePath: string;
+  fileId: string;
 };
 
 type State =
@@ -16,14 +15,14 @@ type State =
  *  inside a sandboxed iframe. Sandbox keeps any future surprise (links,
  *  scripts, embeds) confined; we additionally avoid emitting `<script>`
  *  on the Rust side. */
-export function DocxViewer({ agentId, filePath }: Props) {
+export function DocxViewer({ fileId }: Props) {
   const [state, setState] = useState<State>({ kind: "loading" });
 
   useEffect(() => {
     let cancelled = false;
     setState({ kind: "loading" });
     previewApi
-      .docx(agentId, filePath)
+      .docx(fileId)
       .then((res) => {
         if (cancelled) return;
         setState({ kind: "ready", srcDoc: wrapInDocument(res.html) });
@@ -37,7 +36,7 @@ export function DocxViewer({ agentId, filePath }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [agentId, filePath]);
+  }, [fileId]);
 
   if (state.kind === "loading") {
     return (

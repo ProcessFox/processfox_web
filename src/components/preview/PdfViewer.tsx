@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut } from "lucide-react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+
+import { fileApi } from "@/lib/tauri";
 
 import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
@@ -18,14 +19,15 @@ const MAX_SCALE = 3;
 const SCALE_STEP = 0.2;
 
 type Props = {
-  filePath: string;
+  fileId: string;
 };
 
-export function PdfViewer({ filePath }: Props) {
+export function PdfViewer({ fileId }: Props) {
   const [numPages, setNumPages] = useState<number | null>(null);
   const [pageNumber, setPageNumber] = useState(1);
   const [scale, setScale] = useState(1);
   const [error, setError] = useState<string | null>(null);
+  const [src, setSrc] = useState<string | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState<number | null>(null);
@@ -43,14 +45,26 @@ export function PdfViewer({ filePath }: Props) {
     return () => ro.disconnect();
   }, []);
 
-  // Reset on path change.
+  // Reset and resolve a fresh pre-signed URL on file change.
   useEffect(() => {
+    let cancelled = false;
     setNumPages(null);
     setPageNumber(1);
     setError(null);
-  }, [filePath]);
-
-  const src = convertFileSrc(filePath);
+    setSrc(null);
+    fileApi
+      .downloadUrl(fileId)
+      .then(({ url }) => {
+        if (!cancelled) setSrc(url);
+      })
+      .catch((e) => {
+        if (!cancelled)
+          setError(String((e as { message?: string })?.message ?? e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [fileId]);
 
   if (error) {
     return (
@@ -77,6 +91,9 @@ export function PdfViewer({ filePath }: Props) {
         ref={containerRef}
         className="flex flex-1 items-start justify-center overflow-auto bg-muted/40 p-4"
       >
+        {src === null ? (
+          <div className="text-xs text-muted-foreground">Lädt …</div>
+        ) : (
         <Document
           file={src}
           onLoadSuccess={({ numPages }) => setNumPages(numPages)}
@@ -97,6 +114,7 @@ export function PdfViewer({ filePath }: Props) {
             />
           )}
         </Document>
+        )}
       </div>
     </div>
   );

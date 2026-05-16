@@ -7,17 +7,16 @@ import type { PreviewStatus } from "./PreviewHeader";
 const SAVE_DEBOUNCE_MS = 800;
 
 type Props = {
-  agentId: string;
-  filePath: string;
+  fileId: string;
   onStatus: (s: PreviewStatus) => void;
 };
 
 type Loaded = {
   kind: "loaded";
   content: string;
-  /** Server-known modification time. Used as the optimistic-concurrency
-   *  token on save and updated whenever a save round-trips successfully. */
-  mtime: number;
+  /** Server-known version token (e.g. S3 ETag). Used as the optimistic-
+   *  concurrency token on save and updated whenever a save round-trips. */
+  version: string;
   conflict: boolean;
 };
 
@@ -31,36 +30,36 @@ type State =
  *  the backend's mtime is the source of truth for "did anyone else write
  *  to this file since we read it?" — if so, the next save fails with a
  *  `mtime_conflict` and we offer a Reload button. */
-export function TextEditor({ agentId, filePath, onStatus }: Props) {
+export function TextEditor({ fileId, onStatus }: Props) {
   const [state, setState] = useState<State>({ kind: "loading" });
 
-  // Path the latest async response is allowed to apply to. Guards against
+  // File id the latest async response is allowed to apply to. Guards against
   // a slow read/write resolving after the user has switched files.
-  const currentPathRef = useRef(filePath);
+  const currentIdRef = useRef(fileId);
   const saveTimerRef = useRef<number | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const res = await fileApi.readTextFile(agentId, filePath);
-      if (currentPathRef.current !== filePath) return;
+      const res = await fileApi.readTextFile(fileId);
+      if (currentIdRef.current !== fileId) return;
       setState({
         kind: "loaded",
         content: res.content,
-        mtime: res.mtime,
+        version: res.version,
         conflict: false,
       });
       onStatus({ kind: "idle" });
     } catch (e: unknown) {
-      if (currentPathRef.current !== filePath) return;
+      if (currentIdRef.current !== fileId) return;
       const message = errorMessage(e);
       setState({ kind: "error", message });
       onStatus({ kind: "error", message });
     }
-  }, [agentId, filePath, onStatus]);
+  }, [fileId, onStatus]);
 
-  // Reset on path change, then load.
+  // Reset on file change, then load.
   useEffect(() => {
-    currentPathRef.current = filePath;
+    currentIdRef.current = fileId;
     setState({ kind: "loading" });
     onStatus({ kind: "idle" });
     void load();
@@ -70,7 +69,7 @@ export function TextEditor({ agentId, filePath, onStatus }: Props) {
         saveTimerRef.current = null;
       }
     };
-  }, [filePath, load, onStatus]);
+  }, [fileId, load, onStatus]);
 
   const save = useCallback(async () => {
     setState((prev) => {
@@ -83,22 +82,21 @@ export function TextEditor({ agentId, filePath, onStatus }: Props) {
       onStatus({ kind: "saving" });
       try {
         const res = await fileApi.writeTextFile(
-          agentId,
-          filePath,
+          fileId,
           loaded.content,
-          loaded.mtime,
+          loaded.version,
         );
-        if (currentPathRef.current !== filePath) return;
+        if (currentIdRef.current !== fileId) return;
         setState((cur) =>
           cur.kind === "loaded"
-            ? { ...cur, mtime: res.mtime, conflict: false }
+            ? { ...cur, version: res.version, conflict: false }
             : cur,
         );
         onStatus({ kind: "saved" });
       } catch (e: unknown) {
-        if (currentPathRef.current !== filePath) return;
+        if (currentIdRef.current !== fileId) return;
         const code = (e as { code?: string })?.code;
-        if (code === "mtime_conflict") {
+        if (code === "version_conflict") {
           setState((cur) =>
             cur.kind === "loaded" ? { ...cur, conflict: true } : cur,
           );
@@ -109,7 +107,7 @@ export function TextEditor({ agentId, filePath, onStatus }: Props) {
         }
       }
     }
-  }, [agentId, filePath, onStatus]);
+  }, [fileId, onStatus]);
 
   const onChange = (value: string) => {
     setState((prev) =>

@@ -282,10 +282,16 @@ processfox_web/
 
 ```sql
 -- Organisationen
-organizations (id, name, created_at)
+-- invite_code: 6-stellig, eindeutig, vom Owner rotierbar. Pflicht beim
+-- Beitritt zu einer bestehenden Org (siehe §2 Registrierung).
+organizations (id, name, invite_code, created_at)
 
--- Nutzer
+-- Nutzer (email global eindeutig; ein User gehört zu genau einer Org)
 users (id, email, password_hash, org_id, org_role, created_at)
+
+-- Refresh-Tokens (rotierend, widerrufbar; httpOnly-Cookie hält nur das Token,
+-- der Server hält den Hash + Ablauf)
+refresh_tokens (id, user_id, token_hash, expires_at, revoked_at, created_at)
 
 -- Workspaces (= Agent-Ordner)
 workspaces (id, org_id, name, created_at)
@@ -438,7 +444,7 @@ CMD ["/app/processfox-web"]
 
 ## 13. Test-Strategie
 
-- **Rust:** `cargo test` für Unit-Tests. Integration-Tests für Axum-Handler via `axum::test` oder `reqwest` gegen einen Test-Server mit In-Memory-SQLite.
+- **Rust:** `cargo test` für Unit-Tests. Integration-Tests für Axum-Handler via `reqwest` gegen einen Test-Server. **DB:** Postgres-Testcontainer bzw. `#[sqlx::test]` mit Wegwerf-Datenbank — **kein** In-Memory-SQLite (sqlx-Queries sind Postgres-spezifisch + compile-time-geprüft, SQLite ist inkompatibel).
 - **Frontend:** `vitest` für Hooks und Utility-Funktionen.
 - **Auth-Tests:** Pflicht — Login, Token-Refresh, Workspace-Berechtigungs-Checks.
 - **Build-Gates vor jedem Commit:** `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `npm run build`.

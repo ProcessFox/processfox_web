@@ -4,8 +4,7 @@ import { previewApi, type XlsxPreview } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 
 type Props = {
-  agentId: string;
-  filePath: string;
+  fileId: string;
 };
 
 type State =
@@ -18,7 +17,7 @@ type State =
  *  on top, row numbers on the left). Sheets are switched via tabs which
  *  refetch the new sheet. The backend already trims to 1000×50 cells, so
  *  the table stays snappy without virtualization. */
-export function XlsxViewer({ agentId, filePath }: Props) {
+export function XlsxViewer({ fileId }: Props) {
   const [state, setState] = useState<State>({ kind: "loading" });
   // Active sheet name. `null` means "use the workbook's first sheet" — we
   // don't know the names until the first request returns.
@@ -28,13 +27,13 @@ export function XlsxViewer({ agentId, filePath }: Props) {
   // first sheet rather than trying to reuse a sheet name from the previous.
   useEffect(() => {
     setActiveSheet(null);
-  }, [filePath]);
+  }, [fileId]);
 
   useEffect(() => {
     let cancelled = false;
     setState({ kind: "loading" });
     previewApi
-      .xlsx(agentId, filePath, activeSheet ?? undefined)
+      .xlsx(fileId, activeSheet ?? undefined)
       .then((data) => {
         if (cancelled) return;
         setState({ kind: "ready", data });
@@ -48,7 +47,7 @@ export function XlsxViewer({ agentId, filePath }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [agentId, filePath, activeSheet]);
+  }, [fileId, activeSheet]);
 
   if (state.kind === "loading") {
     return (

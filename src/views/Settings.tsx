@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 
 import { CloudApisTab } from "@/components/settings/CloudApisTab";
-import { ModelsTab } from "@/components/settings/ModelsTab";
 import { useTheme, type Theme } from "@/components/theme-provider";
 import {
   Dialog,
@@ -15,7 +14,7 @@ import type { Settings } from "@/types/settings";
 
 type Props = {
   open: boolean;
-  defaultTab?: "models" | "cloud" | "appearance" | "about";
+  defaultTab?: "cloud" | "appearance" | "about";
   onClose: () => void;
   onSettingsChange?: (s: Settings) => void;
 };
@@ -54,18 +53,10 @@ export function SettingsDialog({
 
         <Tabs defaultValue={defaultTab}>
           <TabsList className="w-full justify-start">
-            <TabsTrigger value="models">Modelle</TabsTrigger>
             <TabsTrigger value="cloud">Cloud-APIs</TabsTrigger>
             <TabsTrigger value="appearance">Darstellung</TabsTrigger>
             <TabsTrigger value="about">Über</TabsTrigger>
           </TabsList>
-
-          <TabsContent value="models">
-            <ModelsTab
-              settings={settings}
-              onSettingsChange={handleSettingsChange}
-            />
-          </TabsContent>
 
           <TabsContent value="cloud">
             <CloudApisTab
@@ -97,12 +88,10 @@ export function SettingsDialog({
 
           <TabsContent value="about" className="py-4">
             <div className="flex flex-col gap-1 text-xs">
-              <div className="text-sm font-medium">ProcessFox</div>
+              <div className="text-sm font-medium">ProcessFox Web</div>
+              <div className="text-muted-foreground">Version 0.1.0</div>
               <div className="text-muted-foreground">
-                Version 0.1.0 (Phase 2 — Etappe A)
-              </div>
-              <div className="text-muted-foreground">
-                Lokale KI-Agenten für Einsteiger.
+                Team-fähige KI-Agenten für gemeinsame Dokumentenarbeit.
               </div>
             </div>
           </TabsContent>

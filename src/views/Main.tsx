@@ -10,12 +10,15 @@ import {
 } from "@/components/ui/resizable";
 import type { PendingToolCall } from "@/hooks/useAgentChat";
 import type { Agent } from "@/types/agent";
+import type { Workspace } from "@/types/auth";
 import type { ChatMessage, PendingHitl, PendingQuestion } from "@/types/chat";
 
 type Props = {
+  workspaces: Workspace[];
+  activeWorkspace: Workspace | null;
   agents: Agent[];
   activeAgent: Agent | null;
-  selectedFile: { path: string; name: string } | null;
+  selectedFile: { fileId: string; name: string } | null;
   messages: ChatMessage[];
   streamingText: string | null;
   streamingReasoning: string | null;
@@ -32,11 +35,12 @@ type Props = {
   onAgentUpdated: (agent: Agent) => void;
   chatFooter?: { templateName: string | null; model: string | null };
   fileTreeRefresh: number;
+  onSelectWorkspace: (workspace: Workspace) => void;
   onSelectAgent: (agent: Agent) => void;
   onCreateAgent: () => void;
   onEditAgent: () => void;
   onOpenSettings: () => void;
-  onSelectFile: (path: string, name: string) => void;
+  onSelectFile: (fileId: string, name: string) => void;
   onClosePreview: () => void;
   onSendMessage: (text: string) => void;
   onCancelRun: () => void;
@@ -48,6 +52,8 @@ type Props = {
 };
 
 export function Main({
+  workspaces,
+  activeWorkspace,
   agents,
   activeAgent,
   selectedFile,
@@ -67,6 +73,7 @@ export function Main({
   onAgentUpdated,
   chatFooter,
   fileTreeRefresh,
+  onSelectWorkspace,
   onSelectAgent,
   onCreateAgent,
   onEditAgent,
@@ -90,6 +97,24 @@ export function Main({
     >
       <ResizablePanel defaultSize={22} minSize={16} maxSize={36}>
         <div className="flex h-full flex-col border-r border-border bg-surface">
+          {workspaces.length > 1 && (
+            <div className="border-b border-border px-3 py-2">
+              <select
+                value={activeWorkspace?.id ?? ""}
+                onChange={(e) => {
+                  const ws = workspaces.find((w) => w.id === e.target.value);
+                  if (ws) onSelectWorkspace(ws);
+                }}
+                className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs"
+              >
+                {workspaces.map((w) => (
+                  <option key={w.id} value={w.id}>
+                    {w.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <AgentSwitcher
             agents={agents}
             activeAgent={activeAgent}
@@ -100,11 +125,9 @@ export function Main({
           />
           <div className="flex-1 overflow-hidden border-t border-border">
             <FileTree
-              agentId={activeAgent?.id ?? null}
-              agentFolder={activeAgent?.folder ?? null}
+              workspaceId={activeWorkspace?.id ?? null}
               refreshSignal={fileTreeRefresh}
               onSelectFile={onSelectFile}
-              onRequestPickFolder={onEditAgent}
             />
           </div>
         </div>
@@ -116,9 +139,8 @@ export function Main({
         <>
           <ResizablePanel defaultSize={38} minSize={20}>
             <PreviewPane
-              agentId={activeAgent?.id ?? null}
+              fileId={selectedFile?.fileId ?? null}
               fileName={selectedFile?.name ?? null}
-              filePath={selectedFile?.path ?? null}
               onClose={onClosePreview}
             />
           </ResizablePanel>

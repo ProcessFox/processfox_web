@@ -9,20 +9,18 @@ import { SettingsDialog } from "@/views/Settings";
 import { WelcomeDialog } from "@/views/Welcome";
 import {
   agentApi,
-  fileApi,
-  modelsApi,
   secretsApi,
   settingsApi,
   skillsApi,
+  workspaceApi,
 } from "@/lib/tauri";
 import { pickStarterPrompts } from "@/lib/starterPrompts";
 import type { Agent } from "@/types/agent";
-import type { CatalogEntry, InstalledModel } from "@/types/models";
+import type { Workspace } from "@/types/auth";
 import type { Settings } from "@/types/settings";
 import type { Skill } from "@/types/skill";
-import type { EffectiveModel } from "@/hooks/useAgentChat";
 
-type SelectedFile = { path: string; name: string } | null;
+type SelectedFile = { fileId: string; name: string } | null;
 
 export default function App() {
   return (
@@ -38,18 +36,18 @@ export default function App() {
 }
 
 function AppShell() {
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [activeWorkspace, setActiveWorkspace] = useState<Workspace | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [activeAgent, setActiveAgent] = useState<Agent | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [hasApiKey, setHasApiKey] = useState<boolean | null>(null);
-  const [installedModels, setInstalledModels] = useState<InstalledModel[]>([]);
-  const [catalog, setCatalog] = useState<CatalogEntry[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [selectedFile, setSelectedFile] = useState<SelectedFile>(null);
   const [fileTreeRefresh, setFileTreeRefresh] = useState(0);
 
   const [settingsState, setSettingsState] = useState<
-    { open: false } | { open: true; tab: "models" | "cloud" | "appearance" | "about" }
+    { open: false } | { open: true; tab: "cloud" | "appearance" | "about" }
   >({ open: false });
   const [agentEditor, setAgentEditor] = useState<
     { mode: "create" | "edit" } | null
@@ -85,35 +83,29 @@ function AppShell() {
     [activeAgent, settings],
   );
 
-  // Footer line inside the chat: template name (if attached) + active model.
-  // The template is only meaningful while document-from-template is on; the
-  // backend already auto-clears the path when the skill is removed, so a
-  // present `templatePath` implies the skill is active.
+  // Footer line inside the chat: template indicator (if attached) + model.
   const chatFooter = useMemo(() => {
     if (!activeAgent) return undefined;
-    const templatePath = activeAgent.attachments?.templatePath ?? null;
-    const templateName = templatePath
-      ? (templatePath.split(/[/\\]/).pop() ?? templatePath)
-      : null;
-    const model = displayModelName(effectiveModel, installedModels, catalog);
-    if (!templateName && !model) return undefined;
-    return { templateName, model };
-  }, [activeAgent, effectiveModel, installedModels, catalog]);
+    const hasTemplate = Boolean(activeAgent.attachments?.templateFileId);
+    const model = effectiveModel?.modelId ?? null;
+    if (!hasTemplate && !model) return undefined;
+    return { templateName: hasTemplate ? "gesetzt" : null, model };
+  }, [activeAgent, effectiveModel]);
 
   const chat = useAgentChat(activeAgent, effectiveModel);
 
   const handleSendMessage = useCallback(
     (text: string) => {
-      // Bump the file-tree's refresh signal: the user often dropped new
-      // files in their agent folder right before prompting about them.
+      // Bump the file-tree's refresh signal: the user often uploaded new
+      // files right before prompting about them.
       setFileTreeRefresh((n) => n + 1);
       chat.send(text);
     },
     [chat],
   );
 
-  const refreshAgents = useCallback(async () => {
-    const list = await agentApi.list();
+  const refreshAgents = useCallback(async (workspaceId: string) => {
+    const list = await agentApi.list(workspaceId);
     setAgents(list);
     return list;
   }, []);
@@ -126,18 +118,32 @@ function AppShell() {
 
   useEffect(() => {
     skillsApi.list().then(setSkills).catch(console.error);
-    // Catalog is small, immutable per release, and used for friendly model
-    // names across the app — load once at mount and keep it.
-    modelsApi.listCatalog().then(setCatalog).catch(console.error);
   }, []);
 
+  // Initial load: workspaces + settings. The first workspace becomes active.
   useEffect(() => {
-    Promise.all([refreshAgents(), refreshSettings()])
-      .then(([list]) => {
-        if (list.length > 0) setActiveAgent(list[0]);
+    Promise.all([workspaceApi.list(), refreshSettings()])
+      .then(([ws]) => {
+        setWorkspaces(ws);
+        if (ws.length > 0) setActiveWorkspace(ws[0]);
       })
       .catch((e) => console.error("initial load failed", e));
-  }, [refreshAgents, refreshSettings]);
+  }, [refreshSettings]);
+
+  // Load agents whenever the active workspace changes.
+  useEffect(() => {
+    if (!activeWorkspace) {
+      setAgents([]);
+      setActiveAgent(null);
+      return;
+    }
+    refreshAgents(activeWorkspace.id)
+      .then((list) => {
+        setActiveAgent(list.length > 0 ? list[0] : null);
+        setSelectedFile(null);
+      })
+      .catch((e) => console.error("agent load failed", e));
+  }, [activeWorkspace, refreshAgents]);
 
   // Watcher fires when an agent's attachment was auto-cleared because the
   // file disappeared. Refresh the affected agent so the icon flips to warn.
@@ -177,21 +183,9 @@ function AppShell() {
     }
   }, []);
 
-  // Refresh the installed-models list whenever Settings closes (the user may
-  // have downloaded or deleted a model). This feeds the local-model gate below.
-  useEffect(() => {
-    if (settingsState.open) return;
-    modelsApi.listInstalled().then(setInstalledModels).catch(console.error);
-  }, [settingsState.open]);
-
-  // Check API key status for the effective provider. Local models don't use
-  // keychain credentials, so we short-circuit for them.
+  // Check API key status for the effective provider.
   useEffect(() => {
     if (!effectiveModel) {
-      setHasApiKey(null);
-      return;
-    }
-    if (effectiveModel.provider === "local") {
       setHasApiKey(null);
       return;
     }
@@ -209,6 +203,10 @@ function AppShell() {
     };
   }, [effectiveModel, settingsState.open]);
 
+  const handleSelectWorkspace = useCallback((ws: Workspace) => {
+    setActiveWorkspace(ws);
+  }, []);
+
   const handleSelectAgent = useCallback((agent: Agent) => {
     setActiveAgent(agent);
     setSelectedFile(null);
@@ -225,11 +223,11 @@ function AppShell() {
 
   const handleAgentSaved = useCallback(
     async (saved: Agent) => {
-      await refreshAgents();
+      if (activeWorkspace) await refreshAgents(activeWorkspace.id);
       setActiveAgent(saved);
       setSelectedFile(null);
     },
-    [refreshAgents],
+    [activeWorkspace, refreshAgents],
   );
 
   const handleAgentUpdated = useCallback((updated: Agent) => {
@@ -237,8 +235,8 @@ function AppShell() {
     setActiveAgent((curr) => (curr && curr.id === updated.id ? updated : curr));
   }, []);
 
-  const handleSelectFile = useCallback((path: string, name: string) => {
-    setSelectedFile({ path, name });
+  const handleSelectFile = useCallback((fileId: string, name: string) => {
+    setSelectedFile({ fileId, name });
   }, []);
 
   const handleClosePreview = useCallback(() => setSelectedFile(null), []);
@@ -273,26 +271,6 @@ function AppShell() {
     return () => window.removeEventListener("keydown", handle);
   }, []);
 
-  // OS drag-and-drop: when the user drops files anywhere on the window,
-  // copy them into the active agent's folder. The folder watcher then
-  // refreshes the FileTree on its own.
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    fileApi
-      .subscribeFilesDropped((paths) => {
-        if (!activeAgent || !activeAgent.folder) return;
-        fileApi.importFilesToAgent(activeAgent.id, paths).catch((e) => {
-          console.warn("import failed", e);
-        });
-      })
-      .then((u) => {
-        unlisten = u;
-      })
-      .catch((e) => console.warn("drop subscribe failed", e));
-    return () => {
-      if (unlisten) unlisten();
-    };
-  }, [activeAgent]);
   const handleCloseSettings = useCallback(() => {
     setSettingsState({ open: false });
     // Re-fetch settings on close in case the user changed a default.
@@ -318,17 +296,7 @@ function AppShell() {
           "Kein Modell konfiguriert — in den Einstellungen einen Default setzen oder im Agenten überschreiben.",
       };
     }
-    if (effectiveModel.provider === "local") {
-      const present = installedModels.some(
-        (m) => m.filename === effectiveModel.modelId,
-      );
-      if (!present) {
-        return {
-          chatDisabled: true,
-          chatDisabledReason: `Lokales Modell „${effectiveModel.modelId}" ist nicht installiert.`,
-        };
-      }
-    } else if (hasApiKey === false) {
+    if (hasApiKey === false) {
       return {
         chatDisabled: true,
         chatDisabledReason: `Kein API-Key für ${effectiveModel.provider} hinterlegt.`,
@@ -343,6 +311,8 @@ function AppShell() {
   return (
     <div className="flex h-full w-full flex-col">
       <Main
+        workspaces={workspaces}
+        activeWorkspace={activeWorkspace}
         agents={agents}
         activeAgent={activeAgent}
         selectedFile={selectedFile}
@@ -362,6 +332,7 @@ function AppShell() {
         onAgentUpdated={handleAgentUpdated}
         chatFooter={chatFooter}
         fileTreeRefresh={fileTreeRefresh}
+        onSelectWorkspace={handleSelectWorkspace}
         onSelectAgent={handleSelectAgent}
         onCreateAgent={handleCreateAgent}
         onEditAgent={handleEditAgent}
@@ -381,6 +352,7 @@ function AppShell() {
         open={agentEditor !== null}
         mode={agentEditor?.mode ?? "create"}
         agent={agentEditor?.mode === "edit" ? activeAgent : null}
+        workspaceId={activeWorkspace?.id ?? null}
         onClose={() => setAgentEditor(null)}
         onSaved={handleAgentSaved}
       />
@@ -395,34 +367,12 @@ function AppShell() {
       <WelcomeDialog
         open={showWelcome && !settingsState.open && agentEditor === null}
         settings={settings}
-        installedModels={installedModels}
         hasApiKey={hasApiKey}
         agents={agents}
-        onOpenSettings={() =>
-          setSettingsState({ open: true, tab: "models" })
-        }
+        onOpenSettings={() => setSettingsState({ open: true, tab: "cloud" })}
         onCreateAgent={() => setAgentEditor({ mode: "create" })}
         onFinish={handleFinishWelcome}
       />
     </div>
   );
-}
-
-/** Friendly label for a resolved model. Local: catalog title when known,
- *  otherwise the GGUF filename without extension. Cloud: the provider's
- *  raw model id — they're already human-readable and rotate too often to
- *  hand-curate. */
-function displayModelName(
-  model: EffectiveModel | null,
-  installed: InstalledModel[],
-  catalog: CatalogEntry[],
-): string | null {
-  if (!model) return null;
-  if (model.provider !== "local") return model.modelId;
-  const match = installed.find((m) => m.filename === model.modelId);
-  if (match?.catalogId) {
-    const entry = catalog.find((c) => c.id === match.catalogId);
-    if (entry) return entry.title;
-  }
-  return model.modelId.replace(/\.gguf$/i, "");
 }

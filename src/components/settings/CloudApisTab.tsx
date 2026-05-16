@@ -98,7 +98,12 @@ function ProviderCard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const defaultModel = settings?.defaultModels?.[meta.id] ?? "";
+  // The org has a single default provider + model. A card only reflects the
+  // default model when its provider is the active default.
+  const defaultModel =
+    settings?.defaultProvider === meta.id
+      ? (settings?.defaultModel ?? "")
+      : "";
 
   const validate = useCallback(async () => {
     setStatus({ state: "validating" });
@@ -169,11 +174,10 @@ function ProviderCard({
       const updated = await settingsApi.setDefaultProvider(meta.id);
       onSettingsChange(updated);
     }
-    // If no default model is set for this provider yet, pick the first
-    // suggestion as a sensible starter.
-    if (!settings?.defaultModels?.[meta.id]) {
+    // If no default model is set yet, pick the first suggestion as a
+    // sensible starter.
+    if (!settings?.defaultModel) {
       const updated = await settingsApi.setDefaultModel(
-        meta.id,
         meta.suggestedModels[0],
       );
       onSettingsChange(updated);
@@ -217,14 +221,14 @@ function ProviderCard({
   async function updateDefaultModel(model: string) {
     setBusy(true);
     try {
-      const next = await settingsApi.setDefaultModel(meta.id, model || null);
-      onSettingsChange(next);
-      // Whenever the user actively picks a model for a provider, make that
-      // provider the default if none is set yet.
-      if (!settings?.defaultProvider) {
+      // Picking a model on a card also makes this provider the org default —
+      // the single default model only makes sense paired with its provider.
+      if (settings?.defaultProvider !== meta.id) {
         const withProvider = await settingsApi.setDefaultProvider(meta.id);
         onSettingsChange(withProvider);
       }
+      const next = await settingsApi.setDefaultModel(model || null);
+      onSettingsChange(next);
     } finally {
       setBusy(false);
     }

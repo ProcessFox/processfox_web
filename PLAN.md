@@ -11,7 +11,11 @@
 | API-Konvention | RESTful `/api/v1/...` + `Authorization: Bearer` (CLAUDE.md §7). RPC-Bridge wird ersetzt. |
 | Geteiltes Design | Visuell replizieren. Kein geteiltes npm-Paket / Monorepo mit www & Local. |
 | Local-Code | GGUF, Hardware-Info, Modell-Download, OS-Ordnerzugriff werden **entfernt**. |
-| Reihenfolge | Erst Plan, dann phasenweise Umsetzung mit Abnahme pro Phase. |
+| Reihenfolge | Phasen **strikt sequenziell** umsetzen, Abnahme pro Phase. |
+| Bestands-Migration Local→Web | **Keine** — Greenfield. |
+| Storage | **MinIO als Coolify-Service** (Coolify hat keinen eigenen S3-Dienst; Volumes reichen nicht — kein S3-API/Presign). AWS S3 optional via gleiche Env-Vars. |
+| Registrierung | **Immer** mit 6-stelligem Org-Invite-Code. Keine Org-Erstellung über die App — erste Org + Owner werden manuell in der DB angelegt (Betreiber). |
+| LLM-Layer | Provider-HTTP-Clients aus `processfox_local/core/llm` portieren; **Anthropic Prompt-Caching** (`cache_control`) von Anfang an mitnehmen. |
 
 ## Ausgangslage (Kurz)
 
@@ -21,9 +25,14 @@ Leere. Local-Paradigma (Modelle/Hardware/Ordner) noch durchgängig.
 
 ---
 
-## Phase 0 — Frontend-Bereinigung (Local-Paradigma raus)
+## Phase 0 — Frontend-Bereinigung (Local-Paradigma raus) ✅ ABGESCHLOSSEN (2026-05-16)
 
 Ziel: Frontend von Local-Annahmen befreien, bevor Backend gebaut wird.
+
+**Ergebnis:** `npm run build` (tsc + vite) grün, keine `@tauri-apps`-/
+Local-/Hardware-Referenzen mehr. Bridge auf Workspace+Upload-Signaturen
+umgestellt (Transport bleibt RPC bis zur REST-Etappe). Neue Typen
+`src/types/auth.ts`; `models.ts`/`ModelsTab.tsx` entfernt.
 
 **Entfernen:**
 - `modelsApi` komplett (Katalog, installierte Modelle, Hardware, Downloads).
@@ -63,15 +72,21 @@ Migrations laufen, `/api/v1/health` antwortet.
 
 ## Phase 2 — Auth (JWT)
 
-- Tabellen `organizations`, `users`. Argon2-Passwort-Hash.
-- `POST /api/v1/auth/register`, `/auth/login`, `/auth/refresh`, `/auth/logout`.
-- Access-Token 15 min (Bearer), Refresh-Token 7 Tage (httpOnly-Cookie).
+- Tabellen `organizations` (inkl. `invite_code`), `users`, `refresh_tokens`.
+  Argon2-Passwort-Hash.
+- `POST /api/v1/auth/register` (**immer mit** 6-stelligem Org-Code),
+  `/auth/login`, `/auth/refresh`, `/auth/logout`,
+  `POST /api/v1/orgs/:id/rotate-invite-code` (nur Owner).
+  **Kein** Org-Erstellungs-Endpunkt — erste Org + Owner manuell in DB.
+- Access-Token 15 min (Bearer), Refresh-Token 7 Tage (httpOnly-Cookie,
+  serverseitig gehasht + widerrufbar). Rate-Limit auf register/login.
 - JWT-Middleware extrahiert `user_id`.
-- Frontend: `src/hooks/useAuth.ts`, `src/views/Login.tsx`, Token-Refresh-Logik,
+- Frontend: `src/hooks/useAuth.ts`, `src/views/Login.tsx` (zwei Modi:
+  Login / Registrieren-mit-Org-Code), Token-Refresh-Logik,
   Bridge injiziert `Authorization`-Header + 401→Refresh→Retry.
 
-**Abnahme:** Auth-Tests (Login, Refresh, abgelaufener Token); Login-View
-funktioniert gegen Backend.
+**Abnahme:** Auth-Tests (Login, Refresh, abgelaufener Token, Registrierung
+mit gültigem/ungültigem Code); Login-View funktioniert gegen Backend.
 
 ---
 
@@ -156,10 +171,61 @@ Beispiel-Abbildung (vollständige Liste beim Bridge-Rewrite):
 > Hinweis: `modelsApi`-Kommandos entfallen ersatzlos (Local-Cleanup).
 > CLAUDE.md §7 und die §7-Diskrepanz-Notiz aktualisieren, sobald die Bridge steht.
 
-## Offene Punkte / vor Phasenstart zu klären
+## Registrierung (betrifft Phase 2/3)
 
-1. **Migrationsstrategie Bestands-User Local → Web?** (vermutlich keine — Greenfield).
-2. **Org-Self-Service vs. invite-only** für Registrierung in v1.
-3. **MinIO vs. AWS S3** als Default-Storage für die erste Deployment-Stufe.
-4. **`@anthropic-ai/sdk` / Provider-SDK-Versionen** und Prompt-Caching im Backend.
-5. Reihenfolge: Phase 0 zuerst (empfohlen) oder Backend-Skeleton parallel?
+**Modell:** Jede Organisation besitzt einen **6-stelligen Invite-Code**
+(`organizations.invite_code`). **Jede** Registrierung erfordert diesen Code —
+es gibt **keinen** Org-Erstellungs-Endpunkt in der App.
+
+- **Erste Org + Owner:** werden vom Betreiber **manuell in der DB** angelegt
+  (Org-Zeile inkl. `invite_code`, Owner-User mit `org_role = owner`).
+  Kein Henne-Ei-Problem, kein App-Bootstrap-Pfad nötig.
+- **Code-Format:** 6 Zeichen, Charset ohne mehrdeutige Zeichen
+  (kein `0/O`, `1/I/L`) → 32^6 Raum. Eindeutig (DB-Constraint).
+  Case-insensitive Eingabe, intern normalisiert.
+- **Owner kann Code rotieren** (`POST /orgs/:id/rotate-invite-code`),
+  falls geleakt. Alter Code wird sofort ungültig.
+- **Rollen beim Beitritt:** neuer User → `org_role = member`, **keine**
+  Workspace-Mitgliedschaft (Owner ordnet später Workspaces/Rollen zu).
+- **E-Mail:** global eindeutig (ein Account = eine Org in v1).
+- **Abuse-Schutz:** Rate-Limit auf `register`/`login`, Code-Versuche
+  gedrosselt (Brute-Force auf 6 Zeichen sonst trivial).
+
+## Planungslücken (in den Plan aufgenommen)
+
+Bei der Durchsicht gefundene, vorher fehlende Punkte:
+
+1. **Refresh-Token-Persistenz** (Phase 2): Schema um `refresh_tokens`
+   (Hash + Ablauf + revoked_at) ergänzt → Logout/Revocation/Rotation
+   möglich. (CLAUDE.md §8 aktualisiert.)
+2. **WS-Auth-Lebensdauer** (Phase 6): Access-Token (15 min) < WS-Lebensdauer.
+   → Single multiplexte WS-Verbindung `GET /ws?token=`, Client reconnectet
+   mit frischem Token nach Refresh; Server schließt bei Token-Ablauf.
+   Konsolidiert zugleich die Bridge-Divergenz `/ws/<channel>` → ein Kanal
+   mit `{type,payload}` (CLAUDE.md §7).
+3. **Shared-Session-Nebenläufigkeit** (Phase 6): zwei Editoren senden
+   gleichzeitig an denselben Agenten. → Pro Agent max. ein aktiver Run;
+   zweiter Send wird abgelehnt/gequeued; Run-State per WS an alle Mitglieder.
+4. **Skill-Quelle im Web** (Phase 4/6): Local liest `SKILL.md` von Disk.
+   Web: Skills werden **mit dem Backend-Binary gebündelt** (read-only,
+   kein User-Script — CLAUDE.md §3 Regel 7), `skillsApi.list()` liefert sie.
+5. **Agent-Attachment-Referenz** (Phase 4/5): `attachments.templatePath`
+   zeigt heute auf einen Pfad → muss auf eine `workspace_files`-ID umgestellt
+   werden; Auto-Clear, wenn Datei gelöscht (WS-Event `agent-attachments-changed`).
+6. **Datei-Namenskollision** (Phase 5): gleicher Dateiname erneut hochgeladen
+   → Default: überschreiben + neue Version-Metadaten; Entscheidung vor Phase 5
+   final festzurren.
+7. **Test-DB-Widerspruch** (Querschnitt): CLAUDE.md §13 nannte In-Memory-SQLite
+   — inkompatibel mit Postgres-spezifischem, compile-time-geprüftem sqlx.
+   → korrigiert auf Postgres-Testcontainer / `#[sqlx::test]`.
+8. **API-Key-Verschlüsselung** (Phase 4): Verhalten bei fehlendem/rotiertem
+   `API_KEY_ENCRYPTION_KEY` definieren (Fail-fast beim Start, klare Fehlermeldung).
+9. **Delegation/Sub-Agenten** (out of scope v1): `Agent.delegationProfile`
+   bleibt im Typ, Backend implementiert es in v1 **nicht** — explizit als
+   Nicht-Ziel dokumentieren, damit es nicht implizit erwartet wird.
+
+## Vor dem jeweiligen Phasenstart final zu entscheiden
+
+- **Phase 5:** Namenskollisions-Strategie (überschreiben vs. versionieren vs. ablehnen)?
+- **Phase 6:** Provider-API-Versionen/Modell-IDs aktuell halten; Prompt-Caching-
+  Granularität (System-Prompt + Tool-Schemas cachen).

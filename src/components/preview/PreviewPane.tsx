@@ -12,18 +12,17 @@ import { XlsxViewer } from "./XlsxViewer";
 import { previewKindForName } from "./previewKind";
 
 type Props = {
-  agentId: string | null;
+  fileId: string | null;
   fileName: string | null;
-  filePath: string | null;
   onClose: () => void;
 };
 
-export function PreviewPane({ agentId, fileName, filePath, onClose }: Props) {
+export function PreviewPane({ fileId, fileName, onClose }: Props) {
   // Each sub-viewer can publish its own status (saving/saved/conflict). The
   // header lifts it up so we don't have to re-render a header per viewer.
   const [status, setStatus] = useState<PreviewStatus>({ kind: "idle" });
 
-  if (!fileName || !filePath || !agentId) {
+  if (!fileName || !fileId) {
     return (
       <div className="flex h-full items-center justify-center p-6 text-xs text-muted-foreground">
         Wähle links eine Datei, um ihre Vorschau zu öffnen.
@@ -43,8 +42,7 @@ export function PreviewPane({ agentId, fileName, filePath, onClose }: Props) {
       <div className="flex min-h-0 flex-1 flex-col">
         <Body
           kind={kind}
-          agentId={agentId}
-          filePath={filePath}
+          fileId={fileId}
           fileName={fileName}
           onStatus={setStatus}
         />
@@ -55,46 +53,32 @@ export function PreviewPane({ agentId, fileName, filePath, onClose }: Props) {
 
 function Body({
   kind,
-  agentId,
-  filePath,
+  fileId,
   fileName,
   onStatus,
 }: {
   kind: ReturnType<typeof previewKindForName>;
-  agentId: string;
-  filePath: string;
+  fileId: string;
   fileName: string;
   onStatus: (s: PreviewStatus) => void;
 }) {
   switch (kind) {
     case "image":
-      return <ImageViewer filePath={filePath} fileName={fileName} />;
+      return <ImageViewer fileId={fileId} fileName={fileName} />;
     case "text":
-      return (
-        <TextEditor
-          agentId={agentId}
-          filePath={filePath}
-          onStatus={onStatus}
-        />
-      );
+      return <TextEditor fileId={fileId} onStatus={onStatus} />;
     case "markdown":
-      return (
-        <MarkdownEditor
-          agentId={agentId}
-          filePath={filePath}
-          onStatus={onStatus}
-        />
-      );
+      return <MarkdownEditor fileId={fileId} onStatus={onStatus} />;
     case "pdf":
-      return <PdfViewer filePath={filePath} />;
+      return <PdfViewer fileId={fileId} />;
     case "docx":
-      return <DocxViewer agentId={agentId} filePath={filePath} />;
+      return <DocxViewer fileId={fileId} />;
     case "xlsx":
-      return <XlsxViewer agentId={agentId} filePath={filePath} />;
+      return <XlsxViewer fileId={fileId} />;
     case "pptx":
-      return <PptxViewer agentId={agentId} filePath={filePath} />;
+      return <PptxViewer fileId={fileId} />;
     case "unsupported":
     default:
-      return <UnsupportedViewer filePath={filePath} fileName={fileName} />;
+      return <UnsupportedViewer fileId={fileId} fileName={fileName} />;
   }
 }

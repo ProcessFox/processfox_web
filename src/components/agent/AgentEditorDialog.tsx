@@ -1,5 +1,4 @@
-import { open } from "@tauri-apps/plugin-dialog";
-import { Folder, Wrench } from "lucide-react";
+import { Wrench } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -14,9 +13,8 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { agentApi, modelsApi, settingsApi, skillsApi } from "@/lib/tauri";
+import { agentApi, settingsApi, skillsApi } from "@/lib/tauri";
 import type { Agent, DelegationProfile, ModelRef } from "@/types/agent";
-import type { InstalledModel } from "@/types/models";
 import type { Settings } from "@/types/settings";
 import type { Skill } from "@/types/skill";
 
@@ -24,6 +22,8 @@ type Props = {
   open: boolean;
   mode: "create" | "edit";
   agent: Agent | null;
+  /** Workspace the new agent belongs to (required when mode === "create"). */
+  workspaceId: string | null;
   onClose: () => void;
   onSaved: (agent: Agent) => void;
 };
@@ -36,32 +36,21 @@ const PROVIDER_OPTIONS: { value: string; label: string }[] = [
   { value: "anthropic", label: "Anthropic" },
   { value: "openai", label: "OpenAI" },
   { value: "openrouter", label: "OpenRouter" },
-  { value: "local", label: "Lokal (GGUF)" },
 ];
 
-function modelRefToSelection(m: ModelRef | null): ModelSelection {
+function modelRefToSelection(m: ModelRef | null | undefined): ModelSelection {
   if (!m) return { kind: "inherit" };
-  if (m.type === "cloud") {
-    return { kind: "override", provider: m.provider, modelId: m.id };
-  }
-  if (m.type === "local") {
-    return { kind: "override", provider: "local", modelId: m.id };
-  }
-  return { kind: "inherit" };
+  return { kind: "override", provider: m.provider, modelId: m.id };
 }
 
 function selectionToModelRef(sel: ModelSelection): ModelRef | undefined {
   if (sel.kind === "inherit") return undefined;
-  if (sel.provider === "local") {
-    return { type: "local", id: sel.modelId };
-  }
-  return { type: "cloud", provider: sel.provider, id: sel.modelId };
+  return { provider: sel.provider, id: sel.modelId };
 }
 
 type ModelPickerProps = {
   selection: ModelSelection;
   onChange: (s: ModelSelection) => void;
-  installed: InstalledModel[];
   defaultLabel: string;
   defaultHint: string;
   overrideHint: string;
@@ -70,7 +59,6 @@ type ModelPickerProps = {
 function ModelOverridePicker({
   selection,
   onChange,
-  installed,
   defaultLabel,
   defaultHint,
   overrideHint,
@@ -113,63 +101,28 @@ function ModelOverridePicker({
       </div>
 
       {selection.kind === "override" && (
-        <div className="mt-2 flex flex-col gap-2">
-          <div className="grid grid-cols-[140px_1fr] gap-2">
-            <select
-              value={selection.provider}
-              onChange={(e) => {
-                const nextProvider = e.target.value;
-                // Reset the model-id when switching between cloud and
-                // local, because the ID formats differ (cloud: opaque
-                // string like "claude-sonnet-4-6"; local: a filename).
-                onChange({
-                  kind: "override",
-                  provider: nextProvider,
-                  modelId:
-                    nextProvider === selection.provider ? selection.modelId : "",
-                });
-              }}
-              className="h-8 rounded-md border border-border bg-background px-2 text-xs"
-            >
-              {PROVIDER_OPTIONS.map((p) => (
-                <option key={p.value} value={p.value}>
-                  {p.label}
-                </option>
-              ))}
-            </select>
-
-            {selection.provider === "local" ? (
-              installed.length === 0 ? (
-                <div className="flex items-center rounded-md border border-dashed border-border bg-muted/40 px-3 text-xs text-muted-foreground">
-                  Erst ein Modell in den Einstellungen herunterladen.
-                </div>
-              ) : (
-                <select
-                  value={selection.modelId}
-                  onChange={(e) =>
-                    onChange({ ...selection, modelId: e.target.value })
-                  }
-                  className="h-8 rounded-md border border-border bg-background px-2 text-xs"
-                >
-                  <option value="">— Modell wählen —</option>
-                  {installed.map((m) => (
-                    <option key={m.filename} value={m.filename}>
-                      {m.filename}
-                    </option>
-                  ))}
-                </select>
-              )
-            ) : (
-              <Input
-                value={selection.modelId}
-                onChange={(e) =>
-                  onChange({ ...selection, modelId: e.target.value })
-                }
-                placeholder="z. B. claude-sonnet-4-6"
-                className="text-xs"
-              />
-            )}
-          </div>
+        <div className="mt-2 grid grid-cols-[140px_1fr] gap-2">
+          <select
+            value={selection.provider}
+            onChange={(e) =>
+              onChange({ ...selection, provider: e.target.value })
+            }
+            className="h-8 rounded-md border border-border bg-background px-2 text-xs"
+          >
+            {PROVIDER_OPTIONS.map((p) => (
+              <option key={p.value} value={p.value}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+          <Input
+            value={selection.modelId}
+            onChange={(e) =>
+              onChange({ ...selection, modelId: e.target.value })
+            }
+            placeholder="z. B. claude-sonnet-4-6"
+            className="text-xs"
+          />
         </div>
       )}
     </>
@@ -180,16 +133,15 @@ export function AgentEditorDialog({
   open: isOpen,
   mode,
   agent,
+  workspaceId,
   onClose,
   onSaved,
 }: Props) {
   const [name, setName] = useState("");
   const [icon, setIcon] = useState("Bot");
-  const [folder, setFolder] = useState<string | null>(null);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [selection, setSelection] = useState<ModelSelection>({ kind: "inherit" });
   const [settings, setSettings] = useState<Settings | null>(null);
-  const [installed, setInstalled] = useState<InstalledModel[]>([]);
   const [availableSkills, setAvailableSkills] = useState<Skill[]>([]);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [hitlDisabled, setHitlDisabled] = useState(false);
@@ -204,7 +156,6 @@ export function AgentEditorDialog({
   useEffect(() => {
     if (!isOpen) return;
     settingsApi.get().then(setSettings).catch(console.error);
-    modelsApi.listInstalled().then(setInstalled).catch(console.error);
     skillsApi
       .list()
       .then((list) => {
@@ -220,7 +171,6 @@ export function AgentEditorDialog({
     if (mode === "edit" && agent) {
       setName(agent.name);
       setIcon(agent.icon);
-      setFolder(agent.folder);
       setSystemPrompt(agent.systemPrompt);
       setSelection(modelRefToSelection(agent.model));
       setActiveSkills(agent.skills);
@@ -232,7 +182,6 @@ export function AgentEditorDialog({
     } else {
       setName("");
       setIcon("Bot");
-      setFolder(null);
       setSystemPrompt("");
       setSelection({ kind: "inherit" });
       setActiveSkills([]);
@@ -244,15 +193,6 @@ export function AgentEditorDialog({
     setError(null);
   }, [isOpen, mode, agent]);
 
-  async function pickFolder() {
-    try {
-      const picked = await open({ directory: true, multiple: false });
-      if (typeof picked === "string") setFolder(picked);
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
   async function handleSave() {
     if (
       delegationEnabled &&
@@ -262,6 +202,10 @@ export function AgentEditorDialog({
       setError(
         "Bitte ein Modell für den Hintergrund-Worker wählen oder auf Default zurücksetzen.",
       );
+      return;
+    }
+    if (mode === "create" && !workspaceId) {
+      setError("Kein Workspace ausgewählt.");
       return;
     }
     setSubmitting(true);
@@ -281,7 +225,7 @@ export function AgentEditorDialog({
           ? await agentApi.create({
               name: name.trim(),
               icon,
-              folder: folder ?? undefined,
+              workspaceId: workspaceId!,
               systemPrompt,
               model,
               skills: activeSkills,
@@ -291,7 +235,6 @@ export function AgentEditorDialog({
           : await agentApi.update(agent!.id, {
               name: name.trim(),
               icon,
-              folder: folder ?? undefined,
               systemPrompt,
               model,
               skills: activeSkills,
@@ -315,7 +258,7 @@ export function AgentEditorDialog({
     if (!settings) return "…";
     const provider = settings.defaultProvider;
     if (!provider) return "Kein Default gesetzt (in Einstellungen konfigurieren).";
-    const model = settings.defaultModels?.[provider];
+    const model = settings.defaultModel;
     return model ? `${provider} · ${model}` : `${provider} · kein Default-Modell`;
   })();
 
@@ -342,28 +285,6 @@ export function AgentEditorDialog({
           </div>
 
           <div className="flex flex-col gap-1.5">
-            <Label className="text-xs">Ordner</Label>
-            <div className="flex items-center gap-2">
-              <div
-                className="min-w-0 flex-1 truncate rounded-md border border-border bg-background px-3 py-1.5 text-xs text-muted-foreground"
-                title={folder ?? undefined}
-              >
-                {folder ?? "Kein Ordner gewählt"}
-              </div>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={pickFolder}
-                className="shrink-0 gap-2"
-              >
-                <Folder className="h-3.5 w-3.5" />
-                Wählen
-              </Button>
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-1.5">
             <Label htmlFor="agent-prompt" className="text-xs">
               System-Prompt
             </Label>
@@ -382,7 +303,6 @@ export function AgentEditorDialog({
             <ModelOverridePicker
               selection={selection}
               onChange={setSelection}
-              installed={installed}
               defaultLabel="Default"
               defaultHint={inheritedHint}
               overrideHint="Modell für diesen Agenten festlegen"
@@ -446,7 +366,7 @@ export function AgentEditorDialog({
               <span className="text-xs text-muted-foreground">
                 Schreib-Tools laufen sofort durch — der Freigabe-Dialog wird
                 übersprungen. Vorsicht: nur für Agenten verwenden, denen du
-                das eigenständige Arbeiten in „ihrem" Ordner zutraust.
+                das eigenständige Arbeiten in „ihrem" Workspace zutraust.
               </span>
             </div>
           </label>
@@ -493,7 +413,6 @@ export function AgentEditorDialog({
                 <ModelOverridePicker
                   selection={delegationSelection}
                   onChange={setDelegationSelection}
-                  installed={installed}
                   defaultLabel="Wie der Agent"
                   defaultHint="Erbt das Modell des Eltern-Agenten."
                   overrideHint="Eigenes Modell für den Worker"

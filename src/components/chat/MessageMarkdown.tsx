@@ -1,8 +1,7 @@
-import { memo, type AnchorHTMLAttributes, type MouseEvent } from "react";
+import { memo, type AnchorHTMLAttributes } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
-import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { cn } from "@/lib/utils";
 
@@ -40,23 +39,19 @@ function MessageMarkdownInner({ text, className }: Props) {
 export const MessageMarkdown = memo(MessageMarkdownInner);
 
 const MARKDOWN_COMPONENTS: Components = {
-  a: ({ href, children, ...rest }: AnchorHTMLAttributes<HTMLAnchorElement>) => {
-    const onClick = (e: MouseEvent<HTMLAnchorElement>) => {
-      e.preventDefault();
-      if (!href) return;
-      openUrl(href).catch((err) => console.warn("openUrl failed", err));
-    };
-    return (
-      <a
-        {...rest}
-        href={href}
-        onClick={onClick}
-        className="text-primary underline underline-offset-2 hover:opacity-80"
-      >
-        {children}
-      </a>
-    );
-  },
+  a: ({ href, children, ...rest }: AnchorHTMLAttributes<HTMLAnchorElement>) => (
+    // Links open in a new browser tab; rel hardening since the href comes
+    // from model output.
+    <a
+      {...rest}
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer nofollow"
+      className="text-primary underline underline-offset-2 hover:opacity-80"
+    >
+      {children}
+    </a>
+  ),
   p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
   ul: ({ children }) => (
     <ul className="mb-2 list-disc pl-5 last:mb-0 [&_ul]:mb-0 [&_ol]:mb-0">

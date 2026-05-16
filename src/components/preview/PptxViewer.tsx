@@ -3,8 +3,7 @@ import { useEffect, useState } from "react";
 import { previewApi, type PptxPreview, type SlidePreview } from "@/lib/tauri";
 
 type Props = {
-  agentId: string;
-  filePath: string;
+  fileId: string;
 };
 
 type State =
@@ -16,14 +15,14 @@ type State =
  *  its title, body bullets, and (collapsed by default) speaker notes. We
  *  intentionally don't try to recreate the visual layout — see
  *  `core::preview::pptx` for why. */
-export function PptxViewer({ agentId, filePath }: Props) {
+export function PptxViewer({ fileId }: Props) {
   const [state, setState] = useState<State>({ kind: "loading" });
 
   useEffect(() => {
     let cancelled = false;
     setState({ kind: "loading" });
     previewApi
-      .pptx(agentId, filePath)
+      .pptx(fileId)
       .then((data) => {
         if (cancelled) return;
         setState({ kind: "ready", data });
@@ -37,7 +36,7 @@ export function PptxViewer({ agentId, filePath }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [agentId, filePath]);
+  }, [fileId]);
 
   if (state.kind === "loading") {
     return (
