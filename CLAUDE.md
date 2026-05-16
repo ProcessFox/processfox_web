@@ -11,6 +11,12 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 ## 1. Projekt-Kurzprofil
 
 - **Produkt:** ProcessFox Web — Browser-basierte, team-fähige KI-Agenten-Plattform für kollaborative Dokumentenarbeit.
+- **Domain:** Wird unter der Subdomain **`chat.processfox.ai`** ausgeliefert.
+- **Produkt-Familie (gemeinsames Design, unterschiedliche Architektur):**
+  - **`www.processfox.ai`** — reguläre Marketing-/Produkt-Webseite (eigenes Repo).
+  - **ProcessFox Local** — lokal installierbare Desktop-App (Tauri, `processfox_local`-Repo).
+  - **ProcessFox Web** — dieses Repo, `chat.processfox.ai`.
+  - Alle drei teilen sich Design-Sprache, Farb-/Typo-System und UI-Komponenten-Look. Änderungen am gemeinsamen visuellen Erscheinungsbild müssen mit den anderen Flächen konsistent bleiben.
 - **Zielgruppe:** Kleine Teams und NGOs, die gemeinsam remote an Dateien arbeiten. Einzel-Anwender ohne lokale Modell-Infrastruktur.
 - **Deployment:** Self-hosted via [Coolify](https://coolify.io/) (Docker), alternativ als Managed-Service.
 - **Kernunterschied zu ProcessFox Local:**
@@ -18,6 +24,55 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
   - Datei-Upload statt lokaler Ordnerzugriff
   - Cloud-LLMs als primärer Pfad — kein lokales GGUF
   - Browser-App statt Desktop-App
+
+---
+
+## 1a. Ist-Stand (Stand: 2026-05-16)
+
+> **Wichtig:** Der Rest dieses Dokuments (§2–§16) beschreibt den **Soll-Zustand** /
+> die Ziel-Architektur. Der folgende Abschnitt beschreibt, was **tatsächlich im
+> Repo liegt**. Bei jedem Task zuerst hier prüfen, was schon existiert.
+
+**Was realisiert ist:**
+
+- **Nur das Frontend.** Das Repo enthält ausschließlich die React/Vite/TS-App —
+  ein nahezu 1:1-Port des Frontends aus `processfox_local` (ein einziger Commit
+  „Initial commit", 70 Dateien).
+- **API-Bridge umgeschrieben:** `src/lib/tauri.ts` ersetzt die Tauri-`invoke`/`listen`-
+  Bridge durch `fetch` (HTTP POST) + `WebSocket`. Die Funktions-Signaturen sind
+  unverändert, damit die UI-Komponenten ungeändert bleiben.
+- UI-Komponenten vollständig vorhanden: Agent-Editor/-Switcher, Chat-Pane
+  (inkl. HITL-Karten, AskUser, Tool-/Reasoning-Chips), FileTree, Preview-Viewer
+  (docx/xlsx/pptx/pdf/image/markdown/text), Settings (Models + Cloud-APIs),
+  Welcome-Dialog, Theme-Provider, shadcn-UI-Bausteine.
+
+**Was NICHT existiert (entgegen §6 ff.):**
+
+- **Kein Backend.** Es gibt kein `backend/`-Verzeichnis, keinen Axum-Server,
+  keine DB-Migrations, keine Rust-Crate. Die Bridge zeigt ins Leere
+  (`vite.config.ts` proxyt `/api`+`/ws` → `localhost:3000`, dort läuft nichts).
+- **Kein Auth / Mehrbenutzer.** `src/types/auth.ts`, `src/hooks/useAuth.ts`,
+  `src/views/Login.tsx` und `src/components/workspace/` existieren **nicht**.
+  Es gibt keinerlei Org-/Workspace-/Rollen-Konzept im Frontend.
+- **Local-Paradigma noch durchgängig vorhanden** — d. h. das Frontend ist noch
+  *nicht* an das Web-Konzept angepasst:
+  - Lokale GGUF-Modelle, Hardware-Info, Modell-Katalog & -Download
+    (`modelsApi`, `HardwareInfo`, `provider === "local"`-Pfade in `App.tsx`).
+  - OS-Ordner-Zugriff statt Upload (`list_agent_folder`, `watch_agent_folder`,
+    `import_files_to_agent`, `files-dropped`-Event, `agent.folder`).
+  - `Agent` hat ein `folder`-Feld, kein `workspace_id`.
+- **API-Bridge weicht von §7 ab:** Die Bridge nutzt **RPC-Stil**
+  (`POST /api/<command>`, z. B. `/api/list_agents`), **nicht** das in §7
+  beschriebene RESTful-Schema `/api/v1/...`. Auch ohne `Authorization`-Header.
+  Diese Diskrepanz ist offen und muss bewusst entschieden werden (siehe §7-Notiz).
+
+**Daraus folgende grobe Roadmap (noch nicht abgestimmt — siehe Fragen):**
+
+1. Backend-Skeleton (Axum + sqlx + S3) anlegen.
+2. Auth-Schicht (JWT, Login-View, `useAuth`) ergänzen.
+3. Frontend vom Local- auf das Web-Paradigma umbauen (Workspaces statt Ordner,
+   Upload statt OS-Zugriff, Local-Modell-/Hardware-Code entfernen).
+4. Bridge-Konvention (RPC vs. REST) festziehen.
 
 ---
 
@@ -193,6 +248,12 @@ processfox_web/
 ---
 
 ## 7. API-Konventionen
+
+> **⚠ Offene Diskrepanz (siehe §1a):** Die aktuell im Repo liegende Bridge
+> (`src/lib/tauri.ts`) nutzt RPC-Stil (`POST /api/<command>`, ohne Versionierung,
+> ohne Auth-Header). Das folgende RESTful-Schema ist der **Soll-Zustand**, aber
+> noch nicht implementiert. Bevor das Backend gebaut wird, muss entschieden
+> werden, welche Konvention gilt — und die jeweils andere Seite angepasst werden.
 
 ### HTTP-Endpunkte
 
