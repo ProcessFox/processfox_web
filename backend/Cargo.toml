@@ -40,7 +40,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde"] }
 
 [profile.release]
-# Smaller, faster-to-ship binary for the container image.
-opt-level = 2
-lto = "thin"
+# Auf Build-Geschwindigkeit + niedrigen Peak-RAM optimiert (2-vCPU-VPS).
+# Kein LTO (spart den teuren Whole-Program-Link), opt-level 1 (für einen
+# I/O-gebundenen Axum-Server praktisch ohne Laufzeit-Nachteil), viele
+# codegen-units für mehr Parallelität.
+opt-level = 1
+lto = false
+codegen-units = 256
+incremental = false
 strip = true

@@ -27,15 +27,37 @@ Schritt-für-Schritt-Anleitung für den Deploy von ProcessFox Web auf
 - **Bucket anlegen:** MinIO-Konsole öffnen → Bucket **`processfox`**
   erstellen (Phase 1 nutzt es noch nicht, aber so ist es ab Phase 5 bereit).
 
-## 2. Application anlegen
+## 2. Image bauen (GitHub Actions) statt auf dem VPS
 
-- **+ New → Application → Public/Private Repository** → dieses GitHub-Repo.
-- **Build Pack: Dockerfile** (das `Dockerfile` liegt im Repo-Root,
-  Build-Kontext = Repo-Root — nichts umstellen).
+> **Warum:** Der 2-vCPU-VPS ist zu schwach, um Frontend (großer Bundle) +
+> Rust-Backend zu *bauen* — Builds liefen >25 min ins Memory-Thrashing.
+> Deshalb baut **GitHub Actions** das Image und pusht es nach GHCR; Coolify
+> **zieht** nur das fertige Image (Pull = Sekunden, VPS baut nichts).
+
+1. Workflow `.github/workflows/docker.yml` ist im Repo. Bei jedem Push auf
+   `main` (oder manuell via „Run workflow") baut er das Multi-Stage-Image
+   und pusht nach `ghcr.io/<owner>/<repo>` (Tags `latest` + Commit-SHA).
+2. **Package auf öffentlich stellen** (einmalig, nach dem ersten erfolg-
+   reichen Run): GitHub → Repo/Org → **Packages** → `processfox_web` →
+   **Package settings → Change visibility → Public**. Danach kann Coolify
+   ohne Credentials ziehen.
+
+## 2b. Application in Coolify anlegen (Docker Image, kein Build)
+
+- **+ New → Docker Image** (nicht „Repository"/Dockerfile-Build).
+- **Image:** `ghcr.io/<owner-lowercase>/processfox_web:latest`
+  (z. B. `ghcr.io/processfox/processfox_web:latest`).
 - **Port:** `3000`.
 - **Health Check Path:** `/api/v1/health` (erwartete Antwort
   `{"status":"ok"}`, HTTP 200).
-- **Branch:** `main`, „Deploy on push" aktivieren.
+- Redeploy nach neuem Image: in Coolify **Redeploy** drücken, sobald der
+  GitHub-Action-Run grün ist (optional später per Coolify-Deploy-Webhook
+  am Ende des Workflows automatisieren).
+
+> Eine bereits als „Dockerfile-Build aus Repository" angelegte Application
+> kann nicht zuverlässig auf Image-Pull umgestellt werden — sauberer ist
+> eine **neue** Docker-Image-Resource (Env-Vars/Domain dorthin übernehmen,
+> alte Resource danach löschen).
 
 ## 3. Umgebungsvariablen (Coolify → Environment Variables)
 
@@ -67,8 +89,10 @@ Vorlage siehe `.env.example`. Konkret:
 
 ## 5. Deploy & Verifikation
 
-1. **Deploy** in Coolify auslösen (oder Push auf `main`).
-2. Build dauert beim ersten Mal länger (Rust-Dependency-Kompilierung).
+1. Push auf `main` → **GitHub-Action** „Build & Push Image" abwarten
+   (Actions-Tab; erster Run lädt/baut alles, danach via Cache schnell).
+2. In Coolify **Redeploy** der Docker-Image-Resource auslösen (zieht das
+   frische `:latest`).
 3. Nach „Healthy":
 
 ```bash
