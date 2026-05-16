@@ -46,3 +46,16 @@ jobs:
             ${{ env.IMAGE }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Stößt Coolify nach erfolgreichem Push an, das neue :latest zu ziehen.
+      # No-op, solange das Secret COOLIFY_DEPLOY_WEBHOOK nicht gesetzt ist —
+      # dann bleibt es beim manuellen Redeploy.
+      - name: Trigger Coolify redeploy
+        env:
+          HOOK: ${{ secrets.COOLIFY_DEPLOY_WEBHOOK }}
+          TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+        if: ${{ env.HOOK != '' }}
+        run: |
+          curl -fsS -X POST \
+            ${TOKEN:+-H "Authorization: Bearer $TOKEN"} \
+            "$HOOK"
