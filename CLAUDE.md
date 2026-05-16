@@ -398,26 +398,24 @@ Das Projekt nutzt einen **Multi-Stage Docker Build**:
 2. **Stage 2 — Backend-Build:** Rust-Image, `cargo build --release` → Binary
 3. **Stage 3 — Runtime:** Minimales Debian-Image, kopiert Frontend-`dist/` und Backend-Binary. Der Axum-Server serviert das Frontend als statische Dateien unter `/` und die API unter `/api/v1/`.
 
-```dockerfile
-# Grob-Skizze — Details beim Aufsetzen verfeinern
-FROM node:22-alpine AS frontend
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci
-COPY . .
-RUN npm run build
+Das konkrete `Dockerfile` liegt im Repo-Root (seit Phase 1) und ist baubar.
+Eckpunkte:
 
-FROM rust:1.82 AS backend
-WORKDIR /app
-COPY backend/ .
-RUN cargo build --release
+- **Build-Kontext = Repo-Root** (nicht `backend/`), damit Stage 1 das
+  Frontend und Stage 2 `backend/` sieht.
+- **Stage 2** nutzt `rust:1-bookworm`; das Runtime-Image ist
+  `debian:bookworm-slim` (gleiche glibc). `ca-certificates` ist im Runtime
+  installiert (TLS zu Postgres/S3).
+- Migrationen sind via `sqlx::migrate!` ins Binary eingebettet — beim
+  Image-Bau ist **keine** DB-Verbindung nötig (keine `query!`-Makros im
+  Skeleton).
+- Healthcheck-Pfad für Coolify: **`GET /api/v1/health`** → `{"status":"ok"}`.
 
-FROM debian:bookworm-slim AS runtime
-COPY --from=frontend /app/dist /app/static
-COPY --from=backend /app/target/release/processfox-web /app/processfox-web
-ENV STATIC_DIR=/app/static
-CMD ["/app/processfox-web"]
-```
+> Stand Phase 1: Der Server liefert das Frontend aus und beantwortet
+> `/api/v1/health`. Alle übrigen API-Endpunkte folgen in Phase 2–6 — bis
+> dahin lädt die UI, aber Datenaktionen liefern 404. Der Phase-1-Deploy
+> validiert die Pipeline (Build, Coolify, Postgres/MinIO, Health), nicht
+> die App-Funktion.
 
 ### Pflicht-Umgebungsvariablen
 

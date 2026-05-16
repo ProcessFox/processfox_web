@@ -54,9 +54,14 @@ umgestellt (Transport bleibt RPC bis zur REST-Etappe). Neue Typen
 
 ---
 
-## Phase 1 — Backend-Skeleton (Axum)
+## Phase 1 — Backend-Skeleton (Axum) ✅ ABGESCHLOSSEN (2026-05-16)
 
 `backend/`-Crate gemäß CLAUDE.md §6.
+
+**Ergebnis:** `cargo build` + `cargo fmt --check` + `clippy -D warnings`
+grün. Multi-Stage-`Dockerfile`, `.dockerignore`, `.env.example`, `DEPLOY.md`
+erstellt. Container-Smoke-Test (Health/Migrations) findet beim Coolify-Deploy
+statt (lokales Docker stand nicht zur Verfügung).
 
 - `Cargo.toml`, `main.rs`, `lib.rs`, `config.rs` (Env-Vars §12).
 - sqlx-Pool (Postgres), `db/migrations/` mit Schema §8.

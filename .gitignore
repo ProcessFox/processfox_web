@@ -3,3 +3,9 @@ dist
 dist-ssr
 *.local
 .DS_Store
+
+# Rust backend
+backend/target
+
+# Local env
+.env

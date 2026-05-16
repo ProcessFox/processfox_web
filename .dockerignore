@@ -1,0 +1,10 @@
+node_modules
+dist
+dist-ssr
+backend/target
+.git
+.gitignore
+*.local
+.DS_Store
+PLAN.md
+README.md
