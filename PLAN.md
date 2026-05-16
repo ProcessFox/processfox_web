@@ -77,7 +77,7 @@ Migrations laufen, `/api/v1/health` antwortet.
 
 ---
 
-## Phase 2 — Auth (passwordless Magic-Link) ✅ ABGESCHLOSSEN (2026-05-16)
+## Phase 2 — Auth (passwordless Magic-Link) ✅ ABGESCHLOSSEN + LIVE VERIFIZIERT (2026-05-16)
 
 > **Geänderte Entscheidung:** statt E-Mail+Passwort (Argon2) nun
 > **passwordless Magic-Link**. Mailversand via n8n-Webhook. CLAUDE.md §4
@@ -109,15 +109,25 @@ nachziehen, sobald ein Test-Postgres steht (CLAUDE.md §13).
 
 ---
 
-## Phase 3 — Workspaces & Mitglieder
+## Phase 3 — Workspaces & Mitglieder ✅ ABGESCHLOSSEN (2026-05-16)
 
-- Tabellen `workspaces`, `workspace_members`.
-- Endpunkte: Workspace CRUD, Member-Invite/-Rollen.
-- Middleware: `require_workspace_member`, `require_editor`.
-- Frontend: `components/workspace/` (WorkspaceSwitcher, MemberList, InviteDialog).
+- Tabellen `workspaces`, `workspace_members` (bereits aus Schema 0001).
+- REST: `GET/POST /workspaces`, `PATCH/DELETE /workspaces/{id}`,
+  `GET/POST /workspaces/{id}/members`, `PATCH/DELETE
+  /workspaces/{id}/members/{userId}`.
+- Helper `effective_role`/`require_member`/`require_editor`/
+  `require_org_owner`: Org-`owner` = Vollzugriff in eigener Org; sonst
+  `workspace_members.role`; fremde Org → 404 (kein Leak).
+- Frontend: `components/workspace/` (`WorkspaceSwitcher`,
+  `WorkspaceMembersDialog`), Bridge `workspaceApi`/`memberApi` auf REST,
+  App-Init gegen fehlende Settings/Agent-Endpunkte (Phase 4) entkoppelt.
 
-**Abnahme:** Berechtigungs-Matrix (CLAUDE.md §4) testabgedeckt; Nicht-Mitglied
-bekommt 403.
+**Ergebnis:** `cargo build/fmt/clippy -D warnings` grün, 5 DB-freie
+Unit-Tests grün (inkl. Rollen-Validierung); `tsc` + `npm run build` grün.
+
+**Offen (bewusst verschoben):** HTTP/DB-Integrationstests der
+Berechtigungs-Matrix (Nicht-Mitglied→404/403) brauchen Test-Postgres →
+CI mit `#[sqlx::test]`, zusammen mit Phase-2-Integrationstests.
 
 ---
 

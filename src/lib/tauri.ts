@@ -18,7 +18,12 @@ import type { ChatMessage, RunEvent, RunStarted } from "@/types/chat";
 import type { WorkspaceFile } from "@/types/file";
 import type { Settings } from "@/types/settings";
 import type { Skill } from "@/types/skill";
-import type { AuthSession, Workspace } from "@/types/auth";
+import type {
+  AuthSession,
+  Workspace,
+  WorkspaceMember,
+  WorkspaceRole,
+} from "@/types/auth";
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -153,6 +158,29 @@ async function v1Post<T>(path: string, body: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** Authentifizierter REST-Call gegen /api/v1 mit 401→Refresh→Retry.
+ *  `void` für 204-Antworten (kein JSON-Body). */
+async function v1<T>(
+  method: "GET" | "POST" | "PATCH" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<T> {
+  const doFetch = () =>
+    fetch(`${V1}/${path}`, {
+      method,
+      headers: authHeaders(
+        body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      ),
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  let res = await doFetch();
+  if (res.status === 401 && (await tryRefresh())) res = await doFetch();
+  if (res.status === 401) onSessionLost?.();
+  if (!res.ok) return parseError(res);
+  if (res.status === 204) return undefined as T;
+  return res.json() as Promise<T>;
+}
+
 export type UnlistenFn = () => void;
 
 function subscribeWs<T>(
@@ -170,7 +198,22 @@ function subscribeWs<T>(
 // ---------------------------------------------------------------------------
 
 export const workspaceApi = {
-  list: () => post<Workspace[]>("list_workspaces"),
+  list: () => v1<Workspace[]>("GET", "workspaces"),
+  create: (name: string) => v1<Workspace>("POST", "workspaces", { name }),
+  rename: (id: string, name: string) =>
+    v1<void>("PATCH", `workspaces/${id}`, { name }),
+  delete: (id: string) => v1<void>("DELETE", `workspaces/${id}`),
+};
+
+export const memberApi = {
+  list: (workspaceId: string) =>
+    v1<WorkspaceMember[]>("GET", `workspaces/${workspaceId}/members`),
+  add: (workspaceId: string, email: string, role: WorkspaceRole) =>
+    v1<void>("POST", `workspaces/${workspaceId}/members`, { email, role }),
+  setRole: (workspaceId: string, userId: string, role: WorkspaceRole) =>
+    v1<void>("PATCH", `workspaces/${workspaceId}/members/${userId}`, { role }),
+  remove: (workspaceId: string, userId: string) =>
+    v1<void>("DELETE", `workspaces/${workspaceId}/members/${userId}`),
 };
 
 // ---------------------------------------------------------------------------

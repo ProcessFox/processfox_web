@@ -56,10 +56,16 @@ function AuthGate() {
       />
     );
   }
-  return <AppShell onLogout={auth.logout} />;
+  return <AppShell onLogout={auth.logout} isOwner={auth.user!.orgRole === "owner"} />;
 }
 
-function AppShell({ onLogout }: { onLogout: () => void }) {
+function AppShell({
+  onLogout,
+  isOwner,
+}: {
+  onLogout: () => void;
+  isOwner: boolean;
+}) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspace, setActiveWorkspace] = useState<Workspace | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -144,15 +150,31 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
     skillsApi.list().then(setSkills).catch(console.error);
   }, []);
 
-  // Initial load: workspaces + settings. The first workspace becomes active.
+  // Workspace-Liste laden; optional einen bestimmten (neuen) auswählen,
+  // sonst Auswahl beibehalten bzw. auf den ersten fallen.
+  const refreshWorkspaces = useCallback(
+    async (selectId?: string) => {
+      const ws = await workspaceApi.list();
+      setWorkspaces(ws);
+      setActiveWorkspace((curr) => {
+        if (selectId) return ws.find((w) => w.id === selectId) ?? curr;
+        if (curr) return ws.find((w) => w.id === curr.id) ?? ws[0] ?? null;
+        return ws[0] ?? null;
+      });
+      return ws;
+    },
+    [],
+  );
+
+  // Initial load. Workspaces und Settings unabhängig — fehlt der (erst ab
+  // Phase 4 implementierte) Settings-Endpunkt, blockiert das die
+  // Workspace-Liste nicht.
   useEffect(() => {
-    Promise.all([workspaceApi.list(), refreshSettings()])
-      .then(([ws]) => {
-        setWorkspaces(ws);
-        if (ws.length > 0) setActiveWorkspace(ws[0]);
-      })
-      .catch((e) => console.error("initial load failed", e));
-  }, [refreshSettings]);
+    refreshWorkspaces().catch((e) =>
+      console.error("workspace load failed", e),
+    );
+    refreshSettings().catch((e) => console.warn("settings load failed", e));
+  }, [refreshWorkspaces, refreshSettings]);
 
   // Load agents whenever the active workspace changes.
   useEffect(() => {
@@ -337,6 +359,8 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
       <Main
         workspaces={workspaces}
         activeWorkspace={activeWorkspace}
+        isOwner={isOwner}
+        onWorkspacesChanged={refreshWorkspaces}
         agents={agents}
         activeAgent={activeAgent}
         selectedFile={selectedFile}

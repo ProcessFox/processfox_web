@@ -1,8 +1,8 @@
-//! HTTP-Router unter `/api/v1`. Phase 2: Health + Auth (Magic-Link) +
-//! Org-Invite-Code-Rotation. Workspaces/Agenten/Dateien/Chat folgen in
-//! Phase 3–6.
+//! HTTP-Router unter `/api/v1`. Phase 2: Auth (Magic-Link). Phase 3:
+//! Workspaces & Mitglieder. Agenten/Dateien/Chat folgen in Phase 4–6.
 
 pub mod auth;
+pub mod workspaces;
 
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -18,6 +18,7 @@ pub fn api_router() -> Router<AppState> {
             post(auth::rotate_invite_code),
         )
         .merge(auth::router())
+        .merge(workspaces::router())
 }
 
 async fn health() -> Json<serde_json::Value> {

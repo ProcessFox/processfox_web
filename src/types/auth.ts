@@ -32,6 +32,12 @@ export interface Workspace {
   createdAt: string;
 }
 
+export interface WorkspaceMember {
+  userId: string;
+  email: string;
+  role: WorkspaceRole;
+}
+
 /** Antwort von `/api/v1/auth/login` bzw. `/auth/register`. */
 export interface AuthSession {
   accessToken: string;

@@ -1,4 +1,5 @@
 import { AgentSwitcher } from "@/components/agent/AgentSwitcher";
+import { WorkspaceSwitcher } from "@/components/workspace/WorkspaceSwitcher";
 import { ChatPane } from "@/components/chat/ChatPane";
 import type { StarterPrompt } from "@/lib/starterPrompts";
 import { FileTree } from "@/components/filetree/FileTree";
@@ -16,6 +17,8 @@ import type { ChatMessage, PendingHitl, PendingQuestion } from "@/types/chat";
 type Props = {
   workspaces: Workspace[];
   activeWorkspace: Workspace | null;
+  isOwner: boolean;
+  onWorkspacesChanged: (selectId?: string) => void;
   agents: Agent[];
   activeAgent: Agent | null;
   selectedFile: { fileId: string; name: string } | null;
@@ -73,6 +76,8 @@ export function Main({
   onAgentUpdated,
   chatFooter,
   fileTreeRefresh,
+  isOwner,
+  onWorkspacesChanged,
   onSelectWorkspace,
   onSelectAgent,
   onCreateAgent,
@@ -97,24 +102,13 @@ export function Main({
     >
       <ResizablePanel defaultSize={22} minSize={16} maxSize={36}>
         <div className="flex h-full flex-col border-r border-border bg-surface">
-          {workspaces.length > 1 && (
-            <div className="border-b border-border px-3 py-2">
-              <select
-                value={activeWorkspace?.id ?? ""}
-                onChange={(e) => {
-                  const ws = workspaces.find((w) => w.id === e.target.value);
-                  if (ws) onSelectWorkspace(ws);
-                }}
-                className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs"
-              >
-                {workspaces.map((w) => (
-                  <option key={w.id} value={w.id}>
-                    {w.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
+          <WorkspaceSwitcher
+            workspaces={workspaces}
+            activeWorkspace={activeWorkspace}
+            isOwner={isOwner}
+            onSelect={onSelectWorkspace}
+            onChanged={onWorkspacesChanged}
+          />
           <AgentSwitcher
             agents={agents}
             activeAgent={activeAgent}
