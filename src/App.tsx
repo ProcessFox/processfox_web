@@ -4,6 +4,8 @@ import { AgentEditorDialog } from "@/components/agent/AgentEditorDialog";
 import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { resolveAgentModel, useAgentChat } from "@/hooks/useAgentChat";
+import { useAuth } from "@/hooks/useAuth";
+import { Login } from "@/views/Login";
 import { Main } from "@/views/Main";
 import { SettingsDialog } from "@/views/Settings";
 import { WelcomeDialog } from "@/views/Welcome";
@@ -29,13 +31,35 @@ export default function App() {
           casual mouse drift across the UI. Native `title` is ~500 ms and
           can't be tuned. */}
       <TooltipProvider delayDuration={150} skipDelayDuration={50}>
-        <AppShell />
+        <AuthGate />
       </TooltipProvider>
     </ThemeProvider>
   );
 }
 
-function AppShell() {
+/** Gate: lädt die App erst nach erfolgreicher (passwordless) Anmeldung. */
+function AuthGate() {
+  const auth = useAuth();
+
+  if (auth.loading) {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-background text-sm text-muted-foreground">
+        Lädt …
+      </div>
+    );
+  }
+  if (!auth.isAuthenticated) {
+    return (
+      <Login
+        onRequestLogin={auth.requestLogin}
+        onRequestRegister={auth.requestRegister}
+      />
+    );
+  }
+  return <AppShell onLogout={auth.logout} />;
+}
+
+function AppShell({ onLogout }: { onLogout: () => void }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspace, setActiveWorkspace] = useState<Workspace | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -362,6 +386,7 @@ function AppShell() {
         defaultTab={settingsState.open ? settingsState.tab : undefined}
         onClose={handleCloseSettings}
         onSettingsChange={handleSettingsChange}
+        onLogout={onLogout}
       />
 
       <WelcomeDialog

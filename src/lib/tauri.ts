@@ -18,24 +18,76 @@ import type { ChatMessage, RunEvent, RunStarted } from "@/types/chat";
 import type { WorkspaceFile } from "@/types/file";
 import type { Settings } from "@/types/settings";
 import type { Skill } from "@/types/skill";
-import type { Workspace } from "@/types/auth";
+import type { AuthSession, Workspace } from "@/types/auth";
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 const BASE = "/api";
+const V1 = "/api/v1";
+
+// In-Memory-Access-Token (kein localStorage — XSS-Härtung). Wird von
+// useAuth gesetzt; bei Reload via Refresh-Cookie wiederhergestellt.
+let accessToken: string | null = null;
+export function setAccessToken(token: string | null): void {
+  accessToken = token;
+}
+/** Wird von useAuth gesetzt, damit ein 401 hier transparent refreshen kann. */
+let onSessionRefreshed: ((s: AuthSession) => void) | null = null;
+let onSessionLost: (() => void) | null = null;
+export function setAuthCallbacks(
+  refreshed: (s: AuthSession) => void,
+  lost: () => void,
+): void {
+  onSessionRefreshed = refreshed;
+  onSessionLost = lost;
+}
+
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  const h: Record<string, string> = { ...(extra ?? {}) };
+  if (accessToken) h.Authorization = `Bearer ${accessToken}`;
+  return h;
+}
+
+// Single-Flight-Refresh: parallele 401er teilen sich einen Refresh-Call.
+let refreshInflight: Promise<boolean> | null = null;
+async function tryRefresh(): Promise<boolean> {
+  if (!refreshInflight) {
+    refreshInflight = fetch(`${V1}/auth/refresh`, { method: "POST" })
+      .then(async (res) => {
+        if (!res.ok) return false;
+        const session = (await res.json()) as AuthSession;
+        accessToken = session.accessToken;
+        onSessionRefreshed?.(session);
+        return true;
+      })
+      .catch(() => false)
+      .finally(() => {
+        refreshInflight = null;
+      });
+  }
+  return refreshInflight;
+}
+
+async function parseError(res: Response): Promise<never> {
+  const err = await res.json().catch(() => ({ message: res.statusText }));
+  throw new Error((err as { message?: string }).message ?? res.statusText);
+}
 
 async function post<T>(command: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}/${command}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: res.statusText }));
-    throw new Error((err as { message?: string }).message ?? res.statusText);
+  const doFetch = () =>
+    fetch(`${BASE}/${command}`, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  let res = await doFetch();
+  if (res.status === 401 && (await tryRefresh())) {
+    res = await doFetch();
   }
+  if (res.status === 401) onSessionLost?.();
+  if (!res.ok) return parseError(res);
   return res.json() as Promise<T>;
 }
 
@@ -44,17 +96,60 @@ async function upload<T>(
   fields: Record<string, string>,
   file: File,
 ): Promise<T> {
-  const form = new FormData();
-  for (const [k, v] of Object.entries(fields)) form.append(k, v);
-  form.append("file", file);
-  const res = await fetch(`${BASE}/${command}`, {
-    method: "POST",
-    body: form,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: res.statusText }));
-    throw new Error((err as { message?: string }).message ?? res.statusText);
+  const build = () => {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) form.append(k, v);
+    form.append("file", file);
+    return fetch(`${BASE}/${command}`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: form,
+    });
+  };
+  let res = await build();
+  if (res.status === 401 && (await tryRefresh())) {
+    res = await build();
   }
+  if (res.status === 401) onSessionLost?.();
+  if (!res.ok) return parseError(res);
+  return res.json() as Promise<T>;
+}
+
+// --- Auth (REST, /api/v1/auth/*) ------------------------------------------
+
+export const authApi = {
+  requestLogin: (email: string) =>
+    v1Post<{ ok: boolean; message: string }>("auth/request-login", { email }),
+  requestRegister: (email: string, inviteCode: string) =>
+    v1Post<{ ok: boolean; message: string }>("auth/request-register", {
+      email,
+      inviteCode,
+    }),
+  verify: (token: string) => v1Post<AuthSession>("auth/verify", { token }),
+  /** Stellt eine Session aus dem httpOnly-Refresh-Cookie wieder her. */
+  refresh: async (): Promise<AuthSession | null> => {
+    const res = await fetch(`${V1}/auth/refresh`, { method: "POST" });
+    if (!res.ok) return null;
+    const s = (await res.json()) as AuthSession;
+    accessToken = s.accessToken;
+    return s;
+  },
+  logout: async (): Promise<void> => {
+    await fetch(`${V1}/auth/logout`, {
+      method: "POST",
+      headers: authHeaders(),
+    }).catch(() => {});
+    accessToken = null;
+  },
+};
+
+async function v1Post<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${V1}/${path}`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) return parseError(res);
   return res.json() as Promise<T>;
 }
 

@@ -73,6 +73,9 @@ Vorlage siehe `.env.example`. Konkret:
 | `S3_REGION` | `us-east-1` |
 | `JWT_SECRET` | `openssl rand -base64 48` (≥ 32 Zeichen) |
 | `API_KEY_ENCRYPTION_KEY` | `openssl rand -hex 32` (genau 64 Hex-Zeichen) |
+| `PUBLIC_BASE_URL` | `https://chat.processfox.ai` (ohne Slash am Ende) |
+| `MAGIC_LINK_WEBHOOK_URL` | n8n-Webhook-URL, die die Login-Mail versendet |
+| `MAGIC_LINK_WEBHOOK_SECRET` | optional; Shared-Secret (Header `X-Webhook-Secret`) |
 | `PORT` | `3000` |
 | `STATIC_DIR` | `/app/static` |
 
@@ -109,11 +112,50 @@ curl -s -o /dev/null -w '%{http_code}\n' \
    Postgres-Konsole prüfen: `\dt` zeigt `organizations`, `users`,
    `workspaces`, … (Schema aus `0001_init.sql`).
 
-## 6. Bekannte Phase-1-Grenzen
+## 6. Erste Organisation + Owner anlegen (Seed-SQL, einmalig)
 
-- Login/Registrierung, Workspaces, Agenten, Datei-Upload, Chat: **noch
-  nicht implementiert** (Phase 2–6). Entsprechende Calls → HTTP 404.
-- Erste Organisation + Owner werden später **einmalig per SQL** angelegt
-  (Coolify-DB-Terminal), nicht über die App — relevant ab Phase 2.
-- Frontend-Bridge spricht aktuell RPC (`POST /api/<command>`); Umstellung
-  auf REST `/api/v1/...` ist eine spätere Etappe (siehe PLAN.md).
+Es gibt **keinen** Org-Erstellungs-Endpunkt — Registrierung erfordert immer
+einen Org-Invite-Code. Die erste Org + den Owner legst du **einmalig per
+SQL** an (Coolify → Postgres → Terminal/Query):
+
+```sql
+-- 1) Organisation mit 6-stelligem Invite-Code (Großbuchstaben, ohne 0/O/1/I/L)
+INSERT INTO organizations (name, invite_code)
+VALUES ('ProcessFox', 'ABCD23') RETURNING id;
+
+-- 2) Owner-User (passwordless — nur E-Mail). <ORG_ID> = id aus Schritt 1
+INSERT INTO users (email, org_id, org_role)
+VALUES ('christian@xplrs.net', '<ORG_ID>', 'owner');
+
+-- 3) Org-Settings-Zeile
+INSERT INTO org_settings (org_id) VALUES ('<ORG_ID>');
+```
+
+Danach: auf `chat.processfox.ai` → **Anmelden** → E-Mail eingeben →
+Magic-Link aus der Mail → eingeloggt. Weitere Mitglieder registrieren sich
+selbst über **Registrieren** mit dem Invite-Code (`ABCD23`).
+
+## 7. n8n-Webhook-Vertrag (Magic-Link-Versand)
+
+Das Backend POSTet bei jedem Login-/Registrierungs-Wunsch an
+`MAGIC_LINK_WEBHOOK_URL`:
+
+```json
+{ "email": "user@example.com",
+  "magicLink": "https://chat.processfox.ai/auth/callback?token=…",
+  "purpose": "login" }
+```
+
+`purpose` ist `login` oder `register`. Ist `MAGIC_LINK_WEBHOOK_SECRET`
+gesetzt, kommt zusätzlich der Header `X-Webhook-Secret`. Dein n8n-Flow muss
+nur eine E-Mail mit `magicLink` als klickbarem Link an `email` versenden.
+Der Link ist 15 Minuten gültig und einmalig nutzbar.
+
+## 8. Bekannte Grenzen (Stand Phase 2)
+
+- Workspaces, Agenten, Datei-Upload, Chat: **noch nicht implementiert**
+  (Phase 3–6) — entsprechende Calls liefern 404, die UI lädt aber nach
+  dem Login.
+- Frontend-Bridge spricht für diese (noch fehlenden) Endpunkte weiter RPC
+  (`POST /api/<command>`); Auth läuft bereits über REST `/api/v1/auth/...`.
+  Vollständige RPC→REST-Umstellung ist eine spätere Etappe (PLAN.md).

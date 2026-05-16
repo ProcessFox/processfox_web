@@ -23,10 +23,18 @@ async fn main() -> anyhow::Result<()> {
 
     let storage = Storage::new(&config.s3);
 
+    // Max. 10 Auth-Versuche pro IP in 5 Minuten.
+    let ratelimit = Arc::new(processfox_web::ratelimit::RateLimiter::new(
+        10,
+        std::time::Duration::from_secs(300),
+    ));
+
     let state = AppState {
         pool,
         storage,
         config: Arc::new(config),
+        ratelimit,
+        http: reqwest::Client::new(),
     };
 
     let app = build_app(state);
@@ -37,8 +45,12 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("Konnte nicht an {addr} binden"))?;
     tracing::info!("ProcessFox Web lauscht auf http://{addr}");
 
-    axum::serve(listener, app)
-        .await
-        .context("Server abgebrochen")?;
+    // ConnectInfo<SocketAddr> wird für das Auth-Rate-Limit (Client-IP) gebraucht.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .context("Server abgebrochen")?;
     Ok(())
 }

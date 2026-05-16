@@ -17,6 +17,7 @@ type Props = {
   defaultTab?: "cloud" | "appearance" | "about";
   onClose: () => void;
   onSettingsChange?: (s: Settings) => void;
+  onLogout?: () => void;
 };
 
 const THEME_OPTIONS: { value: Theme; label: string }[] = [
@@ -30,6 +31,7 @@ export function SettingsDialog({
   defaultTab = "cloud",
   onClose,
   onSettingsChange,
+  onLogout,
 }: Props) {
   const { theme, setTheme } = useTheme();
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -87,12 +89,22 @@ export function SettingsDialog({
           </TabsContent>
 
           <TabsContent value="about" className="py-4">
-            <div className="flex flex-col gap-1 text-xs">
-              <div className="text-sm font-medium">ProcessFox Web</div>
-              <div className="text-muted-foreground">Version 0.1.0</div>
-              <div className="text-muted-foreground">
-                Team-fähige KI-Agenten für gemeinsame Dokumentenarbeit.
+            <div className="flex flex-col gap-3">
+              <div className="flex flex-col gap-1 text-xs">
+                <div className="text-sm font-medium">ProcessFox Web</div>
+                <div className="text-muted-foreground">Version 0.1.0</div>
+                <div className="text-muted-foreground">
+                  Team-fähige KI-Agenten für gemeinsame Dokumentenarbeit.
+                </div>
               </div>
+              {onLogout && (
+                <button
+                  onClick={onLogout}
+                  className="self-start rounded-md border border-border bg-background px-3 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  Abmelden
+                </button>
+              )}
             </div>
           </TabsContent>
         </Tabs>

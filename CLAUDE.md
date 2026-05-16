@@ -131,9 +131,15 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 ### User-Identität
 
-- Registrierung und Login via E-Mail + Passwort (Argon2-Hashing).
-- JWT (15 min Access-Token) + Refresh-Token (7 Tage, httpOnly-Cookie).
-- Kein OAuth in v1 — SSO/SAML als spätere Erweiterung.
+- **Passwordless / Magic-Link** (geänderte Entscheidung, Phase 2): Login &
+  Registrierung nur über E-Mail. Das Backend erzeugt ein einmaliges,
+  15-min-gültiges Token (nur als SHA-256-Hash gespeichert) und POSTet den
+  Magic-Link an einen n8n-Webhook (`MAGIC_LINK_WEBHOOK_URL`), der die Mail
+  versendet. **Kein Passwort, kein Argon2.** Registrierung erfordert
+  zusätzlich den 6-stelligen Org-Invite-Code.
+- JWT (15 min Access-Token, in-memory im Frontend) + Refresh-Token (7 Tage,
+  httpOnly-Cookie, serverseitig gehasht + rotierend/widerrufbar).
+- Kein OAuth/SSO in v1 — spätere Erweiterung.
 
 ---
 

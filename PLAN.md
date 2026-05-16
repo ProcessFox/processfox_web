@@ -60,8 +60,10 @@ umgestellt (Transport bleibt RPC bis zur REST-Etappe). Neue Typen
 
 **Ergebnis:** `cargo build` + `cargo fmt --check` + `clippy -D warnings`
 grün. Multi-Stage-`Dockerfile`, `.dockerignore`, `.env.example`, `DEPLOY.md`
-erstellt. Container-Smoke-Test (Health/Migrations) findet beim Coolify-Deploy
-statt (lokales Docker stand nicht zur Verfügung).
+erstellt. Build via **GitHub Actions → GHCR** (`.github/workflows/docker.yml`,
+public Package), Coolify zieht das Image (VPS baut nichts — 2 vCPU zu schwach
+für den Build). **Live deployed auf `chat.processfox.ai`** (2026-05-16),
+`/api/v1/health` erreichbar.
 
 - `Cargo.toml`, `main.rs`, `lib.rs`, `config.rs` (Env-Vars §12).
 - sqlx-Pool (Postgres), `db/migrations/` mit Schema §8.
@@ -75,23 +77,35 @@ Migrations laufen, `/api/v1/health` antwortet.
 
 ---
 
-## Phase 2 — Auth (JWT)
+## Phase 2 — Auth (passwordless Magic-Link) ✅ ABGESCHLOSSEN (2026-05-16)
 
-- Tabellen `organizations` (inkl. `invite_code`), `users`, `refresh_tokens`.
-  Argon2-Passwort-Hash.
-- `POST /api/v1/auth/register` (**immer mit** 6-stelligem Org-Code),
-  `/auth/login`, `/auth/refresh`, `/auth/logout`,
-  `POST /api/v1/orgs/:id/rotate-invite-code` (nur Owner).
-  **Kein** Org-Erstellungs-Endpunkt — erste Org + Owner manuell in DB.
-- Access-Token 15 min (Bearer), Refresh-Token 7 Tage (httpOnly-Cookie,
-  serverseitig gehasht + widerrufbar). Rate-Limit auf register/login.
-- JWT-Middleware extrahiert `user_id`.
-- Frontend: `src/hooks/useAuth.ts`, `src/views/Login.tsx` (zwei Modi:
-  Login / Registrieren-mit-Org-Code), Token-Refresh-Logik,
-  Bridge injiziert `Authorization`-Header + 401→Refresh→Retry.
+> **Geänderte Entscheidung:** statt E-Mail+Passwort (Argon2) nun
+> **passwordless Magic-Link**. Mailversand via n8n-Webhook. CLAUDE.md §4
+> entsprechend aktualisiert.
 
-**Abnahme:** Auth-Tests (Login, Refresh, abgelaufener Token, Registrierung
-mit gültigem/ungültigem Code); Login-View funktioniert gegen Backend.
+- Tabellen `organizations` (inkl. `invite_code`), `users` (ohne
+  `password_hash`), `refresh_tokens`, `login_tokens` (Magic-Link, nur Hash).
+- `POST /api/v1/auth/request-login` (E-Mail), `/auth/request-register`
+  (E-Mail + 6-stelliger Org-Code), `/auth/verify` (Token → Session),
+  `/auth/refresh`, `/auth/logout`,
+  `POST /api/v1/orgs/{id}/rotate-invite-code` (nur Owner).
+  **Kein** Org-Erstellungs-Endpunkt — erste Org + Owner per Seed-SQL
+  (DEPLOY.md §6).
+- Magic-Link-Token 15 min, einmalig (atomar konsumiert). Access-Token
+  15 min (Bearer), Refresh-Token 7 Tage (httpOnly-Cookie, gehasht,
+  rotierend/widerrufbar). In-Memory-Rate-Limit auf den Auth-Endpunkten.
+- `AuthUser`-Extractor (Bearer → user_id/org_id/org_role).
+- Frontend: `useAuth`, `Login.tsx` (Anmelden / Registrieren-mit-Code),
+  `/auth/callback?token=`-Pickup, App hinter Auth-Gate, Bridge injiziert
+  `Authorization` + 401→Refresh→Retry. Logout in Settings „Über".
+
+**Ergebnis:** `cargo build/fmt/clippy -D warnings` grün, 4 DB-freie
+Unit-Tests (JWT-Roundtrip, Token-Hash) grün; `npm run build` + `tsc` grün.
+Webhook-Vertrag + Seed-SQL in DEPLOY.md §6/§7.
+
+**Offen (bewusst verschoben):** HTTP/DB-Integrationstests (register/verify/
+refresh-Flows) brauchen eine Postgres-Instanz → in CI mit `#[sqlx::test]`
+nachziehen, sobald ein Test-Postgres steht (CLAUDE.md §13).
 
 ---
 

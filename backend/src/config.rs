@@ -17,6 +17,12 @@ pub struct Config {
     pub port: u16,
     /// Verzeichnis mit dem gebauten Frontend (Vite `dist/`).
     pub static_dir: String,
+    /// Basis-URL der App (für Magic-Links), z. B. `https://chat.processfox.ai`.
+    pub public_base_url: String,
+    /// n8n-Webhook, an den Magic-Links zum Mailversand gepusht werden.
+    pub magic_link_webhook_url: String,
+    /// Optionales Shared-Secret (Header `X-Webhook-Secret`) für den Webhook.
+    pub magic_link_webhook_secret: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +83,13 @@ impl Config {
             api_key_encryption_key,
             port,
             static_dir: optional("STATIC_DIR", "/app/static"),
+            public_base_url: required("PUBLIC_BASE_URL")?
+                .trim_end_matches('/')
+                .to_string(),
+            magic_link_webhook_url: required("MAGIC_LINK_WEBHOOK_URL")?,
+            magic_link_webhook_secret: std::env::var("MAGIC_LINK_WEBHOOK_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
         })
     }
 }

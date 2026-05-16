@@ -4,9 +4,11 @@
 //! aus (SPA-Fallback auf `index.html`) und die API unter `/api/v1/`
 //! (CLAUDE.md §7/§12).
 
+pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod ratelimit;
 pub mod routes;
 pub mod storage;
 
@@ -20,6 +22,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
+use crate::ratelimit::RateLimiter;
 use crate::storage::Storage;
 
 #[derive(Clone)]
@@ -27,6 +30,10 @@ pub struct AppState {
     pub pool: PgPool,
     pub storage: Storage,
     pub config: Arc<Config>,
+    /// Brute-Force-Schutz für die Auth-Endpunkte.
+    pub ratelimit: Arc<RateLimiter>,
+    /// HTTP-Client für den Magic-Link-Webhook (n8n).
+    pub http: reqwest::Client,
 }
 
 /// Baut die komplette App: API-Router + statisches Frontend mit
