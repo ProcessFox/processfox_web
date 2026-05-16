@@ -161,7 +161,7 @@ async function v1Post<T>(path: string, body: unknown): Promise<T> {
 /** Authentifizierter REST-Call gegen /api/v1 mit 401→Refresh→Retry.
  *  `void` für 204-Antworten (kein JSON-Body). */
 async function v1<T>(
-  method: "GET" | "POST" | "PATCH" | "DELETE",
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
   path: string,
   body?: unknown,
 ): Promise<T> {
@@ -222,19 +222,20 @@ export const memberApi = {
 
 export const agentApi = {
   list: (workspaceId: string) =>
-    post<Agent[]>("list_agents", { workspaceId }),
-  get: (id: string) => post<Agent>("get_agent", { id }),
-  create: (draft: AgentDraft) => post<Agent>("create_agent", { draft }),
+    v1<Agent[]>("GET", `workspaces/${workspaceId}/agents`),
+  get: (id: string) => v1<Agent>("GET", `agents/${id}`),
+  create: (draft: AgentDraft) =>
+    v1<Agent>("POST", `workspaces/${draft.workspaceId}/agents`, draft),
   update: (id: string, update: AgentUpdate) =>
-    post<Agent>("update_agent", { id, update }),
-  delete: (id: string) => post<void>("delete_agent", { id }),
+    v1<Agent>("PATCH", `agents/${id}`, update),
+  delete: (id: string) => v1<void>("DELETE", `agents/${id}`),
   /** `fileId` referenziert eine Datei im Workspace; `null` löst die
    *  Verknüpfung. */
   setAttachment: (
     agentId: string,
     kind: AttachmentKind,
     fileId: string | null,
-  ) => post<Agent>("set_agent_attachment", { agentId, kind, fileId }),
+  ) => v1<Agent>("POST", `agents/${agentId}/attachment`, { kind, fileId }),
   subscribeAttachmentsChanged: (
     handler: (agentId: string) => void,
   ): Promise<UnlistenFn> =>
@@ -319,13 +320,15 @@ export const fileApi = {
 // ---------------------------------------------------------------------------
 
 export const settingsApi = {
-  get: () => post<Settings>("get_settings"),
+  get: () => v1<Settings>("GET", "settings"),
   setDefaultProvider: (provider: string | null) =>
-    post<Settings>("set_default_provider", { provider }),
+    v1<Settings>("PUT", "settings/provider", { value: provider }),
   setDefaultModel: (model: string | null) =>
-    post<Settings>("set_default_model", { model }),
-  setFirstRunDone: () => post<Settings>("set_first_run_done"),
-  availableProviders: () => post<string[]>("available_providers"),
+    v1<Settings>("PUT", "settings/model", { value: model }),
+  setFirstRunDone: () => v1<Settings>("POST", "settings/first-run-done"),
+  // Statische Liste — kein Backend-Endpunkt nötig.
+  availableProviders: (): Promise<string[]> =>
+    Promise.resolve(["anthropic", "openai", "openrouter"]),
 };
 
 export interface ValidationResult {
@@ -337,17 +340,19 @@ export interface ValidationResult {
  *  exponiert — hier nur Status/Validierung (CLAUDE.md §10). */
 export const secretsApi = {
   setApiKey: (provider: string, value: string) =>
-    post<void>("set_api_key", { provider, value }),
+    v1<void>("POST", `secrets/${provider}`, { value }),
   hasApiKey: (provider: string) =>
-    post<boolean>("has_api_key", { provider }),
+    v1<{ hasKey: boolean }>("GET", `secrets/${provider}`).then(
+      (r) => r.hasKey,
+    ),
   clearApiKey: (provider: string) =>
-    post<void>("clear_api_key", { provider }),
+    v1<void>("DELETE", `secrets/${provider}`),
   validateApiKey: (provider: string) =>
-    post<ValidationResult>("validate_api_key", { provider }),
+    v1<ValidationResult>("POST", `secrets/${provider}/validate`),
 };
 
 export const skillsApi = {
-  list: () => post<Skill[]>("list_skills"),
+  list: () => v1<Skill[]>("GET", "skills"),
 };
 
 // ---------------------------------------------------------------------------

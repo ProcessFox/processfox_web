@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
+use crate::perm::{require_member, require_org_owner};
 use crate::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -79,67 +80,7 @@ fn rfc3339(t: OffsetDateTime) -> String {
     t.format(&Rfc3339).unwrap_or_default()
 }
 
-// --- Berechtigungs-Helper -------------------------------------------------
-
-/// Effektive Rolle des Users im Workspace, oder `None` wenn kein Zugriff
-/// (auch bei fremder Org → behandeln wie „nicht gefunden", kein Leak).
-async fn effective_role(
-    state: &AppState,
-    user: &AuthUser,
-    workspace_id: Uuid,
-) -> ApiResult<Option<String>> {
-    let org: Option<(Uuid,)> = sqlx::query_as("SELECT org_id FROM workspaces WHERE id = $1")
-        .bind(workspace_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
-    let Some((org_id,)) = org else {
-        return Ok(None);
-    };
-    if org_id != user.org_id {
-        return Ok(None);
-    }
-    if user.is_owner() {
-        return Ok(Some("editor".to_string())); // Owner = Vollzugriff
-    }
-    let role: Option<(String,)> = sqlx::query_as(
-        "SELECT role FROM workspace_members \
-         WHERE workspace_id = $1 AND user_id = $2",
-    )
-    .bind(workspace_id)
-    .bind(user.user_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-    Ok(role.map(|r| r.0))
-}
-
-async fn require_member(
-    state: &AppState,
-    user: &AuthUser,
-    workspace_id: Uuid,
-) -> ApiResult<String> {
-    effective_role(state, user, workspace_id)
-        .await?
-        .ok_or(ApiError::NotFound)
-}
-
-// Wird ab Phase 4 (Agenten/Dateien-Schreibaktionen) genutzt.
-#[allow(dead_code)]
-async fn require_editor(state: &AppState, user: &AuthUser, workspace_id: Uuid) -> ApiResult<()> {
-    match require_member(state, user, workspace_id).await?.as_str() {
-        "editor" => Ok(()),
-        _ => Err(ApiError::forbidden("Editor-Rolle erforderlich.")),
-    }
-}
-
-fn require_org_owner(user: &AuthUser) -> ApiResult<()> {
-    if user.is_owner() {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden("Nur der Org-Owner darf das."))
-    }
-}
+// Berechtigungs-Helper sind jetzt in `crate::perm` (von Phase 4 mitgenutzt).
 
 // --- Workspace-Handler ----------------------------------------------------
 

@@ -131,14 +131,31 @@ CI mit `#[sqlx::test]`, zusammen mit Phase-2-Integrationstests.
 
 ---
 
-## Phase 4 — Agents & Settings (DB-backed)
+## Phase 4 — Agents & Settings (DB-backed) ✅ ABGESCHLOSSEN (2026-05-16)
 
-- Tabellen `agents` (workspace-scoped), `org_settings`, `api_keys`
-  (AES-256-GCM, Key aus `API_KEY_ENCRYPTION_KEY`).
-- REST-CRUD für Agents; Settings-Endpunkte org-scoped.
-- API-Keys nie ans Frontend (nur `hasKey`-Bool / Validierung).
+- Tabellen `agents`/`org_settings`/`api_keys` (aus Schema 0001) — keine
+  neue Migration nötig.
+- REST: `GET/POST /workspaces/{wid}/agents`, `GET/PATCH/DELETE
+  /agents/{id}`, `POST /agents/{id}/attachment`; `GET /settings`,
+  `PUT /settings/provider|model`, `POST /settings/first-run-done`;
+  `GET/POST/DELETE /secrets/{provider}`, `POST /secrets/{provider}/validate`;
+  `GET /skills` (vorerst `[]`, Skills ab Phase 6).
+- `crypto.rs`: AES-256-GCM (`nonce||ct`), Key = `API_KEY_ENCRYPTION_KEY`.
+  Klartext-Keys nie ans Frontend (`GET /secrets/{p}` → nur `{hasKey}`),
+  `validate` macht Live-Provider-Check. Settings-Schreiben + Key-Mgmt
+  Owner-only; Lesen jedes Org-Mitglied.
+- Berechtigungs-Helper nach `crate::perm` extrahiert (von Workspaces +
+  Agenten geteilt). Frontend-Bridge `agentApi/settingsApi/secretsApi/
+  skillsApi` auf REST (mit 401→Refresh→Retry), Signaturen unverändert.
 
-**Abnahme:** Agent-CRUD über REST; Key verschlüsselt in DB, nicht im Klartext.
+**Ergebnis:** `cargo build/fmt/clippy -D warnings` grün, 6 DB-freie
+Unit-Tests grün (inkl. AES-256-GCM Roundtrip + Tamper/Wrong-Key).
+`tsc` + `npm run build` grün. PLAN-Lücke #5 (Attachment→fileId) im
+Endpoint umgesetzt; Datei-Existenzprüfung folgt mit Phase 5.
+
+**Offen (bewusst verschoben):** HTTP/DB-Integrationstests
+(Agent-CRUD-Permissions, Key-Verschlüsselung in DB) → CI mit
+`#[sqlx::test]`, gebündelt mit Phase 2/3.
 
 ---
 
