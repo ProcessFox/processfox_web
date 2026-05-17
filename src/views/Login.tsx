@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { MailCheck, Sparkles } from "lucide-react";
+import { MailCheck } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -46,7 +46,11 @@ export function Login({ onRequestLogin, onRequestRegister }: Props) {
     <div className="flex h-full w-full items-center justify-center bg-background p-6">
       <div className="w-full max-w-sm rounded-lg border border-border bg-surface p-6 shadow-subtle">
         <div className="mb-5 flex items-center gap-2">
-          <Sparkles className="h-5 w-5 text-primary" />
+          <img
+            src="/icon.png"
+            alt="ProcessFox"
+            className="h-7 w-7 rounded-md"
+          />
           <span className="text-lg font-semibold">ProcessFox</span>
         </div>
 

@@ -1,4 +1,4 @@
-import { Bot, Check, KeyRound, Sparkles } from "lucide-react";
+import { Bot, Check, KeyRound } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -44,7 +44,11 @@ export function WelcomeDialog({
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <Sparkles className="h-4 w-4" />
+            <img
+              src="/icon.png"
+              alt="ProcessFox"
+              className="h-6 w-6 rounded-md"
+            />
             Willkommen bei ProcessFox
           </DialogTitle>
         </DialogHeader>

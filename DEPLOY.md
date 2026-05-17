@@ -116,19 +116,36 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 Es gibt **keinen** Org-Erstellungs-Endpunkt — Registrierung erfordert immer
 einen Org-Invite-Code. Die erste Org + den Owner legst du **einmalig per
-SQL** an (Coolify → Postgres → Terminal/Query):
+SQL** an.
+
+**Zugang zur internen DB** (kein öffentlicher Port nötig):
+
+- *Weg A (empfohlen):* Coolify → PostgreSQL-Resource → Tab **„Terminal"**
+  → `psql -U postgres -d postgres` (User/DB wie in `DATABASE_URL`).
+- *Weg B:* SSH auf den Host →
+  `docker exec -i <pg-container> psql -U postgres -d postgres`.
+
+**Seed (ein Statement — kein manuelles UUID-Kopieren).** `invite_code`:
+6 Zeichen aus `A–Z`/`2–9` ohne mehrdeutige (`O/I/L`/`0/1`); E-Mail
+**kleingeschrieben** (Backend normalisiert beim Login auf lowercase):
 
 ```sql
--- 1) Organisation mit 6-stelligem Invite-Code (Großbuchstaben, ohne 0/O/1/I/L)
-INSERT INTO organizations (name, invite_code)
-VALUES ('ProcessFox', 'ABCD23') RETURNING id;
+WITH org AS (
+  INSERT INTO organizations (name, invite_code)
+  VALUES ('ProcessFox', 'ABCD23')
+  RETURNING id
+), new_user AS (
+  INSERT INTO users (email, org_id, org_role)
+  SELECT 'christian@xplrs.net', id, 'owner' FROM org
+)
+INSERT INTO org_settings (org_id) SELECT id FROM org;
+```
 
--- 2) Owner-User (passwordless — nur E-Mail). <ORG_ID> = id aus Schritt 1
-INSERT INTO users (email, org_id, org_role)
-VALUES ('christian@xplrs.net', '<ORG_ID>', 'owner');
+Kontrolle:
 
--- 3) Org-Settings-Zeile
-INSERT INTO org_settings (org_id) VALUES ('<ORG_ID>');
+```sql
+SELECT o.name, o.invite_code, u.email, u.org_role
+FROM organizations o JOIN users u ON u.org_id = o.id;
 ```
 
 Danach: auf `chat.processfox.ai` → **Anmelden** → E-Mail eingeben →
