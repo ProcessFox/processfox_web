@@ -20,6 +20,8 @@ pub enum ApiError {
     NotFound,
     #[error("{0}")]
     Conflict(String),
+    #[error("Datei wurde zwischenzeitlich geändert")]
+    VersionConflict,
     #[error("interner Fehler")]
     Internal(#[from] anyhow::Error),
 }
@@ -36,6 +38,7 @@ impl ApiError {
             Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            Self::VersionConflict => (StatusCode::CONFLICT, "version_conflict"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
     }

@@ -96,29 +96,6 @@ async function post<T>(command: string, body?: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-async function upload<T>(
-  command: string,
-  fields: Record<string, string>,
-  file: File,
-): Promise<T> {
-  const build = () => {
-    const form = new FormData();
-    for (const [k, v] of Object.entries(fields)) form.append(k, v);
-    form.append("file", file);
-    return fetch(`${BASE}/${command}`, {
-      method: "POST",
-      headers: authHeaders(),
-      body: form,
-    });
-  };
-  let res = await build();
-  if (res.status === 401 && (await tryRefresh())) {
-    res = await build();
-  }
-  if (res.status === 401) onSessionLost?.();
-  if (!res.ok) return parseError(res);
-  return res.json() as Promise<T>;
-}
 
 // --- Auth (REST, /api/v1/auth/*) ------------------------------------------
 
@@ -178,6 +155,24 @@ async function v1<T>(
   if (res.status === 401) onSessionLost?.();
   if (!res.ok) return parseError(res);
   if (res.status === 204) return undefined as T;
+  return res.json() as Promise<T>;
+}
+
+/** Authentifizierter Multipart-Upload gegen /api/v1 (401→Refresh→Retry). */
+async function v1Upload<T>(path: string, file: File): Promise<T> {
+  const build = () => {
+    const form = new FormData();
+    form.append("file", file);
+    return fetch(`${V1}/${path}`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: form,
+    });
+  };
+  let res = await build();
+  if (res.status === 401 && (await tryRefresh())) res = await build();
+  if (res.status === 401) onSessionLost?.();
+  if (!res.ok) return parseError(res);
   return res.json() as Promise<T>;
 }
 
@@ -283,10 +278,17 @@ export interface PptxPreview {
 }
 
 export const previewApi = {
-  docx: (fileId: string) => post<DocxPreview>("preview_docx", { fileId }),
+  docx: (fileId: string) =>
+    v1<DocxPreview>("GET", `files/${fileId}/preview/docx`),
   xlsx: (fileId: string, sheet?: string) =>
-    post<XlsxPreview>("preview_xlsx", { fileId, sheet }),
-  pptx: (fileId: string) => post<PptxPreview>("preview_pptx", { fileId }),
+    v1<XlsxPreview>(
+      "GET",
+      `files/${fileId}/preview/xlsx${
+        sheet ? `?sheet=${encodeURIComponent(sheet)}` : ""
+      }`,
+    ),
+  pptx: (fileId: string) =>
+    v1<PptxPreview>("GET", `files/${fileId}/preview/pptx`),
 };
 
 // ---------------------------------------------------------------------------
@@ -295,18 +297,17 @@ export const previewApi = {
 
 export const fileApi = {
   list: (workspaceId: string) =>
-    post<WorkspaceFile[]>("list_files", { workspaceId }),
+    v1<WorkspaceFile[]>("GET", `workspaces/${workspaceId}/files`),
   upload: (workspaceId: string, file: File) =>
-    upload<WorkspaceFile>("upload_file", { workspaceId }, file),
-  delete: (fileId: string) => post<void>("delete_file", { fileId }),
+    v1Upload<WorkspaceFile>(`workspaces/${workspaceId}/files`, file),
+  delete: (fileId: string) => v1<void>("DELETE", `files/${fileId}`),
   /** Pre-signed Download-URL (Gültigkeit serverseitig begrenzt). */
   downloadUrl: (fileId: string) =>
-    post<{ url: string }>("file_download_url", { fileId }),
+    v1<{ url: string }>("GET", `files/${fileId}/download-url`),
   readTextFile: (fileId: string) =>
-    post<TextFileContent>("read_text_file", { fileId }),
+    v1<TextFileContent>("GET", `files/${fileId}/text`),
   writeTextFile: (fileId: string, content: string, expectedVersion: string) =>
-    post<TextWriteResult>("write_text_file", {
-      fileId,
+    v1<TextWriteResult>("PUT", `files/${fileId}/text`, {
       content,
       expectedVersion,
     }),

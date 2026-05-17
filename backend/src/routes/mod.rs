@@ -4,6 +4,7 @@
 
 pub mod agents;
 pub mod auth;
+pub mod files;
 pub mod secrets;
 pub mod settings;
 pub mod workspaces;
@@ -27,6 +28,7 @@ pub fn api_router() -> Router<AppState> {
         .merge(agents::router())
         .merge(settings::router())
         .merge(secrets::router())
+        .merge(files::router())
 }
 
 async fn health() -> Json<serde_json::Value> {

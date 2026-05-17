@@ -159,16 +159,31 @@ Endpoint umgesetzt; Datei-Existenzprüfung folgt mit Phase 5.
 
 ---
 
-## Phase 5 — Dateien (Upload statt OS-Ordner)
+## Phase 5 — Dateien (Upload statt OS-Ordner) ✅ ABGESCHLOSSEN (2026-05-16)
 
-- Tabelle `workspace_files`. `POST /workspaces/:id/files` multipart
-  (≤ 50 MB, Typ-Whitelist §5). S3-Key `workspaces/<id>/<filename>`.
-- `sandbox.rs::ensure_in_workspace` (§9). Presigned Download-URLs (15 min).
-- Preview-Endpunkte laden serverseitig aus S3 → bestehendes Preview-JSON.
-- Frontend: Drag&Drop → Upload, FileTree aus `workspace_files`,
-  Preview via Presign/Preview-Endpunkt. WS-Broadcast `fs-changed`.
+- REST: `GET/POST /workspaces/{wid}/files` (Multipart ≤ 50 MB,
+  Typ-Whitelist §5), `DELETE /files/{id}`, `GET /files/{id}/download-url`
+  (presigned, 15 min), `GET/PUT /files/{id}/text` (ETag-Optimistic-
+  Concurrency → `version_conflict`), `GET /files/{id}/preview/{docx|xlsx|
+  pptx}`.
+- `sandbox.rs`: `ensure_in_workspace` + `sanitize_filename` (Pfad-Traversal
+  strukturell ausgeschlossen). Migration `0003` (unique
+  `(workspace_id, filename)` → Re-Upload überschreibt, PLAN-Lücke #6).
+- `preview.rs`: xlsx via `calamine`, docx/pptx via `zip`+`quick-xml`
+  (Text-Extraktion, HTML escaped) — liefert exakt das bestehende
+  Preview-JSON. Image/PDF laufen über die Presigned-URL.
+- Frontend-Bridge `fileApi`/`previewApi` auf REST (+ authed Multipart-
+  Upload, 401→Refresh→Retry). FileTree/Drag&Drop/Viewer/Editoren
+  funktionieren ohne Änderung gegen die neuen Endpunkte.
 
-**Abnahme:** Upload→Liste→Preview→Download e2e; Path-Traversal abgewehrt.
+**Ergebnis:** `cargo build/fmt/clippy -D warnings` grün, 8 DB-freie
+Unit-Tests grün (inkl. Sandbox/Filename-Sanitizing, Pfad-Traversal).
+`tsc` + `npm run build` grün.
+
+**Offen (bewusst):** `fs-changed`-Broadcast ist No-op-Platzhalter bis der
+WS-Hub in **Phase 6** steht; pptx-Notizen nicht extrahiert (Outline reicht);
+HTTP/DB-Integrationstests (Upload→Preview→Download e2e) → CI mit
+`#[sqlx::test]` + MinIO-Testcontainer, gebündelt mit Phase 2–4.
 
 ---
 
