@@ -70,8 +70,10 @@ fn ext_of(name: &str) -> String {
     name.rsplit('.').next().unwrap_or("").to_lowercase()
 }
 
-fn s3_err<E: std::fmt::Display>(e: E) -> ApiError {
-    ApiError::Internal(anyhow::anyhow!("S3: {e}"))
+fn s3_err<E: std::fmt::Display + std::fmt::Debug>(e: E) -> ApiError {
+    // `{e}` ist bei AWS-Fehlern nur „dispatch failure"; `{e:?}` enthält die
+    // eigentliche Ursache (DNS-/TCP-/Bucket-/Auth-Fehler).
+    ApiError::Internal(anyhow::anyhow!("S3: {e} | detail={e:?}"))
 }
 
 async fn file_row(state: &AppState, id: Uuid) -> ApiResult<FileRow> {

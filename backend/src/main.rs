@@ -21,6 +21,12 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&config.database_url).await?;
     tracing::info!("Datenbank verbunden, Migrationen angewendet");
 
+    tracing::info!(
+        endpoint = %config.s3.endpoint,
+        bucket = %config.s3.bucket,
+        region = %config.s3.region,
+        "S3-Konfiguration geladen"
+    );
     let storage = Storage::new(&config.s3);
 
     // Max. 10 Auth-Versuche pro IP in 5 Minuten.
