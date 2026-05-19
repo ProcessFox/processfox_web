@@ -85,7 +85,7 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 | Backend | Rust + **Axum** |
 | Realtime | Axum WebSocket (tokio-tungstenite) |
 | Datenbank | **PostgreSQL** via `sqlx` (async, compile-time-checked queries) |
-| Datei-Storage | S3-kompatibler Objektspeicher (MinIO für Self-Hosted, AWS S3 optional) |
+| Datei-Storage | **Lokales Persistent Volume** (Coolify, Single-Instance) — Pfad `STORAGE_DIR`. *(Geänderte Entscheidung 2026-05-19: ursprünglich S3/MinIO; wegen Self-Hosted-Single-Instance-Maßstab + Betriebskomplexität auf lokales Volume umgestellt.)* |
 | Auth | JWT (Bearer-Token) + Refresh-Token; Ausgabe via `/api/auth/login` |
 | LLM-Provider | Anthropic, OpenAI, OpenRouter — kein lokales GGUF in v1 |
 | Deployment | Docker (multi-stage build) + Coolify |
@@ -148,14 +148,14 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 ### Upload-Flow
 
 1. **Frontend:** Drag & Drop oder Datei-Picker → `multipart/form-data` an `POST /api/workspaces/:id/files`.
-2. **Backend:** Validierung (Dateityp, Größe ≤ 50 MB), Upload in S3-Bucket unter `workspaces/<workspace_id>/<filename>`.
-3. **Datenbank:** Eintrag in `workspace_files`-Tabelle (workspace_id, filename, s3_key, size, uploaded_by, uploaded_at).
+2. **Backend:** Validierung (Dateityp, Größe ≤ 50 MB), Schreiben ins lokale Volume unter `STORAGE_DIR/workspaces/<workspace_id>/<filename>`.
+3. **Datenbank:** Eintrag in `workspace_files`-Tabelle (workspace_id, filename, s3_key = Storage-Key, size, uploaded_by, uploaded_at). *(Spaltenname `s3_key` historisch beibehalten; enthält den relativen Storage-Pfad.)*
 4. **Frontend:** WS-Broadcast an alle Workspace-Mitglieder → Datei-Baum aktualisiert sich live.
 
 ### Download / Vorschau
 
-- Dateien werden nie direkt aus S3 ans Frontend gestreamt. Das Backend erzeugt **Pre-signed URLs** (Gültigkeit: 15 min) für den Browser-Download.
-- Vorschau-Endpunkte (`/api/preview/docx`, `/api/preview/xlsx`, `/api/preview/pptx`) laden die Datei serverseitig aus S3 und liefern das bereits bekannte Preview-JSON zurück — gleiche Datenstrukturen wie in Local.
+- Download nie als direkter Datei-Pfad. Das Backend gibt einen **kurzlebig signierten Link** aus (`GET /files/{id}/raw?token=…`, HMAC/JWT, 15 min) — funktioniert ohne Auth-Header als `<img>`/PDF-Quelle, liefert die Bytes mit korrektem Content-Type.
+- Vorschau-Endpunkte (`/api/v1/files/{id}/preview/{docx|xlsx|pptx}`) lesen die Datei serverseitig vom Volume und liefern das bekannte Preview-JSON — gleiche Datenstrukturen wie in Local.
 
 ### Erlaubte Dateitypen
 
@@ -163,7 +163,7 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 ### Sandbox-Prinzip
 
-Jeder S3-Pfad wird serverseitig gegen das Schema `workspaces/<workspace_id>/` validiert. Path-Traversal ist auf API-Ebene ausgeschlossen.
+Jeder Storage-Key wird serverseitig gegen das Schema `workspaces/<workspace_id>/` validiert (`crate::sandbox::ensure_in_workspace`), Dateinamen werden saniert. Path-Traversal ist auf API-Ebene ausgeschlossen.
 
 ---
 
@@ -240,7 +240,7 @@ processfox_web/
         │   ├── skills.rs
         │   └── workspaces.rs
         ├── ws/                  # WebSocket-Hub, Broadcast
-        ├── storage/             # S3-Client (aws-sdk-s3 oder object_store)
+        ├── storage.rs           # lokales Volume (STORAGE_DIR), Pfad-Mapping
         ├── core/                # Wiederverwendete Logik aus processfox_local
         │   ├── chat/            # ReAct-Loop, ChatRepo
         │   ├── llm/             # LlmProvider-Trait + Cloud-Implementierungen
@@ -380,7 +380,7 @@ Da kein lokales Modell unterstützt wird, vereinfacht sich die Provider-Logik ge
 
 - Rust 2021 Edition, `cargo fmt` + `cargo clippy -- -D warnings` müssen grün sein.
 - **Fehler-Handling:** `thiserror` für Domain-Errors, `anyhow` nur in `main.rs`. Kein `unwrap()` in Production-Code.
-- **Async:** `tokio`. Alle DB- und S3-Calls sind async; kein `spawn_blocking` nötig (kein lokales LLM).
+- **Async:** `tokio`. DB-Calls async. Datei-I/O läuft via `std::fs` (kleine Dateien ≤ 50 MB, Single-Instance — bewusst simpel statt `tokio::fs`/Streaming); kein `spawn_blocking` nötig.
 - **Serde:** `#[serde(rename_all = "camelCase")]` an der Grenze zum Frontend. Getaggte Enums: zusätzlich `rename_all_fields = "camelCase"` setzen.
 - **sqlx:** Compile-time-geprüfte Queries (`query_as!`, `query!`). Kein ORM.
 - **Module-Layout:** Ein Axum-Router-Modul pro Feature unter `backend/src/routes/`.
@@ -428,20 +428,21 @@ Eckpunkte:
 | Variable | Beschreibung |
 |---|---|
 | `DATABASE_URL` | PostgreSQL-Connection-String |
-| `S3_ENDPOINT` | MinIO/S3-URL |
-| `S3_BUCKET` | Bucket-Name |
-| `S3_ACCESS_KEY` | S3-Access-Key-ID |
-| `S3_SECRET_KEY` | S3-Secret-Key |
+| `STORAGE_DIR` | Mount-Pfad des Persistent Volume (Default `/data`) |
 | `JWT_SECRET` | Mindestens 32-stelliger zufälliger String |
 | `API_KEY_ENCRYPTION_KEY` | 32-Byte-Hex-String für API-Key-Verschlüsselung |
+| `PUBLIC_BASE_URL` | Öffentliche App-URL (Magic-Links), ohne Slash |
+| `MAGIC_LINK_WEBHOOK_URL` | n8n-Webhook für den Mailversand |
+| `MAGIC_LINK_WEBHOOK_SECRET` | optional; Header `X-Webhook-Secret` |
 | `PORT` | Backend-Port (Default: 3000) |
+| `STATIC_DIR` | Frontend-Verzeichnis (Default `/app/static`) |
 
 ### Coolify-Workflow
 
 1. GitHub-Repo verbinden.
 2. Dockerfile als Build-Methode wählen.
 3. Umgebungsvariablen im Coolify-UI hinterlegen.
-4. PostgreSQL- und MinIO-Services in Coolify anlegen, `DATABASE_URL` + S3-Vars setzen.
+4. PostgreSQL-Service + Persistent Volume (Mount `/data`) in Coolify anlegen, `DATABASE_URL` + `STORAGE_DIR` setzen.
 5. Deploy on push to `main`.
 
 ---
@@ -474,7 +475,7 @@ Identisch mit `processfox_local`:
 - Keine API-Keys ans Frontend exponieren.
 - Keine Datei-Pfade, die außerhalb des Workspace-Prefixes liegen, akzeptieren.
 - Kein globaler Mutex um shared State — Axum nutzt `Arc<AppState>` mit internem Locking wo nötig.
-- Keine direkte S3-URL-Ausgabe an das Frontend ohne Pre-signing.
+- Keine direkte Datei-Pfad-/Roh-Ausgabe ans Frontend ohne signierten, kurzlebigen Link.
 - Keine Chat-History-Sidebar. Auch hier gilt: Agenten sind die persistenten Einheiten.
 
 ---
@@ -486,7 +487,7 @@ Identisch mit `processfox_local`:
 | Runtime | Tauri v2 | Browser + Axum-Server |
 | API-Bridge | `@tauri-apps/api` invoke/listen | fetch + WebSocket |
 | LLM | Lokal (GGUF) + Cloud optional | Cloud-only (Anthropic, OpenAI, OpenRouter) |
-| Datei-Zugriff | Lokaler OS-Ordner | Upload → S3-Bucket |
+| Datei-Zugriff | Lokaler OS-Ordner | Upload → lokales Volume (`STORAGE_DIR`) |
 | Auth | Kein Auth (Single-User) | JWT + Rollen |
 | Mehrbenutzer | Nein | Ja (Org → Workspace → User) |
 | State-Persistenz | JSON-Dateien im App-Support-Ordner | PostgreSQL |

@@ -7,7 +7,7 @@ Schritt-für-Schritt-Anleitung für den Deploy von ProcessFox Web auf
 > beantwortet `GET /api/v1/health`. Alle übrigen API-Endpunkte (Login,
 > Workspaces, Agenten, Dateien, Chat) folgen in Phase 2–6. Die UI lädt
 > also, aber Datenaktionen liefern noch 404. Dieser Deploy validiert die
-> **Pipeline** (Build → Coolify → Postgres/MinIO → Health), nicht die
+> **Pipeline** (Build → Coolify → Postgres/Volume → Health), nicht die
 > App-Funktion.
 
 ---
@@ -20,12 +20,15 @@ Schritt-für-Schritt-Anleitung für den Deploy von ProcessFox Web auf
   `postgres://<user>:<pass>@<service-host>:5432/<db>`.
 - **Keinen** öffentlichen Port aktivieren (nicht nötig, Sicherheitsrisiko).
 
-### b) MinIO (S3)
-- In Coolify: **+ New → Service → MinIO** (One-Click-Service).
-- Notiere `S3_ACCESS_KEY` (Root-User) und `S3_SECRET_KEY` (Root-Passwort).
-- Interner Endpunkt typischerweise `http://<minio-service>:9000`.
-- **Bucket anlegen:** MinIO-Konsole öffnen → Bucket **`processfox`**
-  erstellen (Phase 1 nutzt es noch nicht, aber so ist es ab Phase 5 bereit).
+### b) Datei-Storage (lokales Volume — kein MinIO/S3)
+Ab dem Storage-Umbau speichert die App Dateien auf einem **lokalen
+Persistent Volume** (Single-Instance, self-hosted — kein Objektspeicher).
+- In der App-Resource → **Persistent Storage** → ein Volume mit dem
+  Mount-Pfad **`/data`** anlegen.
+- Env-Var `STORAGE_DIR=/data` (Default ist bereits `/data`).
+- Kein MinIO-Service, kein Bucket, keine S3-Credentials nötig.
+- **Wichtig:** Das Volume sichern (Coolify-Backup) — die App ist dadurch
+  bewusst *stateful* und an diese Instanz gebunden (kein H-Scaling).
 
 ## 2. Image bauen (GitHub Actions) statt auf dem VPS
 
@@ -66,11 +69,7 @@ Vorlage siehe `.env.example`. Konkret:
 | Variable | Wert |
 |---|---|
 | `DATABASE_URL` | interner Postgres-Connection-String aus Schritt 1a |
-| `S3_ENDPOINT` | interner MinIO-Endpunkt, z. B. `http://<minio>:9000` |
-| `S3_BUCKET` | `processfox` |
-| `S3_ACCESS_KEY` | MinIO Root-User |
-| `S3_SECRET_KEY` | MinIO Root-Passwort |
-| `S3_REGION` | `us-east-1` |
+| `STORAGE_DIR` | `/data` (Mount-Pfad des Persistent Volume aus Schritt 1b) |
 | `JWT_SECRET` | `openssl rand -base64 48` (≥ 32 Zeichen) |
 | `API_KEY_ENCRYPTION_KEY` | `openssl rand -hex 32` (genau 64 Hex-Zeichen) |
 | `PUBLIC_BASE_URL` | `https://chat.processfox.ai` (ohne Slash am Ende) |

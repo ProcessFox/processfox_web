@@ -1,16 +1,19 @@
-//! Workspace-Dateien (PLAN.md Phase 5). Upload → S3, Liste, Löschen,
-//! Presigned-Download (15 min), Text-Read/Write mit ETag-Konkurrenz,
-//! Office-Vorschau. Pfade gehen immer durch `crate::sandbox`.
+//! Workspace-Dateien (Phase 5, **lokales Volume** statt S3). Upload →
+//! Dateisystem unter `STORAGE_DIR/workspaces/<wid>/<datei>`, Liste, Löschen,
+//! Download über kurzlebig signierten Link, Text-Read/Write mit
+//! mtime-Konkurrenz, Office-Vorschau. Pfade gehen immer durch
+//! `crate::sandbox` (kein Traversal).
 
-use aws_sdk_s3::presigning::PresigningConfig;
-use aws_sdk_s3::primitives::ByteStream;
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Deserialize;
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -26,9 +29,10 @@ pub fn router() -> Router<AppState> {
         .route("/workspaces/{wid}/files", get(list_files).post(upload_file))
         .route("/files/{id}", axum::routing::delete(delete_file))
         .route("/files/{id}/download-url", get(download_url))
+        // Token-gesichert (kein Auth-Header) — taugt als <img>/PDF-Quelle.
+        .route("/files/{id}/raw", get(raw_file))
         .route("/files/{id}/text", get(read_text).put(write_text))
         .route("/files/{id}/preview/{kind}", get(preview_file))
-        // 50-MB-Uploads zulassen (Default wäre 2 MB).
         .layer(DefaultBodyLimit::max(MAX_BYTES + 1024 * 1024))
 }
 
@@ -36,6 +40,7 @@ const MAX_BYTES: usize = 50 * 1024 * 1024;
 const ALLOWED: [&str; 11] = [
     "md", "txt", "pdf", "docx", "xlsx", "csv", "png", "jpg", "jpeg", "webp", "pptx",
 ];
+const LINK_TTL_SECS: u64 = 900;
 
 #[derive(sqlx::FromRow)]
 struct FileRow {
@@ -70,10 +75,8 @@ fn ext_of(name: &str) -> String {
     name.rsplit('.').next().unwrap_or("").to_lowercase()
 }
 
-fn s3_err<E: std::fmt::Display + std::fmt::Debug>(e: E) -> ApiError {
-    // `{e}` ist bei AWS-Fehlern nur „dispatch failure"; `{e:?}` enthält die
-    // eigentliche Ursache (DNS-/TCP-/Bucket-/Auth-Fehler).
-    ApiError::Internal(anyhow::anyhow!("S3: {e} | detail={e:?}"))
+fn io_err<E: std::fmt::Display>(e: E) -> ApiError {
+    ApiError::Internal(anyhow::anyhow!("Storage: {e}"))
 }
 
 async fn file_row(state: &AppState, id: Uuid) -> ApiResult<FileRow> {
@@ -85,20 +88,53 @@ async fn file_row(state: &AppState, id: Uuid) -> ApiResult<FileRow> {
         .ok_or(ApiError::NotFound)
 }
 
-/// Lädt Objekt-Bytes + ETag (Version) aus S3.
-async fn s3_get(state: &AppState, key: &str) -> ApiResult<(Vec<u8>, String)> {
-    let obj = state
-        .storage
-        .client
-        .get_object()
-        .bucket(&state.storage.bucket)
-        .key(key)
-        .send()
-        .await
-        .map_err(s3_err)?;
-    let etag = obj.e_tag().unwrap_or_default().to_string();
-    let data = obj.body.collect().await.map_err(s3_err)?.into_bytes();
-    Ok((data.to_vec(), etag))
+/// Versions-Token = mtime in Millisekunden (Optimistic Concurrency).
+fn mtime_version(path: &std::path::Path) -> String {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_default()
+}
+
+// --- Signierter Download-Link --------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+struct LinkClaims {
+    /// File-ID.
+    fid: String,
+    exp: usize,
+}
+
+fn sign_link(secret: &str, file_id: Uuid) -> ApiResult<String> {
+    let exp = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        + LINK_TTL_SECS) as usize;
+    encode(
+        &Header::new(Algorithm::HS256),
+        &LinkClaims {
+            fid: file_id.to_string(),
+            exp,
+        },
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("Link-Signatur: {e}")))
+}
+
+fn verify_link(secret: &str, token: &str, file_id: Uuid) -> ApiResult<()> {
+    let data = decode::<LinkClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::new(Algorithm::HS256),
+    )
+    .map_err(|_| ApiError::Unauthorized)?;
+    if data.claims.fid != file_id.to_string() {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(())
 }
 
 // --- Handlers -------------------------------------------------------------
@@ -128,9 +164,6 @@ async fn upload_file(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     require_editor(&state, &user, wid).await?;
 
-    // Feld vollständig innerhalb der Schleife konsumieren — ein `Field`
-    // leiht `multipart` mutably und darf nicht über Iterationen gehalten
-    // werden.
     let mut found: Option<(String, String, axum::body::Bytes)> = None;
     while let Some(f) = multipart
         .next_field()
@@ -164,17 +197,11 @@ async fn upload_file(
 
     let key = workspace_key(wid, &filename);
     ensure_in_workspace(wid, &key)?;
-    state
-        .storage
-        .client
-        .put_object()
-        .bucket(&state.storage.bucket)
-        .key(&key)
-        .content_type(&content_type)
-        .body(ByteStream::from(bytes.to_vec()))
-        .send()
-        .await
-        .map_err(s3_err)?;
+    let path = state.storage.path(&key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io_err)?;
+    }
+    std::fs::write(&path, &bytes).map_err(io_err)?;
 
     // Gleicher Dateiname → ersetzen (PLAN-Lücke #6: überschreiben).
     let row: FileRow = sqlx::query_as(&format!(
@@ -210,14 +237,7 @@ async fn delete_file(
     let row = file_row(&state, id).await?;
     require_editor(&state, &user, row.workspace_id).await?;
     ensure_in_workspace(row.workspace_id, &row.s3_key)?;
-    let _ = state
-        .storage
-        .client
-        .delete_object()
-        .bucket(&state.storage.bucket)
-        .key(&row.s3_key)
-        .send()
-        .await;
+    let _ = std::fs::remove_file(state.storage.path(&row.s3_key));
     sqlx::query("DELETE FROM workspace_files WHERE id = $1")
         .bind(id)
         .execute(&state.pool)
@@ -234,18 +254,36 @@ async fn download_url(
 ) -> ApiResult<Json<Value>> {
     let row = file_row(&state, id).await?;
     require_member(&state, &user, row.workspace_id).await?;
+    let token = sign_link(&state.config.jwt_secret, row.id)?;
+    Ok(Json(json!({
+        "url": format!("/api/v1/files/{}/raw?token={token}", row.id)
+    })))
+}
+
+#[derive(Deserialize)]
+struct RawQuery {
+    token: String,
+}
+
+/// Liefert die Datei-Bytes; autorisiert über den signierten Token (kein
+/// Auth-Header — funktioniert als `<img src>` / PDF-Quelle).
+async fn raw_file(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<RawQuery>,
+) -> ApiResult<Response> {
+    verify_link(&state.config.jwt_secret, &q.token, id)?;
+    let row = file_row(&state, id).await?;
     ensure_in_workspace(row.workspace_id, &row.s3_key)?;
-    let pc = PresigningConfig::expires_in(Duration::from_secs(900)).map_err(s3_err)?;
-    let presigned = state
-        .storage
-        .client
-        .get_object()
-        .bucket(&state.storage.bucket)
-        .key(&row.s3_key)
-        .presigned(pc)
-        .await
-        .map_err(s3_err)?;
-    Ok(Json(json!({ "url": presigned.uri().to_string() })))
+    let bytes = std::fs::read(state.storage.path(&row.s3_key)).map_err(io_err)?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, &row.content_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("inline; filename=\"{}\"", row.filename),
+        )
+        .body(Body::from(bytes))
+        .map_err(io_err)
 }
 
 async fn read_text(
@@ -256,10 +294,11 @@ async fn read_text(
     let row = file_row(&state, id).await?;
     require_member(&state, &user, row.workspace_id).await?;
     ensure_in_workspace(row.workspace_id, &row.s3_key)?;
-    let (bytes, version) = s3_get(&state, &row.s3_key).await?;
+    let path = state.storage.path(&row.s3_key);
+    let bytes = std::fs::read(&path).map_err(io_err)?;
     Ok(Json(json!({
         "content": String::from_utf8_lossy(&bytes),
-        "version": version,
+        "version": mtime_version(&path),
     })))
 }
 
@@ -279,27 +318,15 @@ async fn write_text(
     let row = file_row(&state, id).await?;
     require_editor(&state, &user, row.workspace_id).await?;
     ensure_in_workspace(row.workspace_id, &row.s3_key)?;
+    let path = state.storage.path(&row.s3_key);
 
-    // Optimistic Concurrency: aktuelle Version muss zur erwarteten passen.
-    let (_, current) = s3_get(&state, &row.s3_key).await?;
-    if !body.expected_version.is_empty() && body.expected_version != current {
+    // Optimistic Concurrency: aktuelle mtime muss zur erwarteten passen.
+    if !body.expected_version.is_empty() && body.expected_version != mtime_version(&path) {
         return Err(ApiError::VersionConflict);
     }
-
-    let put = state
-        .storage
-        .client
-        .put_object()
-        .bucket(&state.storage.bucket)
-        .key(&row.s3_key)
-        .content_type(&row.content_type)
-        .body(ByteStream::from(body.content.into_bytes()))
-        .send()
-        .await
-        .map_err(s3_err)?;
-    let new_version = put.e_tag().unwrap_or_default().to_string();
+    std::fs::write(&path, body.content.as_bytes()).map_err(io_err)?;
     broadcast_fs_changed(&state, row.workspace_id);
-    Ok(Json(json!({ "version": new_version })))
+    Ok(Json(json!({ "version": mtime_version(&path) })))
 }
 
 async fn preview_file(
@@ -311,7 +338,7 @@ async fn preview_file(
     let row = file_row(&state, id).await?;
     require_member(&state, &user, row.workspace_id).await?;
     ensure_in_workspace(row.workspace_id, &row.s3_key)?;
-    let (bytes, _) = s3_get(&state, &row.s3_key).await?;
+    let bytes = std::fs::read(state.storage.path(&row.s3_key)).map_err(io_err)?;
 
     let result = match kind.as_str() {
         "docx" => preview::docx_html(&bytes),

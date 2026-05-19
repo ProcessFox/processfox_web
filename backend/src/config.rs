@@ -10,7 +10,8 @@ use anyhow::{bail, Context, Result};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub database_url: String,
-    pub s3: S3Config,
+    /// Wurzelverzeichnis für Workspace-Dateien (Coolify-Volume, z. B. `/data`).
+    pub storage_dir: String,
     pub jwt_secret: String,
     /// 32 rohe Bytes, aus einem 64-stelligen Hex-String dekodiert.
     pub api_key_encryption_key: [u8; 32],
@@ -23,16 +24,6 @@ pub struct Config {
     pub magic_link_webhook_url: String,
     /// Optionales Shared-Secret (Header `X-Webhook-Secret`) für den Webhook.
     pub magic_link_webhook_secret: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct S3Config {
-    pub endpoint: String,
-    pub bucket: String,
-    pub access_key: String,
-    pub secret_key: String,
-    /// Region — MinIO ist es egal, AWS braucht sie. Default `us-east-1`.
-    pub region: String,
 }
 
 fn required(key: &str) -> Result<String> {
@@ -72,13 +63,7 @@ impl Config {
 
         Ok(Self {
             database_url: required("DATABASE_URL")?,
-            s3: S3Config {
-                endpoint: required("S3_ENDPOINT")?,
-                bucket: required("S3_BUCKET")?,
-                access_key: required("S3_ACCESS_KEY")?,
-                secret_key: required("S3_SECRET_KEY")?,
-                region: optional("S3_REGION", "us-east-1"),
-            },
+            storage_dir: optional("STORAGE_DIR", "/data"),
             jwt_secret,
             api_key_encryption_key,
             port,

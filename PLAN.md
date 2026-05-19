@@ -161,6 +161,16 @@ Endpoint umgesetzt; Datei-Existenzprüfung folgt mit Phase 5.
 
 ## Phase 5 — Dateien (Upload statt OS-Ordner) ✅ ABGESCHLOSSEN (2026-05-16)
 
+> **Architektur-Änderung 2026-05-19:** Storage von S3/MinIO auf **lokales
+> Persistent Volume** (Coolify, `STORAGE_DIR`) umgestellt — Self-Hosted-
+> Single-Instance-Maßstab + MinIO-Netzwerk-Betriebskomplexität. App damit
+> bewusst *stateful* (Volume sichern, kein H-Scaling). Download nun über
+> kurzlebig signierten Link (`/files/{id}/raw?token=`) statt Presigned-S3.
+> `aws-sdk-s3`/`aws-config` entfernt (schlankerer Build). Frontend
+> unverändert. CLAUDE.md §2/§5/§6/§9/§12/§16 + DEPLOY.md + `.env.example`
+> nachgezogen. Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests grün,
+> `tsc`/`vite build` grün.
+
 - REST: `GET/POST /workspaces/{wid}/files` (Multipart ≤ 50 MB,
   Typ-Whitelist §5), `DELETE /files/{id}`, `GET /files/{id}/download-url`
   (presigned, 15 min), `GET/PUT /files/{id}/text` (ETag-Optimistic-
