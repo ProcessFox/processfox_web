@@ -19,6 +19,7 @@ pub struct ToolSpec {
 pub const WRITE_TOOL: &str = "append_to_file";
 pub const WRITE_XLSX_TOOL: &str = "write_xlsx";
 pub const WRITE_DOCX_TOOL: &str = "write_docx";
+pub const WRITE_DOCX_TPL_TOOL: &str = "write_docx_from_template";
 pub const ASK_TOOL: &str = "ask_user";
 
 fn all_tools() -> Vec<ToolSpec> {
@@ -89,6 +90,25 @@ fn all_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: WRITE_DOCX_TPL_TOOL,
+            description: "Füllt eine vorhandene Word-Vorlage (.docx im \
+                Workspace) aus: ersetzt {{Platzhalter}} durch Werte und \
+                schreibt das Ergebnis als neue .docx. Erfordert Freigabe.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "templateFilename": { "type": "string" },
+                    "outputFilename": { "type": "string" },
+                    "replacements": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["templateFilename", "outputFilename",
+                             "replacements"]
+            }),
+        },
+        ToolSpec {
             name: ASK_TOOL,
             description: "Stellt dem Nutzer eine Rückfrage und wartet auf \
                 dessen Freitext-Antwort, bevor weitergearbeitet wird.",
@@ -111,7 +131,10 @@ pub fn available_tools(skills: &[String]) -> Vec<ToolSpec> {
 }
 
 pub fn is_write_tool(name: &str) -> bool {
-    name == WRITE_TOOL || name == WRITE_XLSX_TOOL || name == WRITE_DOCX_TOOL
+    name == WRITE_TOOL
+        || name == WRITE_XLSX_TOOL
+        || name == WRITE_DOCX_TOOL
+        || name == WRITE_DOCX_TPL_TOOL
 }
 
 pub fn is_ask_tool(name: &str) -> bool {
@@ -126,7 +149,7 @@ pub fn skills_json() -> Value {
         "description": "Workspace-Dateien lesen und (mit Freigabe) ergänzen.",
         "icon": "Folder",
         "tools": ["list_files", "read_file", WRITE_TOOL, WRITE_XLSX_TOOL,
-                  WRITE_DOCX_TOOL, ASK_TOOL],
+                  WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL, ASK_TOOL],
         "hitl": { "default": true },
         "language": "de",
         "body": "",
@@ -511,6 +534,191 @@ async fn do_write_docx(
     ))
 }
 
+// --- docx aus Vorlage (Phase 6b-2d) ---------------------------------------
+
+fn reps_from_input(input: &Value) -> Vec<(String, String)> {
+    input
+        .get("replacements")
+        .and_then(|r| r.as_object())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), val)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `{{...}}`-Platzhalter aus dem document.xml-Text sammeln (heuristisch:
+/// keine `<`/Zeilenumbrüche im Token → ignoriert run-übergreifende).
+fn scan_placeholders(xml: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = xml.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if &xml[i..i + 2] == "{{" {
+            if let Some(end) = xml[i + 2..].find("}}") {
+                let inner = &xml[i + 2..i + 2 + end];
+                if !inner.contains('<') && !inner.contains('\n') {
+                    let k = inner.trim().to_string();
+                    if !k.is_empty() && !out.contains(&k) {
+                        out.push(k);
+                    }
+                }
+                i += 2 + end + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn read_template_doc(
+    state: &AppState,
+    wid: Uuid,
+    template_filename: &str,
+) -> ApiResult<(Vec<u8>, String)> {
+    let tname = sanitize_filename(template_filename)?;
+    if !tname.to_lowercase().ends_with(".docx") {
+        return Err(ApiError::BadRequest("Vorlage muss eine .docx sein.".into()));
+    }
+    let key = workspace_key(wid, &tname);
+    ensure_in_workspace(wid, &key)?;
+    let bytes = std::fs::read(state.storage.path(&key))
+        .map_err(|_| ApiError::BadRequest(format!("Vorlage '{tname}' nicht gefunden.")))?;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes))
+        .map_err(|e| ApiError::BadRequest(format!("Keine gültige .docx: {e}")))?;
+    let doc = {
+        use std::io::Read;
+        let mut f = zip
+            .by_name("word/document.xml")
+            .map_err(|_| ApiError::BadRequest("Vorlage ohne word/document.xml.".into()))?;
+        let mut s = String::new();
+        f.read_to_string(&mut s)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+        s
+    };
+    Ok((bytes, doc))
+}
+
+fn fill_template(template_bytes: &[u8], reps: &[(String, String)]) -> ApiResult<Vec<u8>> {
+    use std::io::{Read, Write};
+    let mut zin = zip::ZipArchive::new(std::io::Cursor::new(template_bytes))
+        .map_err(|e| ApiError::BadRequest(format!("Keine gültige .docx: {e}")))?;
+    let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts: zip::write::SimpleFileOptions = Default::default();
+    for i in 0..zin.len() {
+        let mut f = zin
+            .by_index(i)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+        if f.is_dir() {
+            continue;
+        }
+        let name = f.name().to_string();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+        let data = if name == "word/document.xml" {
+            let mut s = String::from_utf8_lossy(&buf).into_owned();
+            for (k, v) in reps {
+                s = s.replace(&format!("{{{{{k}}}}}"), &xml_escape(v));
+            }
+            s.into_bytes()
+        } else {
+            buf
+        };
+        zw.start_file(name, opts)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+        zw.write_all(&data)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+    }
+    let cur = zw
+        .finish()
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+    Ok(cur.into_inner())
+}
+
+fn tpl_preview(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<Value> {
+    let template = str_in(input, "templateFilename");
+    let output = sanitize_filename(&str_in(input, "outputFilename"))?;
+    let reps = reps_from_input(input);
+    let (_, doc) = read_template_doc(state, wid, &template)?;
+    let placeholders = scan_placeholders(&doc);
+    let out_key = workspace_key(wid, &output);
+    ensure_in_workspace(wid, &out_key)?;
+    Ok(json!({
+        "kind": "writeDocxFromTemplate",
+        "templatePath": sanitize_filename(&template)?,
+        "outputPath": output,
+        "replacements": reps.iter()
+            .map(|(k, v)| json!({ "key": k, "value": v }))
+            .collect::<Vec<_>>(),
+        "templatePlaceholders": placeholders,
+        "createsFile": !state.storage.path(&out_key).exists(),
+    }))
+}
+
+async fn do_write_docx_from_template(
+    state: &AppState,
+    wid: Uuid,
+    uploaded_by: Uuid,
+    input: &Value,
+) -> ApiResult<String> {
+    let template = str_in(input, "templateFilename");
+    let output = sanitize_filename(&str_in(input, "outputFilename"))?;
+    if !output.to_lowercase().ends_with(".docx") {
+        return Err(ApiError::BadRequest(
+            "Ausgabedatei muss auf .docx enden.".into(),
+        ));
+    }
+    let reps = reps_from_input(input);
+    let (tpl_bytes, _) = read_template_doc(state, wid, &template)?;
+    let bytes = fill_template(&tpl_bytes, &reps)?;
+
+    let key = workspace_key(wid, &output);
+    ensure_in_workspace(wid, &key)?;
+    let path = state.storage.path(&key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+    }
+    let size = bytes.len() as i64;
+    std::fs::write(&path, &bytes).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+
+    sqlx::query(
+        "INSERT INTO workspace_files \
+         (workspace_id, filename, s3_key, size_bytes, content_type, uploaded_by) \
+         VALUES ($1,$2,$3,$4,\
+           'application/vnd.openxmlformats-officedocument.wordprocessingml.document',\
+           $5) \
+         ON CONFLICT (workspace_id, filename) DO UPDATE SET \
+           size_bytes = EXCLUDED.size_bytes, uploaded_by = EXCLUDED.uploaded_by, \
+           uploaded_at = now()",
+    )
+    .bind(wid)
+    .bind(&output)
+    .bind(&key)
+    .bind(size)
+    .bind(uploaded_by)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+
+    state
+        .ws
+        .publish(Some(wid), "fs-changed", serde_json::Value::Null);
+    Ok(format!(
+        "'{output}' aus Vorlage '{}' erzeugt ({} Ersetzungen).",
+        sanitize_filename(&template)?,
+        reps.len()
+    ))
+}
+
 // --- Write-Tool-Dispatcher ------------------------------------------------
 
 fn str_in(input: &Value, key: &str) -> String {
@@ -549,6 +757,7 @@ pub fn write_preview(state: &AppState, wid: Uuid, name: &str, input: &Value) -> 
             &str_in(input, "filename"),
             &paras_from_input(input),
         ),
+        WRITE_DOCX_TPL_TOOL => tpl_preview(state, wid, input),
         other => Err(ApiError::BadRequest(format!("Kein Write-Tool: {other}"))),
     }
 }
@@ -598,6 +807,7 @@ pub async fn execute_write(
             )
             .await
         }
+        WRITE_DOCX_TPL_TOOL => do_write_docx_from_template(state, wid, uploaded_by, input).await,
         other => Err(ApiError::BadRequest(format!("Kein Write-Tool: {other}"))),
     }
 }

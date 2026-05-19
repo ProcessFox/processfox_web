@@ -273,15 +273,27 @@ laufenden Run live (echte Shared Session, CLAUDE.md §4).
   `skills_json` eingehängt.
 - Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
 
-## Phase 6b-2d — Rest (offen, bewusst verschoben)
+## Phase 6b-2d — write_docx_from_template ✅ ABGESCHLOSSEN (2026-05-19)
 
-- `writeDocxFromTemplate` (Platzhalter-Ersetzung in einer Vorlage,
-  nutzt Agent-Attachment `templateFileId`), `updateCells`/`appendToDocx`,
-  Delegation/Bulk-Worker (`delegateIntoXlsxColumn`).
+- `write_docx_from_template`-Tool (Skill `files`): nimmt eine `.docx`-
+  Workspace-Datei als Vorlage, ersetzt `{{Platzhalter}}` in
+  `word/document.xml`, packt das Zip neu (alle anderen Teile verbatim →
+  Formatierung bleibt). Platzhalter werden für die Vorschau heuristisch
+  gescannt (run-übergreifende ignoriert — dokumentierte Grenze). Kein
+  neues Dependency. HITL-Vorschau `writeDocxFromTemplate`
+  (Frontend-`HitlCard` rendert das bereits). Vorlage per Dateiname
+  (kein Agent-Attachment-Plumbing nötig).
+- Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
+
+## Phase 6b-2e — Rest (offen, bewusst verschoben)
+
+- `updateCells`/`appendToDocx`, Delegation/Bulk-Worker
+  (`delegateIntoXlsxColumn`), Agent-Attachment-`templateFileId` als
+  Komfort-Quelle für Vorlagen.
 
 **Abnahme:** 6a Streaming live für alle · 6b-1 Datei-Tools+HITL ·
-6b-2a Rückfragen · 6b-2b Excel-Schreiben · 6b-2c Word-Schreiben (jeweils
-HITL-Vorschau, live für alle Mitglieder).
+6b-2a Rückfragen · 6b-2b Excel · 6b-2c Word · 6b-2d Word-aus-Vorlage
+(jeweils HITL-Vorschau, live für alle Mitglieder).
 
 ---
 
