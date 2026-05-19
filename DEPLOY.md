@@ -52,7 +52,10 @@ Persistent Volume** (Single-Instance, self-hosted — kein Objektspeicher).
   (z. B. `ghcr.io/processfox/processfox_web:latest`).
 - **Port:** `3000`.
 - **Health Check Path:** `/api/v1/health` (erwartete Antwort
-  `{"status":"ok"}`, HTTP 200).
+  `{"status":"ok"}`, HTTP 200). Coolify führt den Check **im Container**
+  via `curl` aus — `curl` ist deshalb im Runtime-Image installiert
+  (Dockerfile). Ohne curl/wget meldet Coolify „unhealthy" und rollt zurück
+  → Traefik „no available server".
 - Redeploy nach neuem Image: in Coolify **Redeploy** drücken, sobald der
   GitHub-Action-Run grün ist (optional später per Coolify-Deploy-Webhook
   am Ende des Workflows automatisieren).
