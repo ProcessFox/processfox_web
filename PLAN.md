@@ -285,15 +285,57 @@ laufenden Run live (echte Shared Session, CLAUDE.md §4).
   (kein Agent-Attachment-Plumbing nötig).
 - Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
 
-## Phase 6b-2e — Rest (offen, bewusst verschoben)
+## Phase 6b-2e — append_to_docx ✅ ABGESCHLOSSEN (2026-05-19)
 
-- `updateCells`/`appendToDocx`, Delegation/Bulk-Worker
-  (`delegateIntoXlsxColumn`), Agent-Attachment-`templateFileId` als
-  Komfort-Quelle für Vorlagen.
+- `append_to_docx`-Tool (Skill `files`): Absätze vor `<w:sectPr`/
+  `</w:body>` in eine vorhandene `.docx` einfügen, Zip verbatim neu
+  packen (Formatierung bleibt); fehlt die Datei → neu via `build_docx`.
+  HITL-Vorschau `appendToDocx` inkl. `existingTail` (Text-Tail des
+  Bestands). Docx-Repacking in `repack_docx` extrahiert, `fill_template`
+  nutzt es jetzt mit. Kein neues Dependency.
+- Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
+
+## Phase 6b-2f — update_cells ✅ ABGESCHLOSSEN (2026-05-19)
+
+- `update_cells`-Tool (Skill `files`): gezielte xlsx-Zell-Edits
+  (`{"B2":"42"}`), Zellref-Parser `A1`→(row,col), Lesen via `calamine`,
+  Before/After-Diff in HITL-Vorschau `updateCells` (Frontend-`HitlCard`
+  rendert das bereits), Schreiben via `rust_xlsxwriter`.
+- Refactor: xlsx-Bytes/Persist in `build_xlsx_bytes`/`save_xlsx`
+  extrahiert (von `write_xlsx` mitgenutzt). Kein neues Dependency.
+- **Grenze:** nur das Zielblatt wird neu geschrieben; Formeln/Formate/
+  weitere Blätter gehen verloren (v1, dokumentiert).
+- Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
+
+## Phase 6b-2g — Delegation/Bulk-Worker ✅ ABGESCHLOSSEN (2026-05-19)
+
+- `delegate_into_xlsx_column`-Tool: liest die xlsx, rendert pro Datenzeile
+  ein Prompt-Template (`{{Header}}`/`{{A}}`), ruft je Zeile eine fokussierte
+  Worker-Inferenz (`llm::tool_step` ohne Tools, knapper Worker-System-
+  Prompt), schreibt die Ergebnisse in die Zielspalte. HITL-Vorschau
+  `delegateIntoXlsxColumn` (Sample-Prompts) + Live-Events
+  `delegationStarted/ItemDone/ItemFailed/Finished` über den Agenten-Channel
+  (Frontend rendert das bereits). Row-Cap 200, cancel-bar. Sonderzweig in
+  `chat.rs` (`is_delegate_tool`), nicht über den Write-Dispatcher.
+- Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
+
+**Damit ist die gesamte Phase 6 abgeschlossen** (6a + 6b-1…6b-2g): Chat,
+Streaming, Shared-Session, Tools, HITL, Rückfragen, alle Datei-Schreib-
+Operationen und Delegation — jeweils live für alle Workspace-Mitglieder.
+
+**Bewusst verschoben (klein, optional):** `delegationProfile`-Override
+(eigenes Worker-Modell/System je Agent), Agent-Attachment-`templateFileId`
+als Komfort-Vorlagenquelle.
 
 **Abnahme:** 6a Streaming live für alle · 6b-1 Datei-Tools+HITL ·
-6b-2a Rückfragen · 6b-2b Excel · 6b-2c Word · 6b-2d Word-aus-Vorlage
-(jeweils HITL-Vorschau, live für alle Mitglieder).
+6b-2a Rückfragen · 6b-2b Excel · 6b-2c Word · 6b-2d Word-aus-Vorlage ·
+6b-2e Word-Anhängen · 6b-2f Zell-Edits · 6b-2g Bulk-Delegation
+(jeweils HITL, live für alle).
+
+## Querschnitt — offen: Härtung
+
+- HTTP/DB-Integrationstests (Auth/Workspaces/Agents/Files/Chat) mit
+  Postgres-Testcontainer / `#[sqlx::test]` (über alle Phasen vorgemerkt).
 
 ---
 

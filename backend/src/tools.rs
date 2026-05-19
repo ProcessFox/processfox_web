@@ -2,6 +2,7 @@
 //! (CLAUDE.md §3 Regel 7). Erste Skill: `files` (Workspace-Dateien lesen +
 //! per HITL anhängen). docx/xlsx/Template/Delegation folgen in 6b-2+.
 
+use calamine::{Data, Reader, Xlsx};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -20,7 +21,12 @@ pub const WRITE_TOOL: &str = "append_to_file";
 pub const WRITE_XLSX_TOOL: &str = "write_xlsx";
 pub const WRITE_DOCX_TOOL: &str = "write_docx";
 pub const WRITE_DOCX_TPL_TOOL: &str = "write_docx_from_template";
+pub const APPEND_DOCX_TOOL: &str = "append_to_docx";
+pub const UPDATE_CELLS_TOOL: &str = "update_cells";
+pub const DELEGATE_TOOL: &str = "delegate_into_xlsx_column";
 pub const ASK_TOOL: &str = "ask_user";
+/// Sicherheits-Obergrenze für Bulk-Delegation (eine Inferenz je Zeile).
+pub const DELEGATE_MAX_ROWS: usize = 200;
 
 fn all_tools() -> Vec<ToolSpec> {
     vec![
@@ -109,6 +115,64 @@ fn all_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: APPEND_DOCX_TOOL,
+            description: "Hängt Absätze an eine vorhandene Word-Datei \
+                (.docx) an (legt sie bei Bedarf neu an). Erfordert \
+                Nutzer-Freigabe.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string" },
+                    "paragraphs": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["filename", "paragraphs"]
+            }),
+        },
+        ToolSpec {
+            name: UPDATE_CELLS_TOOL,
+            description: "Ändert gezielt einzelne Zellen einer vorhandenen \
+                .xlsx (z. B. {\"B2\":\"42\"}). Erfordert Nutzer-Freigabe. \
+                Nur das Zielblatt bleibt erhalten; Formeln/Formate gehen \
+                verloren.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string" },
+                    "sheet": { "type": "string" },
+                    "changes": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["filename", "changes"]
+            }),
+        },
+        ToolSpec {
+            name: DELEGATE_TOOL,
+            description: "Verarbeitet eine .xlsx Zeile für Zeile mit je \
+                einer fokussierten KI-Inferenz und schreibt das Ergebnis \
+                in eine Zielspalte. Im promptTemplate referenzieren \
+                {{Spaltenüberschrift}} oder {{A}} andere Spalten der Zeile. \
+                Erfordert Nutzer-Freigabe.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string" },
+                    "sheet": { "type": "string" },
+                    "promptTemplate": { "type": "string" },
+                    "targetColumn": {
+                        "type": "string",
+                        "description": "Spaltenbuchstabe oder Überschrift; \
+                            unbekannt → neue Spalte am Ende."
+                    }
+                },
+                "required": ["filename", "promptTemplate", "targetColumn"]
+            }),
+        },
+        ToolSpec {
             name: ASK_TOOL,
             description: "Stellt dem Nutzer eine Rückfrage und wartet auf \
                 dessen Freitext-Antwort, bevor weitergearbeitet wird.",
@@ -135,10 +199,18 @@ pub fn is_write_tool(name: &str) -> bool {
         || name == WRITE_XLSX_TOOL
         || name == WRITE_DOCX_TOOL
         || name == WRITE_DOCX_TPL_TOOL
+        || name == APPEND_DOCX_TOOL
+        || name == UPDATE_CELLS_TOOL
 }
 
 pub fn is_ask_tool(name: &str) -> bool {
     name == ASK_TOOL
+}
+
+/// Delegation läuft nicht über den Write-Dispatcher, sondern als
+/// Sonderzweig in `chat.rs` (Worker-LLM + Fortschrittsevents).
+pub fn is_delegate_tool(name: &str) -> bool {
+    name == DELEGATE_TOOL
 }
 
 /// `GET /skills`-Payload (Frontend-`Skill`-Vertrag).
@@ -149,7 +221,8 @@ pub fn skills_json() -> Value {
         "description": "Workspace-Dateien lesen und (mit Freigabe) ergänzen.",
         "icon": "Folder",
         "tools": ["list_files", "read_file", WRITE_TOOL, WRITE_XLSX_TOOL,
-                  WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL, ASK_TOOL],
+                  WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL, APPEND_DOCX_TOOL,
+                  UPDATE_CELLS_TOOL, DELEGATE_TOOL, ASK_TOOL],
         "hitl": { "default": true },
         "language": "de",
         "body": "",
@@ -323,6 +396,65 @@ fn xlsx_preview(
     }))
 }
 
+/// xlsx-Bytes aus einem String-Grid (eine Tabelle).
+fn build_xlsx_bytes(sheet: &str, rows: &[Vec<String>]) -> ApiResult<Vec<u8>> {
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.set_name(sheet)
+        .map_err(|e| ApiError::BadRequest(format!("Sheet-Name: {e}")))?;
+    for (r, row) in rows.iter().enumerate() {
+        for (c, val) in row.iter().enumerate() {
+            if val.is_empty() {
+                continue;
+            }
+            ws.write_string(r as u32, c as u16, val)
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+        }
+    }
+    wb.save_to_buffer()
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))
+}
+
+/// xlsx-Bytes ins Volume schreiben + `workspace_files` upserten +
+/// `fs-changed` broadcasten.
+async fn save_xlsx(
+    state: &AppState,
+    wid: Uuid,
+    uploaded_by: Uuid,
+    fname: &str,
+    bytes: &[u8],
+) -> ApiResult<()> {
+    let key = workspace_key(wid, fname);
+    ensure_in_workspace(wid, &key)?;
+    let path = state.storage.path(&key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+    }
+    std::fs::write(&path, bytes).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+    sqlx::query(
+        "INSERT INTO workspace_files \
+         (workspace_id, filename, s3_key, size_bytes, content_type, uploaded_by) \
+         VALUES ($1,$2,$3,$4,\
+           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',\
+           $5) \
+         ON CONFLICT (workspace_id, filename) DO UPDATE SET \
+           size_bytes = EXCLUDED.size_bytes, uploaded_by = EXCLUDED.uploaded_by, \
+           uploaded_at = now()",
+    )
+    .bind(wid)
+    .bind(fname)
+    .bind(&key)
+    .bind(bytes.len() as i64)
+    .bind(uploaded_by)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    state
+        .ws
+        .publish(Some(wid), "fs-changed", serde_json::Value::Null);
+    Ok(())
+}
+
 async fn do_write_xlsx(
     state: &AppState,
     wid: Uuid,
@@ -337,55 +469,302 @@ async fn do_write_xlsx(
             "Dateiname muss auf .xlsx enden.".into(),
         ));
     }
-    let key = workspace_key(wid, &fname);
-    ensure_in_workspace(wid, &key)?;
-
-    let mut wb = rust_xlsxwriter::Workbook::new();
-    let ws = wb.add_worksheet();
-    ws.set_name(sheet)
-        .map_err(|e| ApiError::BadRequest(format!("Sheet-Name: {e}")))?;
-    for (r, row) in rows.iter().enumerate() {
-        for (c, val) in row.iter().enumerate() {
-            ws.write_string(r as u32, c as u16, val)
-                .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
-        }
-    }
-    let bytes = wb
-        .save_to_buffer()
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
-
-    let path = state.storage.path(&key);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
-    }
-    let size = bytes.len() as i64;
-    std::fs::write(&path, &bytes).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
-
-    sqlx::query(
-        "INSERT INTO workspace_files \
-         (workspace_id, filename, s3_key, size_bytes, content_type, uploaded_by) \
-         VALUES ($1,$2,$3,$4,\
-           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',\
-           $5) \
-         ON CONFLICT (workspace_id, filename) DO UPDATE SET \
-           size_bytes = EXCLUDED.size_bytes, uploaded_by = EXCLUDED.uploaded_by, \
-           uploaded_at = now()",
-    )
-    .bind(wid)
-    .bind(&fname)
-    .bind(&key)
-    .bind(size)
-    .bind(uploaded_by)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-
-    state
-        .ws
-        .publish(Some(wid), "fs-changed", serde_json::Value::Null);
+    let bytes = build_xlsx_bytes(sheet, rows)?;
+    save_xlsx(state, wid, uploaded_by, &fname, &bytes).await?;
     Ok(format!(
         "'{fname}' geschrieben ({} Zeilen, Sheet '{sheet}').",
         rows.len()
+    ))
+}
+
+// --- xlsx-Zellen gezielt ändern (Phase 6b-2f) -----------------------------
+
+/// `"B2"` → `(row, col)` 0-basiert (bijektives Base-26 für die Spalte).
+fn parse_cell_ref(s: &str) -> Option<(usize, usize)> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_ascii_digit())?;
+    let (letters, digits) = s.split_at(split);
+    if letters.is_empty() || digits.is_empty() {
+        return None;
+    }
+    let mut col = 0usize;
+    for ch in letters.chars() {
+        if !ch.is_ascii_alphabetic() {
+            return None;
+        }
+        col = col * 26 + (ch.to_ascii_uppercase() as usize - 'A' as usize + 1);
+    }
+    let row: usize = digits.parse().ok()?;
+    if col == 0 || row == 0 {
+        return None;
+    }
+    Some((row - 1, col - 1))
+}
+
+fn changes_from_input(input: &Value) -> Vec<(String, String)> {
+    input
+        .get("changes")
+        .and_then(|c| c.as_object())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), val)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Liest eine xlsx-Datei als String-Grid (gewähltes oder erstes Sheet).
+fn read_xlsx_grid(
+    state: &AppState,
+    wid: Uuid,
+    filename: &str,
+    sheet: Option<&str>,
+) -> ApiResult<(String, Vec<Vec<String>>)> {
+    let fname = sanitize_filename(filename)?;
+    let key = workspace_key(wid, &fname);
+    ensure_in_workspace(wid, &key)?;
+    let bytes = std::fs::read(state.storage.path(&key))
+        .map_err(|_| ApiError::BadRequest(format!("Datei '{fname}' nicht gefunden.")))?;
+    let mut wb: Xlsx<_> = calamine::open_workbook_from_rs(std::io::Cursor::new(bytes))
+        .map_err(|e| ApiError::BadRequest(format!("Keine xlsx: {e}")))?;
+    let names = wb.sheet_names().to_vec();
+    let active = sheet
+        .filter(|s| names.iter().any(|n| n == s))
+        .map(|s| s.to_string())
+        .or_else(|| names.first().cloned())
+        .ok_or_else(|| ApiError::BadRequest("Keine Tabelle.".into()))?;
+    let range = wb
+        .worksheet_range(&active)
+        .map_err(|e| ApiError::BadRequest(format!("Sheet: {e}")))?;
+    let grid = range
+        .rows()
+        .map(|r| {
+            r.iter()
+                .map(|c| match c {
+                    Data::Empty => String::new(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .collect();
+    Ok((active, grid))
+}
+
+fn set_cell(grid: &mut Vec<Vec<String>>, row: usize, col: usize, v: &str) {
+    if grid.len() <= row {
+        grid.resize(row + 1, Vec::new());
+    }
+    if grid[row].len() <= col {
+        grid[row].resize(col + 1, String::new());
+    }
+    grid[row][col] = v.to_string();
+}
+
+fn updatecells_preview(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<Value> {
+    let filename = str_in(input, "filename");
+    let sheet_in = input.get("sheet").and_then(|s| s.as_str());
+    let (sheet, grid) = read_xlsx_grid(state, wid, &filename, sheet_in)?;
+    let mut changes = Vec::new();
+    for (cell, after) in changes_from_input(input) {
+        let (r, c) = parse_cell_ref(&cell)
+            .ok_or_else(|| ApiError::BadRequest(format!("Ungültige Zelle: {cell}")))?;
+        let before = grid
+            .get(r)
+            .and_then(|row| row.get(c))
+            .cloned()
+            .unwrap_or_default();
+        changes.push(json!({ "cell": cell, "before": before, "after": after }));
+    }
+    Ok(json!({
+        "kind": "updateCells",
+        "path": sanitize_filename(&filename)?,
+        "sheet": sheet,
+        "changes": changes,
+    }))
+}
+
+async fn do_update_cells(
+    state: &AppState,
+    wid: Uuid,
+    uploaded_by: Uuid,
+    input: &Value,
+) -> ApiResult<String> {
+    let filename = str_in(input, "filename");
+    let fname = sanitize_filename(&filename)?;
+    let sheet_in = input.get("sheet").and_then(|s| s.as_str());
+    let (sheet, mut grid) = read_xlsx_grid(state, wid, &fname, sheet_in)?;
+    let changes = changes_from_input(input);
+    for (cell, val) in &changes {
+        let (r, c) = parse_cell_ref(cell)
+            .ok_or_else(|| ApiError::BadRequest(format!("Ungültige Zelle: {cell}")))?;
+        set_cell(&mut grid, r, c, val);
+    }
+    let bytes = build_xlsx_bytes(&sheet, &grid)?;
+    save_xlsx(state, wid, uploaded_by, &fname, &bytes).await?;
+    Ok(format!(
+        "{} Zelle(n) in '{fname}' geändert (Sheet '{sheet}').",
+        changes.len()
+    ))
+}
+
+// --- Delegation / Bulk-Worker (Phase 6b-2g) -------------------------------
+
+fn col_letter(mut idx: usize) -> String {
+    let mut s = String::new();
+    idx += 1;
+    while idx > 0 {
+        let r = (idx - 1) % 26;
+        s.insert(0, (b'A' + r as u8) as char);
+        idx = (idx - 1) / 26;
+    }
+    s
+}
+
+fn letters_to_index(s: &str) -> Option<usize> {
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut col = 0usize;
+    for ch in s.chars() {
+        col = col * 26 + (ch.to_ascii_uppercase() as usize - 'A' as usize + 1);
+    }
+    Some(col - 1)
+}
+
+pub struct DelegatePlan {
+    pub filename: String,
+    pub sheet: String,
+    pub grid: Vec<Vec<String>>,
+    pub headers: Vec<String>,
+    pub target_col: usize,
+    pub target_header: String,
+    pub creates_col: bool,
+    pub prompt_template: String,
+    /// Grid-Zeilenindizes der Datenzeilen (ohne Kopfzeile).
+    pub data_rows: Vec<usize>,
+}
+
+pub fn delegate_plan(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<DelegatePlan> {
+    let filename = sanitize_filename(&str_in(input, "filename"))?;
+    let sheet_in = input.get("sheet").and_then(|s| s.as_str());
+    let prompt_template = str_in(input, "promptTemplate");
+    let target_spec = str_in(input, "targetColumn");
+    if prompt_template.trim().is_empty() || target_spec.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "promptTemplate und targetColumn erforderlich.".into(),
+        ));
+    }
+    let (sheet, grid) = read_xlsx_grid(state, wid, &filename, sheet_in)?;
+    let headers: Vec<String> = grid.first().cloned().unwrap_or_default();
+
+    // Zielspalte: Buchstabe → Index; sonst Header-Treffer; sonst neue Spalte.
+    let (target_col, target_header, creates_col) =
+        if let Some(idx) = letters_to_index(target_spec.trim()) {
+            let h = headers
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| target_spec.clone());
+            (idx, h, idx >= headers.len())
+        } else if let Some(idx) = headers
+            .iter()
+            .position(|h| h.trim().eq_ignore_ascii_case(target_spec.trim()))
+        {
+            (idx, headers[idx].clone(), false)
+        } else {
+            (headers.len().max(1), target_spec.clone(), true)
+        };
+
+    let data_rows: Vec<usize> = (1..grid.len())
+        .filter(|&r| grid[r].iter().any(|c| !c.trim().is_empty()))
+        .collect();
+    if data_rows.len() > DELEGATE_MAX_ROWS {
+        return Err(ApiError::BadRequest(format!(
+            "Zu viele Zeilen ({} > {DELEGATE_MAX_ROWS}). Bitte eingrenzen.",
+            data_rows.len()
+        )));
+    }
+    Ok(DelegatePlan {
+        filename,
+        sheet,
+        grid,
+        headers,
+        target_col,
+        target_header,
+        creates_col,
+        prompt_template,
+        data_rows,
+    })
+}
+
+/// Rendert das Prompt-Template für eine konkrete Datenzeile.
+pub fn render_prompt(plan: &DelegatePlan, row: usize) -> String {
+    let empty = String::new();
+    let cells = plan.grid.get(row).unwrap_or(&plan.grid[0]);
+    let mut out = plan.prompt_template.clone();
+    for c in 0..plan.headers.len().max(cells.len()) {
+        let val = cells.get(c).unwrap_or(&empty);
+        if let Some(h) = plan.headers.get(c) {
+            if !h.trim().is_empty() {
+                out = out.replace(&format!("{{{{{}}}}}", h.trim()), val);
+            }
+        }
+        out = out.replace(&format!("{{{{{}}}}}", col_letter(c)), val);
+    }
+    out
+}
+
+pub fn delegate_preview_json(plan: &DelegatePlan, worker_label: &str) -> Value {
+    let samples: Vec<Value> = plan
+        .data_rows
+        .iter()
+        .take(3)
+        .map(|&r| {
+            json!({
+                "rowLabel": format!("Zeile {}", r + 1),
+                "renderedPrompt": render_prompt(plan, r)
+            })
+        })
+        .collect();
+    json!({
+        "kind": "delegateIntoXlsxColumn",
+        "path": plan.filename,
+        "sheet": plan.sheet,
+        "targetColumn": col_letter(plan.target_col),
+        "targetCreatesColumn": plan.creates_col,
+        "rowCount": plan.data_rows.len(),
+        "workerLabel": worker_label,
+        "samplePrompts": samples,
+    })
+}
+
+/// Schreibt die Worker-Ergebnisse in die Zielspalte und speichert.
+pub async fn save_delegation(
+    state: &AppState,
+    wid: Uuid,
+    uploaded_by: Uuid,
+    plan: &DelegatePlan,
+    results: &[(usize, String)],
+) -> ApiResult<String> {
+    let mut grid = plan.grid.clone();
+    if plan.creates_col || plan.headers.get(plan.target_col).is_none() {
+        set_cell(&mut grid, 0, plan.target_col, &plan.target_header);
+    }
+    for (row, val) in results {
+        set_cell(&mut grid, *row, plan.target_col, val);
+    }
+    let bytes = build_xlsx_bytes(&plan.sheet, &grid)?;
+    save_xlsx(state, wid, uploaded_by, &plan.filename, &bytes).await?;
+    Ok(format!(
+        "{} Zeile(n) verarbeitet, Spalte '{}' in '{}' geschrieben.",
+        results.len(),
+        col_letter(plan.target_col),
+        plan.filename
     ))
 }
 
@@ -607,9 +986,11 @@ fn read_template_doc(
     Ok((bytes, doc))
 }
 
-fn fill_template(template_bytes: &[u8], reps: &[(String, String)]) -> ApiResult<Vec<u8>> {
+/// Packt eine vorhandene .docx neu und ersetzt dabei nur
+/// `word/document.xml` (alle anderen Teile verbatim → Formatierung bleibt).
+fn repack_docx(orig: &[u8], new_document_xml: &str) -> ApiResult<Vec<u8>> {
     use std::io::{Read, Write};
-    let mut zin = zip::ZipArchive::new(std::io::Cursor::new(template_bytes))
+    let mut zin = zip::ZipArchive::new(std::io::Cursor::new(orig))
         .map_err(|e| ApiError::BadRequest(format!("Keine gültige .docx: {e}")))?;
     let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts: zip::write::SimpleFileOptions = Default::default();
@@ -625,11 +1006,7 @@ fn fill_template(template_bytes: &[u8], reps: &[(String, String)]) -> ApiResult<
         f.read_to_end(&mut buf)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
         let data = if name == "word/document.xml" {
-            let mut s = String::from_utf8_lossy(&buf).into_owned();
-            for (k, v) in reps {
-                s = s.replace(&format!("{{{{{k}}}}}"), &xml_escape(v));
-            }
-            s.into_bytes()
+            new_document_xml.as_bytes().to_vec()
         } else {
             buf
         };
@@ -642,6 +1019,46 @@ fn fill_template(template_bytes: &[u8], reps: &[(String, String)]) -> ApiResult<
         .finish()
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
     Ok(cur.into_inner())
+}
+
+fn fill_template(template_bytes: &[u8], reps: &[(String, String)]) -> ApiResult<Vec<u8>> {
+    // Vorlagen-document.xml lesen, Platzhalter ersetzen, Zip neu packen.
+    let (_, doc) = {
+        use std::io::Read;
+        let mut zin = zip::ZipArchive::new(std::io::Cursor::new(template_bytes))
+            .map_err(|e| ApiError::BadRequest(format!("Keine gültige .docx: {e}")))?;
+        let mut s = String::new();
+        zin.by_name("word/document.xml")
+            .map_err(|_| ApiError::BadRequest("Vorlage ohne word/document.xml.".into()))?
+            .read_to_string(&mut s)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+        ((), s)
+    };
+    let mut filled = doc;
+    for (k, v) in reps {
+        filled = filled.replace(&format!("{{{{{k}}}}}"), &xml_escape(v));
+    }
+    repack_docx(template_bytes, &filled)
+}
+
+/// Absätze-XML vor `<w:sectPr` bzw. `</w:body>` einfügen.
+fn insert_paragraphs(doc: &str, paragraphs: &[String]) -> String {
+    let paras: String = paragraphs
+        .iter()
+        .map(|p| {
+            format!(
+                "<w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
+                xml_escape(p)
+            )
+        })
+        .collect();
+    if let Some(pos) = doc.find("<w:sectPr") {
+        format!("{}{}{}", &doc[..pos], paras, &doc[pos..])
+    } else if let Some(pos) = doc.rfind("</w:body>") {
+        format!("{}{}{}", &doc[..pos], paras, &doc[pos..])
+    } else {
+        format!("{doc}{paras}")
+    }
 }
 
 fn tpl_preview(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<Value> {
@@ -719,6 +1136,137 @@ async fn do_write_docx_from_template(
     ))
 }
 
+// --- An vorhandene .docx anhängen (Phase 6b-2e) ---------------------------
+
+/// Liest `word/document.xml` einer Workspace-.docx, falls vorhanden.
+fn read_docx_doc_opt(
+    state: &AppState,
+    wid: Uuid,
+    filename: &str,
+) -> ApiResult<Option<(Vec<u8>, String)>> {
+    use std::io::Read;
+    let fname = sanitize_filename(filename)?;
+    let key = workspace_key(wid, &fname);
+    ensure_in_workspace(wid, &key)?;
+    let Ok(bytes) = std::fs::read(state.storage.path(&key)) else {
+        return Ok(None);
+    };
+    let mut zin = zip::ZipArchive::new(std::io::Cursor::new(&bytes))
+        .map_err(|e| ApiError::BadRequest(format!("Keine gültige .docx: {e}")))?;
+    let mut s = String::new();
+    zin.by_name("word/document.xml")
+        .map_err(|_| ApiError::BadRequest("Datei ohne word/document.xml.".into()))?
+        .read_to_string(&mut s)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+    Ok(Some((bytes, s)))
+}
+
+/// Sichtbarer Text aus document.xml (für die Tail-Vorschau).
+fn docx_text(doc: &str) -> String {
+    let mut out = String::new();
+    let mut rest = doc;
+    while let Some(start) = rest.find("<w:t") {
+        let after = &rest[start..];
+        let Some(gt) = after.find('>') else { break };
+        let body = &after[gt + 1..];
+        let Some(end) = body.find("</w:t>") else {
+            break;
+        };
+        out.push_str(
+            &body[..end]
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&"),
+        );
+        out.push(' ');
+        rest = &body[end + 6..];
+    }
+    out
+}
+
+fn appenddocx_preview(
+    state: &AppState,
+    wid: Uuid,
+    filename: &str,
+    paragraphs: &[String],
+) -> ApiResult<Value> {
+    let fname = sanitize_filename(filename)?;
+    let existing = read_docx_doc_opt(state, wid, &fname)?;
+    let tail = existing.as_ref().map(|(_, d)| {
+        let t = docx_text(d);
+        let start = t.len().saturating_sub(400);
+        t[start..].to_string()
+    });
+    let mut preview_text = paragraphs.join("\n");
+    if preview_text.len() > 800 {
+        preview_text.truncate(800);
+        preview_text.push('…');
+    }
+    Ok(json!({
+        "kind": "appendToDocx",
+        "path": fname,
+        "blockCount": paragraphs.len(),
+        "previewText": preview_text,
+        "createsFile": existing.is_none(),
+        "existingTail": tail,
+    }))
+}
+
+async fn do_append_docx(
+    state: &AppState,
+    wid: Uuid,
+    uploaded_by: Uuid,
+    filename: &str,
+    paragraphs: &[String],
+) -> ApiResult<String> {
+    let fname = sanitize_filename(filename)?;
+    if !fname.to_lowercase().ends_with(".docx") {
+        return Err(ApiError::BadRequest(
+            "Dateiname muss auf .docx enden.".into(),
+        ));
+    }
+    let key = workspace_key(wid, &fname);
+    ensure_in_workspace(wid, &key)?;
+    let bytes = match read_docx_doc_opt(state, wid, &fname)? {
+        Some((orig, doc)) => repack_docx(&orig, &insert_paragraphs(&doc, paragraphs))?,
+        None => build_docx(paragraphs)?,
+    };
+
+    let path = state.storage.path(&key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+    }
+    let size = bytes.len() as i64;
+    std::fs::write(&path, &bytes).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+
+    sqlx::query(
+        "INSERT INTO workspace_files \
+         (workspace_id, filename, s3_key, size_bytes, content_type, uploaded_by) \
+         VALUES ($1,$2,$3,$4,\
+           'application/vnd.openxmlformats-officedocument.wordprocessingml.document',\
+           $5) \
+         ON CONFLICT (workspace_id, filename) DO UPDATE SET \
+           size_bytes = EXCLUDED.size_bytes, uploaded_by = EXCLUDED.uploaded_by, \
+           uploaded_at = now()",
+    )
+    .bind(wid)
+    .bind(&fname)
+    .bind(&key)
+    .bind(size)
+    .bind(uploaded_by)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+
+    state
+        .ws
+        .publish(Some(wid), "fs-changed", serde_json::Value::Null);
+    Ok(format!(
+        "{} Absätze an '{fname}' angehängt.",
+        paragraphs.len()
+    ))
+}
+
 // --- Write-Tool-Dispatcher ------------------------------------------------
 
 fn str_in(input: &Value, key: &str) -> String {
@@ -758,6 +1306,13 @@ pub fn write_preview(state: &AppState, wid: Uuid, name: &str, input: &Value) -> 
             &paras_from_input(input),
         ),
         WRITE_DOCX_TPL_TOOL => tpl_preview(state, wid, input),
+        APPEND_DOCX_TOOL => appenddocx_preview(
+            state,
+            wid,
+            &str_in(input, "filename"),
+            &paras_from_input(input),
+        ),
+        UPDATE_CELLS_TOOL => updatecells_preview(state, wid, input),
         other => Err(ApiError::BadRequest(format!("Kein Write-Tool: {other}"))),
     }
 }
@@ -808,6 +1363,17 @@ pub async fn execute_write(
             .await
         }
         WRITE_DOCX_TPL_TOOL => do_write_docx_from_template(state, wid, uploaded_by, input).await,
+        APPEND_DOCX_TOOL => {
+            do_append_docx(
+                state,
+                wid,
+                uploaded_by,
+                &str_in(input, "filename"),
+                &paras_from_input(input),
+            )
+            .await
+        }
+        UPDATE_CELLS_TOOL => do_update_cells(state, wid, uploaded_by, input).await,
         other => Err(ApiError::BadRequest(format!("Kein Write-Tool: {other}"))),
     }
 }

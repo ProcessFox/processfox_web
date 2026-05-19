@@ -18,6 +18,11 @@ use crate::llm::{self, stream_chat, ChatMsg};
 use crate::perm::{require_editor, require_member};
 use crate::{crypto, AppState};
 
+/// System-Prompt für den Delegations-Worker (knappe Zell-Antwort).
+const WORKER_SYS: &str = "Du bist ein Hintergrund-Worker. Antworte \
+ausschließlich mit dem reinen Ergebnis für die Zelle — knapp, ohne \
+Erklärungen, ohne Markdown, ohne Anführungszeichen.";
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -492,6 +497,141 @@ async fn send_message(
                         }),
                     );
                     Ok(answer)
+                } else if crate::tools::is_delegate_tool(&call.name) {
+                    match crate::tools::delegate_plan(&st, wid, &call.input) {
+                        Err(e) => Err(e),
+                        Ok(plan) => {
+                            let approved = if hitl_disabled {
+                                true
+                            } else {
+                                let preview = crate::tools::delegate_preview_json(&plan, "Worker");
+                                let hitl_id = Uuid::new_v4();
+                                let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                                if let Ok(mut m) = st.pending_hitl.lock() {
+                                    m.insert(hitl_id, tx);
+                                }
+                                st.ws.publish(
+                                    Some(wid),
+                                    channel.clone(),
+                                    json!({
+                                        "type": "hitlRequest",
+                                        "hitlId": hitl_id.to_string(),
+                                        "toolCallId": call.id,
+                                        "toolName": call.name,
+                                        "preview": preview
+                                    }),
+                                );
+                                let ok = matches!(
+                                    tokio::time::timeout(std::time::Duration::from_secs(600), rx,)
+                                        .await,
+                                    Ok(Ok(true))
+                                );
+                                if let Ok(mut m) = st.pending_hitl.lock() {
+                                    m.remove(&hitl_id);
+                                }
+                                st.ws.publish(
+                                    Some(wid),
+                                    channel.clone(),
+                                    json!({
+                                        "type": "hitlResolved",
+                                        "hitlId": hitl_id.to_string(),
+                                        "decision": { "kind":
+                                            if ok { "approve" }
+                                            else { "reject" } }
+                                    }),
+                                );
+                                ok
+                            };
+                            if !approved {
+                                Ok("Vom Nutzer abgelehnt.".to_string())
+                            } else {
+                                let total = plan.data_rows.len();
+                                st.ws.publish(
+                                    Some(wid),
+                                    channel.clone(),
+                                    json!({
+                                        "type": "delegationStarted",
+                                        "toolCallId": call.id,
+                                        "total": total
+                                    }),
+                                );
+                                let mut results = Vec::new();
+                                let (mut ok_n, mut fail_n) = (0usize, 0usize);
+                                for (idx, &row) in plan.data_rows.iter().enumerate() {
+                                    if is_cancelled(&st, run_id) {
+                                        break;
+                                    }
+                                    let prompt = crate::tools::render_prompt(&plan, row);
+                                    let label = plan
+                                        .grid
+                                        .get(row)
+                                        .and_then(|r| r.first())
+                                        .filter(|s| !s.trim().is_empty())
+                                        .cloned()
+                                        .unwrap_or_else(|| format!("Zeile {}", row + 1));
+                                    match llm::tool_step(
+                                        &st.http,
+                                        &provider,
+                                        &api_key,
+                                        &model,
+                                        WORKER_SYS,
+                                        &[llm::Turn::User(prompt)],
+                                        &[],
+                                    )
+                                    .await
+                                    {
+                                        Ok(step) => {
+                                            results.push((
+                                                row,
+                                                step.text.unwrap_or_default().trim().to_string(),
+                                            ));
+                                            ok_n += 1;
+                                            st.ws.publish(
+                                                Some(wid),
+                                                channel.clone(),
+                                                json!({
+                                                    "type":
+                                                        "delegationItemDone",
+                                                    "toolCallId": call.id,
+                                                    "index": idx,
+                                                    "total": total,
+                                                    "itemLabel": label
+                                                }),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            fail_n += 1;
+                                            st.ws.publish(
+                                                Some(wid),
+                                                channel.clone(),
+                                                json!({
+                                                    "type":
+                                                      "delegationItemFailed",
+                                                    "toolCallId": call.id,
+                                                    "index": idx,
+                                                    "total": total,
+                                                    "itemLabel": label,
+                                                    "error": e.to_string()
+                                                }),
+                                            );
+                                        }
+                                    }
+                                }
+                                st.ws.publish(
+                                    Some(wid),
+                                    channel.clone(),
+                                    json!({
+                                        "type": "delegationFinished",
+                                        "toolCallId": call.id,
+                                        "succeeded": ok_n,
+                                        "failed": fail_n
+                                    }),
+                                );
+                                crate::tools::save_delegation(&st, wid, user_id, &plan, &results)
+                                    .await
+                            }
+                        }
+                    }
                 } else if crate::tools::is_write_tool(&call.name) {
                     if hitl_disabled {
                         crate::tools::execute_write(&st, wid, user_id, &call.name, &call.input)

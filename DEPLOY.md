@@ -170,16 +170,20 @@ gesetzt, kommt zusätzlich der Header `X-Webhook-Secret`. Dein n8n-Flow muss
 nur eine E-Mail mit `magicLink` als klickbarem Link an `email` versenden.
 Der Link ist 15 Minuten gültig und einmalig nutzbar.
 
-## 8. Bekannte Grenzen (Stand Phase 6b-2d)
+## 8. Bekannte Grenzen (Stand Phase 6 vollständig)
 
 - Live: Auth, Workspaces/Mitglieder, Agenten, Org-Settings/API-Keys,
-  Datei-Upload/Vorschau, Streaming-Chat, Tools+HITL, Rückfragen,
-  Excel-/Word-Schreiben **und Word-aus-Vorlage**. Skill **„Dateien"**:
-  Agent liest Dateien, hängt Text an, schreibt `.xlsx`/`.docx`, füllt
-  `.docx`-Vorlagen mit `{{Platzhalter}}` und stellt Rückfragen (alles
-  nach Freigabe-Dialog, live für alle Workspace-Mitglieder).
+  Datei-Upload/Vorschau, Streaming-Chat (shared session), Tools+HITL,
+  Rückfragen, Excel-/Word-Schreiben, Word-aus-Vorlage, Word-Anhängen,
+  Excel-Zell-Edits **und Bulk-Delegation** (Zeile-für-Zeile-Worker mit
+  Fortschrittsanzeige). Skill **„Dateien"** deckt Lesen + alle
+  Schreib-Operationen + Delegation ab — jeweils nach Freigabe-Dialog,
+  live für alle Workspace-Mitglieder.
 - **Grenze Vorlagen:** Platzhalter müssen im Vorlagentext zusammen-
-  hängend stehen (Word kann sie über mehrere Runs splitten → werden
-  dann nicht ersetzt).
-- **Noch offen (Phase 6b-2e):** `updateCells`/`appendToDocx`,
-  Delegation/Bulk-Worker.
+  hängend stehen (Word splittet sie sonst über Runs).
+- **Grenze Zell-Edits/Delegation:** Schreiben erzeugt das Zielblatt neu;
+  Formeln/Formate/weitere Blätter gehen verloren. Delegation max. 200
+  Zeilen pro Lauf.
+- **Optional offen:** `delegationProfile`-Override (eigenes Worker-
+  Modell je Agent), Vorlage via Agent-Attachment. **Härtung:** HTTP/DB-
+  Integrationstests stehen noch aus (für CI mit Test-Postgres vorgemerkt).
