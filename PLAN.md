@@ -263,14 +263,25 @@ laufenden Run live (echte Shared Session, CLAUDE.md §4).
   per-Tool-Code mehr im Run-Loop.
 - Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
 
-## Phase 6b-2c — Rest (offen, bewusst verschoben)
+## Phase 6b-2c — write_docx ✅ ABGESCHLOSSEN (2026-05-19)
 
-- docx/Template/`updateCells`-Schreib-Tools mit den jeweiligen
-  HitlPreview-Typen; Delegation/Bulk-Worker (`delegateIntoXlsxColumn`).
+- `write_docx`-Tool (Skill `files`): erzeugt/überschreibt eine `.docx`
+  aus Absätzen — **minimales OOXML-Zip ohne neue Dependency** (`zip` +
+  XML-Strings, von `preview::docx_html` lesbar). HITL-Vorschau
+  `writeDocx` (Frontend-`HitlCard` rendert das bereits). In den
+  `write_preview`/`execute_write`-Dispatcher + `is_write_tool` +
+  `skills_json` eingehängt.
+- Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
 
-**Abnahme 6a:** Streaming-Chat live, alle Mitglieder live. **6b-1:**
-Datei-Tools + HITL-Schreiben live. **6b-2a:** Rückfragen. **6b-2b:**
-Agent kann Excel-Dateien schreiben (HITL-Vorschau, live für alle).
+## Phase 6b-2d — Rest (offen, bewusst verschoben)
+
+- `writeDocxFromTemplate` (Platzhalter-Ersetzung in einer Vorlage,
+  nutzt Agent-Attachment `templateFileId`), `updateCells`/`appendToDocx`,
+  Delegation/Bulk-Worker (`delegateIntoXlsxColumn`).
+
+**Abnahme:** 6a Streaming live für alle · 6b-1 Datei-Tools+HITL ·
+6b-2a Rückfragen · 6b-2b Excel-Schreiben · 6b-2c Word-Schreiben (jeweils
+HITL-Vorschau, live für alle Mitglieder).
 
 ---
 
