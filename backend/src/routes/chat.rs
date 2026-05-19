@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
-use crate::llm::{stream_chat, ChatMsg};
+use crate::llm::{self, stream_chat, ChatMsg};
 use crate::perm::{require_editor, require_member};
 use crate::{crypto, AppState};
 
@@ -25,14 +25,47 @@ pub fn router() -> Router<AppState> {
             get(list_messages).post(send_message),
         )
         .route("/runs/{id}/cancel", post(cancel_run))
-        // HITL-Stubs (Tools kommen erst in Phase 6b).
-        .route("/hitl/{id}/approve", post(hitl_noop))
-        .route("/hitl/{id}/reject", post(hitl_noop))
+        .route("/hitl/{id}/approve", post(hitl_approve))
+        .route("/hitl/{id}/reject", post(hitl_reject))
+        // askUser kommt in 6b-2 — vorerst No-op.
         .route("/questions/{id}/respond", post(hitl_noop))
 }
 
 async fn hitl_noop() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+/// Löst die parkende HITL-Anfrage auf (true = freigegeben). Den
+/// `hitlResolved`-Broadcast macht der Run-Task.
+fn resolve_hitl(state: &AppState, hitl_id: Uuid, approved: bool) -> StatusCode {
+    let tx = state
+        .pending_hitl
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(&hitl_id));
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(approved);
+            StatusCode::NO_CONTENT
+        }
+        None => StatusCode::NOT_FOUND,
+    }
+}
+
+async fn hitl_approve(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(hitl_id): Path<Uuid>,
+) -> StatusCode {
+    resolve_hitl(&state, hitl_id, true)
+}
+
+async fn hitl_reject(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(hitl_id): Path<Uuid>,
+) -> StatusCode {
+    resolve_hitl(&state, hitl_id, false)
 }
 
 #[derive(Serialize)]
@@ -53,14 +86,37 @@ fn row_to_msg(id: Uuid, role: String, content: Value, at: OffsetDateTime) -> Api
     }
 }
 
-async fn agent_ctx(state: &AppState, id: Uuid) -> ApiResult<(Uuid, String)> {
-    let row: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT workspace_id, system_prompt FROM agents WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|e| ApiError::Internal(e.into()))?;
-    row.ok_or(ApiError::NotFound)
+struct AgentCtx {
+    wid: Uuid,
+    system_prompt: String,
+    skills: Vec<String>,
+    hitl_disabled: bool,
+}
+
+async fn agent_ctx(state: &AppState, id: Uuid) -> ApiResult<AgentCtx> {
+    let row: Option<(Uuid, String, Value, bool)> = sqlx::query_as(
+        "SELECT workspace_id, system_prompt, skills, hitl_disabled \
+         FROM agents WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    let (wid, system_prompt, skills, hitl_disabled) = row.ok_or(ApiError::NotFound)?;
+    let skills = skills
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(AgentCtx {
+        wid,
+        system_prompt,
+        skills,
+        hitl_disabled,
+    })
 }
 
 async fn list_messages(
@@ -68,7 +124,7 @@ async fn list_messages(
     user: AuthUser,
     Path(agent_id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<ApiMessage>>> {
-    let (wid, _) = agent_ctx(&state, agent_id).await?;
+    let wid = agent_ctx(&state, agent_id).await?.wid;
     require_member(&state, &user, wid).await?;
     let rows: Vec<(Uuid, String, Value, OffsetDateTime)> = sqlx::query_as(
         "SELECT id, role, content, created_at FROM chat_messages \
@@ -131,13 +187,73 @@ fn release_run(state: &AppState, agent_id: Uuid, run_id: Uuid) {
     }
 }
 
+fn is_cancelled(state: &AppState, run_id: Uuid) -> bool {
+    state
+        .cancels
+        .lock()
+        .map(|s| s.contains(&run_id))
+        .unwrap_or(false)
+}
+
+/// Assistenten-Nachricht persistieren + `finish` broadcasten.
+async fn finish_run(
+    st: &AppState,
+    agent_id: Uuid,
+    assistant_id: Uuid,
+    wid: Uuid,
+    channel: &str,
+    text: String,
+    reason: &str,
+) {
+    let saved: Result<(OffsetDateTime,), _> = sqlx::query_as(
+        "INSERT INTO chat_messages (id, agent_id, role, content) \
+         VALUES ($1, $2, 'assistant', $3) RETURNING created_at",
+    )
+    .bind(assistant_id)
+    .bind(agent_id)
+    .bind(Value::String(text.clone()))
+    .fetch_one(&st.pool)
+    .await;
+    let created_at = saved
+        .map(|r| r.0.format(&Rfc3339).unwrap_or_default())
+        .unwrap_or_default();
+    st.ws.publish(
+        Some(wid),
+        channel.to_string(),
+        json!({
+            "type": "finish",
+            "reason": reason,
+            "message": {
+                "id": assistant_id.to_string(),
+                "role": "assistant",
+                "content": text,
+                "createdAt": created_at,
+            },
+        }),
+    );
+}
+
+fn error_run(st: &AppState, wid: Uuid, channel: &str, msg: String) {
+    tracing::error!(error = %msg, "chat run failed");
+    st.ws.publish(
+        Some(wid),
+        channel.to_string(),
+        json!({ "type": "error", "code": "llm_error", "message": msg }),
+    );
+}
+
 async fn send_message(
     State(state): State<AppState>,
     user: AuthUser,
     Path(agent_id): Path<Uuid>,
     Json(body): Json<SendBody>,
 ) -> ApiResult<Json<RunStarted>> {
-    let (wid, system_prompt) = agent_ctx(&state, agent_id).await?;
+    let AgentCtx {
+        wid,
+        system_prompt,
+        skills,
+        hitl_disabled,
+    } = agent_ctx(&state, agent_id).await?;
     require_editor(&state, &user, wid).await?;
     if body.text.trim().is_empty() {
         return Err(ApiError::BadRequest("Leere Nachricht.".into()));
@@ -215,86 +331,195 @@ async fn send_message(
     let st = state.clone();
     let provider = body.provider.clone();
     let model = body.model_id.clone();
+    let user_id = user.user_id;
     tokio::spawn(async move {
-        let mut acc = String::new();
-        let res = stream_chat(
-            &st.http,
-            &provider,
-            &api_key,
-            &model,
-            &system_prompt,
-            &history,
-            |chunk| {
-                let cancelled = st
-                    .cancels
-                    .lock()
-                    .map(|s| s.contains(&run_id))
-                    .unwrap_or(false);
-                if cancelled {
-                    return false;
+        let tools = crate::tools::available_tools(&skills);
+
+        // --- Kein Tool → reines Streaming (Phase 6a, beste UX) ----------
+        if tools.is_empty() {
+            let mut acc = String::new();
+            let res = stream_chat(
+                &st.http,
+                &provider,
+                &api_key,
+                &model,
+                &system_prompt,
+                &history,
+                |chunk| {
+                    if is_cancelled(&st, run_id) {
+                        return false;
+                    }
+                    acc.push_str(chunk);
+                    st.ws.publish(
+                        Some(wid),
+                        channel.clone(),
+                        json!({ "type": "delta", "text": chunk }),
+                    );
+                    true
+                },
+            )
+            .await;
+            match res {
+                Ok(_) => {
+                    let reason = if is_cancelled(&st, run_id) {
+                        "cancelled"
+                    } else {
+                        "stop"
+                    };
+                    finish_run(&st, agent_id, assistant_id, wid, &channel, acc, reason).await;
                 }
-                acc.push_str(chunk);
-                st.ws.publish(
-                    Some(wid),
-                    channel.clone(),
-                    json!({ "type": "delta", "text": chunk }),
-                );
-                true
-            },
-        )
-        .await;
-
-        let cancelled = st
-            .cancels
-            .lock()
-            .map(|mut s| s.remove(&run_id))
-            .unwrap_or(false);
-
-        match res {
-            Ok(_) => {
-                // Assistenten-Nachricht persistieren.
-                let saved: Result<(OffsetDateTime,), _> = sqlx::query_as(
-                    "INSERT INTO chat_messages (id, agent_id, role, content) \
-                     VALUES ($1, $2, 'assistant', $3) RETURNING created_at",
-                )
-                .bind(assistant_id)
-                .bind(agent_id)
-                .bind(Value::String(acc.clone()))
-                .fetch_one(&st.pool)
-                .await;
-                let created_at = saved
-                    .map(|r| r.0.format(&Rfc3339).unwrap_or_default())
-                    .unwrap_or_default();
-                let message = json!({
-                    "id": assistant_id.to_string(),
-                    "role": "assistant",
-                    "content": acc,
-                    "createdAt": created_at,
-                });
-                st.ws.publish(
-                    Some(wid),
-                    channel.clone(),
-                    json!({
-                        "type": "finish",
-                        "reason": if cancelled { "cancelled" } else { "stop" },
-                        "message": message,
-                    }),
-                );
+                Err(e) => error_run(&st, wid, &channel, e.to_string()),
             }
-            Err(e) => {
-                tracing::error!(error = %e, "chat run failed");
-                st.ws.publish(
-                    Some(wid),
-                    channel.clone(),
-                    json!({
-                        "type": "error",
-                        "code": "llm_error",
-                        "message": e.to_string(),
-                    }),
-                );
-            }
+            release_run(&st, agent_id, run_id);
+            return;
         }
-        // Run-Slot freigeben — nächster Send für den Agenten ist erlaubt.
+
+        // --- Tools aktiv → ReAct-Loop mit HITL (Phase 6b-1) -------------
+        let mut turns: Vec<llm::Turn> = history
+            .iter()
+            .map(|m| {
+                if m.role == "user" {
+                    llm::Turn::User(m.content.clone())
+                } else {
+                    llm::Turn::Assistant(m.content.clone())
+                }
+            })
+            .collect();
+
+        const MAX_ITERS: usize = 8;
+        let mut final_text: Option<String> = None;
+        let mut reason = "stop";
+
+        for _ in 0..MAX_ITERS {
+            if is_cancelled(&st, run_id) {
+                final_text = Some(String::new());
+                reason = "cancelled";
+                break;
+            }
+            let step = match llm::tool_step(
+                &st.http,
+                &provider,
+                &api_key,
+                &model,
+                &system_prompt,
+                &turns,
+                &tools,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    error_run(&st, wid, &channel, e.to_string());
+                    release_run(&st, agent_id, run_id);
+                    return;
+                }
+            };
+            if step.calls.is_empty() {
+                final_text = Some(step.text.unwrap_or_default());
+                break;
+            }
+            turns.push(llm::Turn::ToolUse(step.calls.clone()));
+            let mut results = Vec::new();
+            for call in &step.calls {
+                st.ws.publish(
+                    Some(wid),
+                    channel.clone(),
+                    json!({
+                        "type": "toolCallStarted",
+                        "id": call.id, "name": call.name,
+                        "arguments": call.input
+                    }),
+                );
+                let outcome: ApiResult<String> = if crate::tools::is_write_tool(&call.name) {
+                    let filename = call
+                        .input
+                        .get("filename")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let content = call
+                        .input
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if hitl_disabled {
+                        crate::tools::do_append(&st, wid, user_id, &filename, &content).await
+                    } else {
+                        match crate::tools::append_preview(&st, wid, &filename, &content) {
+                            Ok(preview) => {
+                                let hitl_id = Uuid::new_v4();
+                                let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                                if let Ok(mut m) = st.pending_hitl.lock() {
+                                    m.insert(hitl_id, tx);
+                                }
+                                st.ws.publish(
+                                    Some(wid),
+                                    channel.clone(),
+                                    json!({
+                                        "type": "hitlRequest",
+                                        "hitlId": hitl_id.to_string(),
+                                        "toolCallId": call.id,
+                                        "toolName": call.name,
+                                        "preview": preview
+                                    }),
+                                );
+                                let approved = matches!(
+                                    tokio::time::timeout(std::time::Duration::from_secs(600), rx,)
+                                        .await,
+                                    Ok(Ok(true))
+                                );
+                                if let Ok(mut m) = st.pending_hitl.lock() {
+                                    m.remove(&hitl_id);
+                                }
+                                st.ws.publish(
+                                    Some(wid),
+                                    channel.clone(),
+                                    json!({
+                                        "type": "hitlResolved",
+                                        "hitlId": hitl_id.to_string(),
+                                        "decision": { "kind":
+                                            if approved { "approve" }
+                                            else { "reject" } }
+                                    }),
+                                );
+                                if approved {
+                                    crate::tools::do_append(&st, wid, user_id, &filename, &content)
+                                        .await
+                                } else {
+                                    Ok("Vom Nutzer abgelehnt.".to_string())
+                                }
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                } else {
+                    crate::tools::execute_read_tool(&st, wid, &call.name, &call.input).await
+                };
+                let (content, is_error) = match outcome {
+                    Ok(s) => (s, false),
+                    Err(e) => (e.to_string(), true),
+                };
+                st.ws.publish(
+                    Some(wid),
+                    channel.clone(),
+                    json!({
+                        "type": "toolCallCompleted",
+                        "id": call.id, "content": content,
+                        "isError": is_error
+                    }),
+                );
+                results.push(llm::ToolResult {
+                    id: call.id.clone(),
+                    content,
+                });
+            }
+            turns.push(llm::Turn::ToolResults(results));
+        }
+
+        let text =
+            final_text.unwrap_or_else(|| "(Maximale Tool-Iterationen erreicht.)".to_string());
+        finish_run(&st, agent_id, assistant_id, wid, &channel, text, reason).await;
         release_run(&st, agent_id, run_id);
     });
 

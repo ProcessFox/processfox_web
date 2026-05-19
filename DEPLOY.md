@@ -170,12 +170,13 @@ gesetzt, kommt zusätzlich der Header `X-Webhook-Secret`. Dein n8n-Flow muss
 nur eine E-Mail mit `magicLink` als klickbarem Link an `email` versenden.
 Der Link ist 15 Minuten gültig und einmalig nutzbar.
 
-## 8. Bekannte Grenzen (Stand Phase 6a)
+## 8. Bekannte Grenzen (Stand Phase 6b-1)
 
-- Auth, Workspaces/Mitglieder, Agenten, Org-Settings/API-Keys,
-  Datei-Upload/Vorschau und **Streaming-Chat** sind live. Bridge
-  vollständig REST `/api/v1/...` + eine multiplexte WebSocket-Verbindung.
-- **Noch offen (Phase 6b):** Tools/Skills, HITL-Freigaben vor
-  Schreibaktionen, Delegation/Bulk-Worker. `GET /skills` liefert `[]`,
-  Agenten haben also noch keine Werkzeuge — reiner konversationeller Chat.
-  Die HITL-Endpunkte existieren als 204-Stubs.
+- Live: Auth, Workspaces/Mitglieder, Agenten, Org-Settings/API-Keys,
+  Datei-Upload/Vorschau, Streaming-Chat **und Tools+HITL**. Aktivierst du
+  beim Agenten den Skill **„Dateien"**, kann er Workspace-Dateien lesen
+  und (nach Freigabe-Dialog) Text anhängen; Tool-Lauf + Freigabe sind für
+  alle Workspace-Mitglieder live sichtbar. „Schreiben ohne Rückfrage" am
+  Agenten überspringt den HITL-Dialog.
+- **Noch offen (Phase 6b-2):** weitere Schreib-Tool-Typen (docx/xlsx/
+  Template/`updateCells`), `askUser`, Delegation/Bulk-Worker.

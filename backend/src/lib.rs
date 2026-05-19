@@ -16,6 +16,7 @@ pub mod ratelimit;
 pub mod routes;
 pub mod sandbox;
 pub mod storage;
+pub mod tools;
 pub mod ws;
 
 use std::collections::HashSet;
@@ -50,6 +51,10 @@ pub struct AppState {
     /// Aktiver Run je Agent (agent_id → run_id). Erzwingt **einen**
     /// gleichzeitigen Run pro Agent (Shared-Session, PLAN.md Lücke #3).
     pub active_runs: Arc<Mutex<std::collections::HashMap<Uuid, Uuid>>>,
+    /// Offene HITL-Anfragen: hitl_id → Sender (true = approve, false =
+    /// reject). Der Run-Task wartet auf die Entscheidung.
+    pub pending_hitl:
+        Arc<Mutex<std::collections::HashMap<Uuid, tokio::sync::oneshot::Sender<bool>>>>,
 }
 
 /// Baut die komplette App: API-Router + statisches Frontend mit

@@ -224,15 +224,34 @@ laufenden Run live (echte Shared Session, CLAUDE.md §4).
 **Ergebnis:** `cargo build/fmt/clippy -D warnings` + 8 Tests grün,
 `tsc`/`vite build` grün.
 
-## Phase 6b — Tools / Skills / HITL / Delegation (offen, bewusst verschoben)
+## Phase 6b-1 — Tool-Loop + HITL ✅ ABGESCHLOSSEN (2026-05-19)
 
-- Skill-/Tool-System (gebündelte SKILL.md, `GET /skills` derzeit `[]`),
-  Tool-Calling im LLM-Loop, HITL-Freigaben vor Schreibaktionen mit den
-  `HitlPreview`-Strukturen, Delegation/Bulk-Worker.
-- Setzt das eigenständige Skill-/Tool-System voraus → eigener Block.
+- `tools.rs`: gebündelte read-only Skill **`files`** (`GET /skills` liefert
+  sie real), Tools `list_files`/`read_file` (read) + `append_to_file`
+  (write → HITL). Provider-neutrale `ToolSpec`.
+- `llm.rs`: non-streaming `tool_step` für Anthropic (`tool_use`) **und**
+  OpenAI-kompatibel (`tool_calls`), neutrale `Turn`-Repräsentation,
+  Iterations-Cap (8).
+- `chat.rs`: kein Tool → Streaming (6a, beste UX); Tools aktiv →
+  **ReAct-Loop**. Write-Tool → `hitlRequest` (Preview) + Run **parkt** via
+  `oneshot` (Timeout 10 min) → approve/reject; `agent.hitl_disabled`
+  überspringt HITL. `toolCallStarted/Completed`, `hitlResolved` über den
+  Agenten-Channel → **alle Mitglieder sehen Tool-Lauf + Freigabe live**.
+  HITL-Endpunkte real (`AppState.pending_hitl`).
+- Frontend: **unverändert** — die portierte Local-UI (`HitlCard`,
+  `ToolCallChip`, `useAgentChat`) + REST-Bridge unterstützen das bereits.
 
-**Abnahme 6a:** Streaming-Chat live; mehrere Workspace-Mitglieder sehen
-denselben Verlauf in Echtzeit. **6b:** Tools + HITL über WS.
+**Ergebnis:** `cargo build/fmt/clippy -D warnings` + 8 Tests grün,
+`tsc`/`vite build` grün.
+
+## Phase 6b-2 — Rest (offen, bewusst verschoben)
+
+- Weitere HitlPreview-Typen (docx/xlsx/`updateCells`/Template …) + zuge-
+  hörige Schreib-Tools, `askUser` (`/questions/{id}/respond` noch No-op),
+  Delegation/Bulk-Worker (`delegateIntoXlsxColumn`).
+
+**Abnahme 6a:** Streaming-Chat live, alle Mitglieder live. **6b-1:**
+Agent ruft Datei-Tools, Schreiben erst nach HITL-Freigabe, live für alle.
 
 ---
 

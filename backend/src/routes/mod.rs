@@ -38,8 +38,7 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
-// Skills werden ab Phase 6 mit dem Backend gebündelt (read-only). Bis dahin
-// leere Liste, damit der Agent-Editor sauber lädt statt 404.
+// Mit dem Backend gebündelte Skills (read-only, Phase 6b-1).
 async fn skills() -> Json<serde_json::Value> {
-    Json(json!([]))
+    Json(crate::tools::skills_json())
 }
