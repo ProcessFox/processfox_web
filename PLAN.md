@@ -214,6 +214,13 @@ HTTP/DB-Integrationstests (Upload→Preview→Download e2e) → CI mit
   (Reconnect mit frischem Token), `chatApi` auf REST. Letzte RPC-Reste
   (`post`/`/api/<command>`) entfernt — Bridge jetzt vollständig REST + 1×WS.
 
+**Härtung (gleicher Tag):** Planungslücke #3 geschlossen — **genau ein
+aktiver Run pro Agent** (`AppState.active_runs`; zweiter paralleler Send →
+`409`, Slot-Freigabe bei finish/error/cancel und Früh-Fehlern). Streaming
+läuft auf `chat:agent:<agentId>` statt `chat:run:<runId>`; `useAgentChat`
+abonniert **pro aktivem Agenten** → alle Workspace-Mitglieder sehen den
+laufenden Run live (echte Shared Session, CLAUDE.md §4).
+
 **Ergebnis:** `cargo build/fmt/clippy -D warnings` + 8 Tests grün,
 `tsc`/`vite build` grün.
 
@@ -293,9 +300,9 @@ Bei der Durchsicht gefundene, vorher fehlende Punkte:
    mit frischem Token nach Refresh; Server schließt bei Token-Ablauf.
    Konsolidiert zugleich die Bridge-Divergenz `/ws/<channel>` → ein Kanal
    mit `{type,payload}` (CLAUDE.md §7).
-3. **Shared-Session-Nebenläufigkeit** (Phase 6): zwei Editoren senden
-   gleichzeitig an denselben Agenten. → Pro Agent max. ein aktiver Run;
-   zweiter Send wird abgelehnt/gequeued; Run-State per WS an alle Mitglieder.
+3. **Shared-Session-Nebenläufigkeit** ✅ GELÖST (Phase 6a-Härtung,
+   2026-05-19): genau ein aktiver Run pro Agent (`active_runs`, 2. Send →
+   409); Run-State per `chat:agent:<id>` an alle Workspace-Mitglieder live.
 4. **Skill-Quelle im Web** (Phase 4/6): Local liest `SKILL.md` von Disk.
    Web: Skills werden **mit dem Backend-Binary gebündelt** (read-only,
    kein User-Script — CLAUDE.md §3 Regel 7), `skillsApi.list()` liefert sie.

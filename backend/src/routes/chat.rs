@@ -118,6 +118,19 @@ async fn fetch_api_key(state: &AppState, org_id: Uuid, provider: &str) -> ApiRes
     Ok(String::from_utf8_lossy(&plain).into_owned())
 }
 
+/// Gibt den Agenten-Run-Slot frei (nur wenn er noch diesem Run gehört)
+/// und räumt das Cancel-Flag ab.
+fn release_run(state: &AppState, agent_id: Uuid, run_id: Uuid) {
+    if let Ok(mut active) = state.active_runs.lock() {
+        if active.get(&agent_id) == Some(&run_id) {
+            active.remove(&agent_id);
+        }
+    }
+    if let Ok(mut c) = state.cancels.lock() {
+        c.remove(&run_id);
+    }
+}
+
 async fn send_message(
     State(state): State<AppState>,
     user: AuthUser,
@@ -131,38 +144,73 @@ async fn send_message(
     }
     let api_key = fetch_api_key(&state, user.org_id, &body.provider).await?;
 
-    // User-Nachricht persistieren.
-    sqlx::query(
-        "INSERT INTO chat_messages (agent_id, role, content) \
-         VALUES ($1, 'user', $2)",
-    )
-    .bind(agent_id)
-    .bind(Value::String(body.text.clone()))
-    .execute(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-
-    // Verlauf laden (inkl. gerade eingefügter User-Nachricht).
-    let hist_rows: Vec<(String, Value)> = sqlx::query_as(
-        "SELECT role, content FROM chat_messages \
-         WHERE agent_id = $1 ORDER BY created_at",
-    )
-    .bind(agent_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-    let history: Vec<ChatMsg> = hist_rows
-        .into_iter()
-        .filter(|(r, _)| r == "user" || r == "assistant")
-        .map(|(r, c)| ChatMsg {
-            role: r,
-            content: c.as_str().unwrap_or_default().to_string(),
-        })
-        .collect();
-
     let run_id = Uuid::new_v4();
     let assistant_id = Uuid::new_v4();
-    let channel = format!("chat:run:{run_id}");
+
+    // Genau ein aktiver Run pro Agent (Shared-Session). Zweiter paralleler
+    // Send → 409, ohne den laufenden Run zu stören.
+    {
+        let mut active = state
+            .active_runs
+            .lock()
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("lock poisoned")))?;
+        if active.contains_key(&agent_id) {
+            return Err(ApiError::Conflict(
+                "Es läuft bereits eine Antwort für diesen Agenten.".into(),
+            ));
+        }
+        active.insert(agent_id, run_id);
+    }
+
+    // Ab hier muss bei jedem Fehlerpfad der Slot wieder frei werden.
+    let setup = async {
+        sqlx::query(
+            "INSERT INTO chat_messages (agent_id, role, content) \
+             VALUES ($1, 'user', $2)",
+        )
+        .bind(agent_id)
+        .bind(Value::String(body.text.clone()))
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+        let hist_rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT role, content FROM chat_messages \
+             WHERE agent_id = $1 ORDER BY created_at",
+        )
+        .bind(agent_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+        Ok::<_, ApiError>(
+            hist_rows
+                .into_iter()
+                .filter(|(r, _)| r == "user" || r == "assistant")
+                .map(|(r, c)| ChatMsg {
+                    role: r,
+                    content: c.as_str().unwrap_or_default().to_string(),
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let history = match setup.await {
+        Ok(h) => h,
+        Err(e) => {
+            release_run(&state, agent_id, run_id);
+            return Err(e);
+        }
+    };
+
+    // Streaming an ALLE Mitglieder, die den Agenten offen haben.
+    let channel = format!("chat:agent:{agent_id}");
+
+    // Run-Start: alle Mitglieder laden den Verlauf neu → der eben
+    // gesendete User-Prompt erscheint sofort bei jedem (nicht erst bei
+    // finish), und der optimistische Platzhalter des Absenders wird durch
+    // die persistierte Nachricht ersetzt.
+    state
+        .ws
+        .publish(Some(wid), channel.clone(), json!({ "type": "userMessage" }));
 
     let st = state.clone();
     let provider = body.provider.clone();
@@ -246,6 +294,8 @@ async fn send_message(
                 );
             }
         }
+        // Run-Slot freigeben — nächster Send für den Agenten ist erlaubt.
+        release_run(&st, agent_id, run_id);
     });
 
     Ok(Json(RunStarted {

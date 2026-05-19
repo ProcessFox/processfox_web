@@ -47,6 +47,9 @@ pub struct AppState {
     pub ws: WsHub,
     /// Run-IDs, deren Stream abgebrochen werden soll (Cancel).
     pub cancels: Arc<Mutex<HashSet<Uuid>>>,
+    /// Aktiver Run je Agent (agent_id → run_id). Erzwingt **einen**
+    /// gleichzeitigen Run pro Agent (Shared-Session, PLAN.md Lücke #3).
+    pub active_runs: Arc<Mutex<std::collections::HashMap<Uuid, Uuid>>>,
 }
 
 /// Baut die komplette App: API-Router + statisches Frontend mit

@@ -431,9 +431,11 @@ export const chatApi = {
   respondToQuestion: (questionId: string, answer: string) =>
     v1<void>("POST", `questions/${questionId}/respond`, { answer }),
 
-  subscribeRun: (
-    runId: string,
+  /** Shared Session: alle Mitglieder, die den Agenten offen haben,
+   *  bekommen den laufenden Run live (ein aktiver Run je Agent). */
+  subscribeAgent: (
+    agentId: string,
     handler: (event: RunEvent) => void,
   ): Promise<UnlistenFn> =>
-    subscribeWs<RunEvent>(`chat:run:${runId}`, handler),
+    subscribeWs<RunEvent>(`chat:agent:${agentId}`, handler),
 };

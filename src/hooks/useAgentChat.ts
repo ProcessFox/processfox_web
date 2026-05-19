@@ -30,10 +30,8 @@ export type DelegationProgress = {
   total: number;
   succeeded: number;
   failed: number;
-  /** Most recently completed item — used to render "Zeile X von N: <label>". */
   lastItem?: { index: number; label: string };
   lastError?: string;
-  /** True after the terminal `delegationFinished` event has arrived. */
   finished: boolean;
 };
 
@@ -46,13 +44,13 @@ export type PendingToolCall = {
   delegation?: DelegationProgress;
 };
 
-type StreamState = {
-  runId: string;
-  assistantMessageId: string;
-  buffer: string;
-  reasoning: string;
-};
-
+/**
+ * Shared-Session-Chat: Wir abonnieren **pro aktivem Agenten** den
+ * Agenten-Channel — damit sehen alle Workspace-Mitglieder, die den
+ * Agenten offen haben, denselben laufenden Run live (Backend erlaubt
+ * genau einen aktiven Run je Agent). `send` startet nur den Run; der
+ * Stream kommt für alle über den Channel.
+ */
 export function useAgentChat(
   agent: Agent | null,
   effectiveModel: EffectiveModel | null,
@@ -69,15 +67,14 @@ export function useAgentChat(
     useState<PendingQuestion | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const streamRef = useRef<StreamState | null>(null);
-  const unlistenRef = useRef<(() => void) | null>(null);
+  const bufferRef = useRef("");
+  const reasoningRef = useRef("");
+  // Run-ID des zuletzt von DIESEM Client gestarteten Runs (für Cancel).
+  const currentRunRef = useRef<string | null>(null);
 
   const resetStream = useCallback(() => {
-    if (unlistenRef.current) {
-      unlistenRef.current();
-      unlistenRef.current = null;
-    }
-    streamRef.current = null;
+    bufferRef.current = "";
+    reasoningRef.current = "";
     setStreamingText(null);
     setStreamingReasoning(null);
     setPendingTools([]);
@@ -86,17 +83,21 @@ export function useAgentChat(
     setSending(false);
   }, []);
 
-  // Load history whenever the active agent changes.
+  // Pro Agent: Verlauf laden + Agenten-Channel abonnieren (live für alle).
   useEffect(() => {
     resetStream();
     setError(null);
+    currentRunRef.current = null;
     if (!agent) {
       setMessages([]);
       return;
     }
+    const agentId = agent.id;
     let cancelled = false;
+    let unlisten: (() => void) | null = null;
+
     chatApi
-      .listMessages(agent.id)
+      .listMessages(agentId)
       .then((msgs) => {
         if (!cancelled) setMessages(msgs);
       })
@@ -104,8 +105,163 @@ export function useAgentChat(
         if (!cancelled)
           setError(String((e as { message?: string })?.message ?? e));
       });
+
+    chatApi
+      .subscribeAgent(agentId, (event) => {
+        switch (event.type) {
+          case "userMessage":
+            // Run-Start: autoritativen Verlauf laden — Prompt erscheint
+            // sofort bei allen; optimistischer Platzhalter wird ersetzt.
+            chatApi
+              .listMessages(agentId)
+              .then(setMessages)
+              .catch(() => {});
+            break;
+          case "delta":
+            bufferRef.current += event.text;
+            setStreamingText(bufferRef.current);
+            break;
+          case "reasoningDelta":
+            reasoningRef.current += event.text;
+            setStreamingReasoning(reasoningRef.current);
+            break;
+          case "toolCallStarted":
+            setPendingTools((prev) => [
+              ...prev,
+              {
+                id: event.id,
+                name: event.name,
+                arguments: event.arguments,
+                status: "running",
+              },
+            ]);
+            bufferRef.current = "";
+            setStreamingText("");
+            break;
+          case "toolCallCompleted":
+            setPendingTools((prev) =>
+              prev.map((t) =>
+                t.id === event.id
+                  ? {
+                      ...t,
+                      status: event.isError ? "error" : "done",
+                      content: event.content,
+                    }
+                  : t,
+              ),
+            );
+            break;
+          case "hitlRequest":
+            setPendingHitl({
+              hitlId: event.hitlId,
+              toolCallId: event.toolCallId,
+              toolName: event.toolName,
+              preview: event.preview,
+            });
+            break;
+          case "hitlResolved":
+            setPendingHitl((prev) =>
+              prev && prev.hitlId === event.hitlId ? null : prev,
+            );
+            break;
+          case "askUserRequest":
+            setPendingQuestion({
+              questionId: event.questionId,
+              toolCallId: event.toolCallId,
+              question: event.question,
+            });
+            break;
+          case "askUserResolved":
+            setPendingQuestion((prev) =>
+              prev && prev.questionId === event.questionId ? null : prev,
+            );
+            break;
+          case "delegationStarted":
+            setPendingTools((prev) =>
+              prev.map((t) =>
+                t.id === event.toolCallId
+                  ? {
+                      ...t,
+                      delegation: {
+                        total: event.total,
+                        succeeded: 0,
+                        failed: 0,
+                        finished: false,
+                      },
+                    }
+                  : t,
+              ),
+            );
+            break;
+          case "delegationItemDone":
+            setPendingTools((prev) =>
+              prev.map((t) => {
+                if (t.id !== event.toolCallId || !t.delegation) return t;
+                return {
+                  ...t,
+                  delegation: {
+                    ...t.delegation,
+                    succeeded: t.delegation.succeeded + 1,
+                    lastItem: { index: event.index, label: event.itemLabel },
+                  },
+                };
+              }),
+            );
+            break;
+          case "delegationItemFailed":
+            setPendingTools((prev) =>
+              prev.map((t) => {
+                if (t.id !== event.toolCallId || !t.delegation) return t;
+                return {
+                  ...t,
+                  delegation: {
+                    ...t.delegation,
+                    failed: t.delegation.failed + 1,
+                    lastItem: { index: event.index, label: event.itemLabel },
+                    lastError: event.error,
+                  },
+                };
+              }),
+            );
+            break;
+          case "delegationFinished":
+            setPendingTools((prev) =>
+              prev.map((t) => {
+                if (t.id !== event.toolCallId || !t.delegation) return t;
+                return {
+                  ...t,
+                  delegation: {
+                    ...t.delegation,
+                    succeeded: event.succeeded,
+                    failed: event.failed,
+                    finished: true,
+                  },
+                };
+              }),
+            );
+            break;
+          case "finish":
+            chatApi.listMessages(agentId).then(setMessages).catch(() => {});
+            currentRunRef.current = null;
+            resetStream();
+            break;
+          case "error":
+            setError(`${event.code}: ${event.message}`);
+            chatApi.listMessages(agentId).then(setMessages).catch(() => {});
+            currentRunRef.current = null;
+            resetStream();
+            break;
+        }
+      })
+      .then((u) => {
+        if (cancelled) u();
+        else unlisten = u;
+      })
+      .catch((e) => console.warn("agent subscribe failed", e));
+
     return () => {
       cancelled = true;
+      if (unlisten) unlisten();
     };
   }, [agent, resetStream]);
 
@@ -127,186 +283,18 @@ export function useAgentChat(
       setStreamingReasoning(null);
       setPendingTools([]);
 
-      let started;
       try {
-        started = await chatApi.sendMessage({
+        const started = await chatApi.sendMessage({
           agentId: agent.id,
           provider: effectiveModel.provider,
           modelId: effectiveModel.modelId,
           text,
         });
+        currentRunRef.current = started.runId;
+        // Stream kommt über den Agenten-Channel (Effekt oben).
       } catch (e) {
+        // Inkl. 409 „Es läuft bereits eine Antwort für diesen Agenten."
         setMessages((prev) => prev.filter((m) => m.id !== tempUserId));
-        setSending(false);
-        setStreamingText(null);
-        setError(String((e as { message?: string })?.message ?? e));
-        return;
-      }
-
-      streamRef.current = {
-        runId: started.runId,
-        assistantMessageId: started.assistantMessageId,
-        buffer: "",
-        reasoning: "",
-      };
-
-      try {
-        const unlisten = await chatApi.subscribeRun(started.runId, (event) => {
-          const state = streamRef.current;
-          if (!state || state.runId !== started.runId) return;
-
-          switch (event.type) {
-            case "delta":
-              state.buffer += event.text;
-              setStreamingText(state.buffer);
-              break;
-            case "reasoningDelta":
-              state.reasoning += event.text;
-              setStreamingReasoning(state.reasoning);
-              break;
-            case "toolCallStarted":
-              setPendingTools((prev) => [
-                ...prev,
-                {
-                  id: event.id,
-                  name: event.name,
-                  arguments: event.arguments,
-                  status: "running",
-                },
-              ]);
-              // A new tool call starts the next LLM iteration from a clean
-              // text slate; drop the accumulated streaming text so chips
-              // group visually with their request.
-              state.buffer = "";
-              setStreamingText("");
-              break;
-            case "toolCallCompleted":
-              setPendingTools((prev) =>
-                prev.map((t) =>
-                  t.id === event.id
-                    ? {
-                        ...t,
-                        status: event.isError ? "error" : "done",
-                        content: event.content,
-                      }
-                    : t,
-                ),
-              );
-              break;
-            case "hitlRequest":
-              setPendingHitl({
-                hitlId: event.hitlId,
-                toolCallId: event.toolCallId,
-                toolName: event.toolName,
-                preview: event.preview,
-              });
-              break;
-            case "hitlResolved":
-              setPendingHitl((prev) =>
-                prev && prev.hitlId === event.hitlId ? null : prev,
-              );
-              break;
-            case "askUserRequest":
-              setPendingQuestion({
-                questionId: event.questionId,
-                toolCallId: event.toolCallId,
-                question: event.question,
-              });
-              break;
-            case "askUserResolved":
-              setPendingQuestion((prev) =>
-                prev && prev.questionId === event.questionId ? null : prev,
-              );
-              break;
-            case "delegationStarted":
-              setPendingTools((prev) =>
-                prev.map((t) =>
-                  t.id === event.toolCallId
-                    ? {
-                        ...t,
-                        delegation: {
-                          total: event.total,
-                          succeeded: 0,
-                          failed: 0,
-                          finished: false,
-                        },
-                      }
-                    : t,
-                ),
-              );
-              break;
-            case "delegationItemDone":
-              setPendingTools((prev) =>
-                prev.map((t) => {
-                  if (t.id !== event.toolCallId || !t.delegation) return t;
-                  return {
-                    ...t,
-                    delegation: {
-                      ...t.delegation,
-                      succeeded: t.delegation.succeeded + 1,
-                      lastItem: {
-                        index: event.index,
-                        label: event.itemLabel,
-                      },
-                    },
-                  };
-                }),
-              );
-              break;
-            case "delegationItemFailed":
-              setPendingTools((prev) =>
-                prev.map((t) => {
-                  if (t.id !== event.toolCallId || !t.delegation) return t;
-                  return {
-                    ...t,
-                    delegation: {
-                      ...t.delegation,
-                      failed: t.delegation.failed + 1,
-                      lastItem: {
-                        index: event.index,
-                        label: event.itemLabel,
-                      },
-                      lastError: event.error,
-                    },
-                  };
-                }),
-              );
-              break;
-            case "delegationFinished":
-              setPendingTools((prev) =>
-                prev.map((t) => {
-                  if (t.id !== event.toolCallId || !t.delegation) return t;
-                  return {
-                    ...t,
-                    delegation: {
-                      ...t.delegation,
-                      succeeded: event.succeeded,
-                      failed: event.failed,
-                      finished: true,
-                    },
-                  };
-                }),
-              );
-              break;
-            case "finish":
-              chatApi
-                .listMessages(agent.id)
-                .then(setMessages)
-                .catch(() => {});
-              resetStream();
-              break;
-            case "error":
-              setError(`${event.code}: ${event.message}`);
-              chatApi
-                .listMessages(agent.id)
-                .then(setMessages)
-                .catch(() => {});
-              resetStream();
-              break;
-          }
-        });
-        unlistenRef.current = unlisten;
-      } catch (e) {
         resetStream();
         setError(String((e as { message?: string })?.message ?? e));
       }
@@ -315,10 +303,10 @@ export function useAgentChat(
   );
 
   const cancel = useCallback(async () => {
-    const state = streamRef.current;
-    if (!state) return;
+    const runId = currentRunRef.current;
+    if (!runId) return;
     try {
-      await chatApi.cancelRun(state.runId);
+      await chatApi.cancelRun(runId);
     } catch (e) {
       console.warn("cancel failed", e);
     }
@@ -359,12 +347,6 @@ export function useAgentChat(
     },
     [pendingQuestion],
   );
-
-  useEffect(() => {
-    return () => {
-      if (unlistenRef.current) unlistenRef.current();
-    };
-  }, []);
 
   return {
     messages,

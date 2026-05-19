@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
         http: reqwest::Client::new(),
         ws: processfox_web::ws::WsHub::new(),
         cancels: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = build_app(state);

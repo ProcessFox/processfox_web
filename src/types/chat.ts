@@ -110,6 +110,9 @@ export interface RunStarted {
 }
 
 export type RunEvent =
+  /** Run-Start: Clients sollen den Verlauf neu laden (zeigt den
+   *  User-Prompt sofort bei allen Mitgliedern). */
+  | { type: "userMessage" }
   | { type: "delta"; text: string }
   | { type: "reasoningDelta"; text: string }
   | {
