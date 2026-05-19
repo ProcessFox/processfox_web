@@ -170,14 +170,13 @@ gesetzt, kommt zusätzlich der Header `X-Webhook-Secret`. Dein n8n-Flow muss
 nur eine E-Mail mit `magicLink` als klickbarem Link an `email` versenden.
 Der Link ist 15 Minuten gültig und einmalig nutzbar.
 
-## 8. Bekannte Grenzen (Stand Phase 6b-2a)
+## 8. Bekannte Grenzen (Stand Phase 6b-2b)
 
 - Live: Auth, Workspaces/Mitglieder, Agenten, Org-Settings/API-Keys,
-  Datei-Upload/Vorschau, Streaming-Chat, Tools+HITL **und Rückfragen**.
-  Skill **„Dateien"**: Agent liest Workspace-Dateien, hängt (nach
-  Freigabe-Dialog) Text an und kann **Rückfragen** stellen (Run wartet
-  auf die Antwort). Tool-Lauf, Freigabe und Rückfrage sind für alle
-  Workspace-Mitglieder live sichtbar. „Schreiben ohne Rückfrage" am
-  Agenten überspringt nur den HITL-Schreib-Dialog (Rückfragen bleiben).
-- **Noch offen (Phase 6b-2b/c):** docx/xlsx/Template/`updateCells`-
-  Schreib-Tools, Delegation/Bulk-Worker.
+  Datei-Upload/Vorschau, Streaming-Chat, Tools+HITL, Rückfragen **und
+  Excel-Schreiben**. Skill **„Dateien"**: Agent liest Dateien, hängt Text
+  an, **schreibt `.xlsx`-Tabellen** (jeweils nach Freigabe-Dialog) und
+  kann Rückfragen stellen. Tool-Lauf, Freigabe und Rückfrage sind für
+  alle Workspace-Mitglieder live sichtbar.
+- **Noch offen (Phase 6b-2c):** docx/Template/`updateCells`-Schreib-
+  Tools, Delegation/Bulk-Worker.

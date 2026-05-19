@@ -17,6 +17,7 @@ pub struct ToolSpec {
 }
 
 pub const WRITE_TOOL: &str = "append_to_file";
+pub const WRITE_XLSX_TOOL: &str = "write_xlsx";
 pub const ASK_TOOL: &str = "ask_user";
 
 fn all_tools() -> Vec<ToolSpec> {
@@ -49,6 +50,27 @@ fn all_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: WRITE_XLSX_TOOL,
+            description: "Schreibt eine Excel-Datei (.xlsx) mit den \
+                angegebenen Zeilen (überschreibt eine bestehende). \
+                Erfordert Nutzer-Freigabe.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string" },
+                    "sheet": { "type": "string" },
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["filename", "rows"]
+            }),
+        },
+        ToolSpec {
             name: ASK_TOOL,
             description: "Stellt dem Nutzer eine Rückfrage und wartet auf \
                 dessen Freitext-Antwort, bevor weitergearbeitet wird.",
@@ -71,7 +93,7 @@ pub fn available_tools(skills: &[String]) -> Vec<ToolSpec> {
 }
 
 pub fn is_write_tool(name: &str) -> bool {
-    name == WRITE_TOOL
+    name == WRITE_TOOL || name == WRITE_XLSX_TOOL
 }
 
 pub fn is_ask_tool(name: &str) -> bool {
@@ -85,7 +107,7 @@ pub fn skills_json() -> Value {
         "title": "Dateien",
         "description": "Workspace-Dateien lesen und (mit Freigabe) ergänzen.",
         "icon": "Folder",
-        "tools": ["list_files", "read_file", WRITE_TOOL, ASK_TOOL],
+        "tools": ["list_files", "read_file", WRITE_TOOL, WRITE_XLSX_TOOL, ASK_TOOL],
         "hitl": { "default": true },
         "language": "de",
         "body": "",
@@ -211,4 +233,191 @@ pub async fn do_append(
         .ws
         .publish(Some(wid), "fs-changed", serde_json::Value::Null);
     Ok(format!("An '{fname}' angehängt ({} Bytes gesamt).", size))
+}
+
+// --- xlsx schreiben (Phase 6b-2b) -----------------------------------------
+
+fn cells_from_input(input: &Value) -> Vec<Vec<String>> {
+    input
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|cells| {
+                            cells
+                                .iter()
+                                .map(|c| match c {
+                                    Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn xlsx_preview(
+    state: &AppState,
+    wid: Uuid,
+    filename: &str,
+    sheet: &str,
+    rows: &[Vec<String>],
+) -> ApiResult<Value> {
+    let fname = sanitize_filename(filename)?;
+    let key = workspace_key(wid, &fname);
+    ensure_in_workspace(wid, &key)?;
+    let creates = !state.storage.path(&key).exists();
+    Ok(json!({
+        "kind": "writeXlsx",
+        "path": fname,
+        "sheet": sheet,
+        "rows": rows,
+        "createsFile": creates,
+    }))
+}
+
+async fn do_write_xlsx(
+    state: &AppState,
+    wid: Uuid,
+    uploaded_by: Uuid,
+    filename: &str,
+    sheet: &str,
+    rows: &[Vec<String>],
+) -> ApiResult<String> {
+    let fname = sanitize_filename(filename)?;
+    if !fname.to_lowercase().ends_with(".xlsx") {
+        return Err(ApiError::BadRequest(
+            "Dateiname muss auf .xlsx enden.".into(),
+        ));
+    }
+    let key = workspace_key(wid, &fname);
+    ensure_in_workspace(wid, &key)?;
+
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.set_name(sheet)
+        .map_err(|e| ApiError::BadRequest(format!("Sheet-Name: {e}")))?;
+    for (r, row) in rows.iter().enumerate() {
+        for (c, val) in row.iter().enumerate() {
+            ws.write_string(r as u32, c as u16, val)
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+        }
+    }
+    let bytes = wb
+        .save_to_buffer()
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+
+    let path = state.storage.path(&key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+    }
+    let size = bytes.len() as i64;
+    std::fs::write(&path, &bytes).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+
+    sqlx::query(
+        "INSERT INTO workspace_files \
+         (workspace_id, filename, s3_key, size_bytes, content_type, uploaded_by) \
+         VALUES ($1,$2,$3,$4,\
+           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',\
+           $5) \
+         ON CONFLICT (workspace_id, filename) DO UPDATE SET \
+           size_bytes = EXCLUDED.size_bytes, uploaded_by = EXCLUDED.uploaded_by, \
+           uploaded_at = now()",
+    )
+    .bind(wid)
+    .bind(&fname)
+    .bind(&key)
+    .bind(size)
+    .bind(uploaded_by)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+
+    state
+        .ws
+        .publish(Some(wid), "fs-changed", serde_json::Value::Null);
+    Ok(format!(
+        "'{fname}' geschrieben ({} Zeilen, Sheet '{sheet}').",
+        rows.len()
+    ))
+}
+
+// --- Write-Tool-Dispatcher ------------------------------------------------
+
+fn str_in(input: &Value, key: &str) -> String {
+    input
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// HITL-Vorschau für ein Write-Tool (vor der Freigabe).
+pub fn write_preview(state: &AppState, wid: Uuid, name: &str, input: &Value) -> ApiResult<Value> {
+    match name {
+        WRITE_TOOL => append_preview(
+            state,
+            wid,
+            &str_in(input, "filename"),
+            &str_in(input, "content"),
+        ),
+        WRITE_XLSX_TOOL => {
+            let sheet = input
+                .get("sheet")
+                .and_then(|s| s.as_str())
+                .unwrap_or("Tabelle1");
+            xlsx_preview(
+                state,
+                wid,
+                &str_in(input, "filename"),
+                sheet,
+                &cells_from_input(input),
+            )
+        }
+        other => Err(ApiError::BadRequest(format!("Kein Write-Tool: {other}"))),
+    }
+}
+
+/// Führt das Write-Tool **nach** HITL-Freigabe aus.
+pub async fn execute_write(
+    state: &AppState,
+    wid: Uuid,
+    uploaded_by: Uuid,
+    name: &str,
+    input: &Value,
+) -> ApiResult<String> {
+    match name {
+        WRITE_TOOL => {
+            do_append(
+                state,
+                wid,
+                uploaded_by,
+                &str_in(input, "filename"),
+                &str_in(input, "content"),
+            )
+            .await
+        }
+        WRITE_XLSX_TOOL => {
+            let sheet = input
+                .get("sheet")
+                .and_then(|s| s.as_str())
+                .unwrap_or("Tabelle1")
+                .to_string();
+            do_write_xlsx(
+                state,
+                wid,
+                uploaded_by,
+                &str_in(input, "filename"),
+                &sheet,
+                &cells_from_input(input),
+            )
+            .await
+        }
+        other => Err(ApiError::BadRequest(format!("Kein Write-Tool: {other}"))),
+    }
 }

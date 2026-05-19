@@ -493,22 +493,11 @@ async fn send_message(
                     );
                     Ok(answer)
                 } else if crate::tools::is_write_tool(&call.name) {
-                    let filename = call
-                        .input
-                        .get("filename")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let content = call
-                        .input
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
                     if hitl_disabled {
-                        crate::tools::do_append(&st, wid, user_id, &filename, &content).await
+                        crate::tools::execute_write(&st, wid, user_id, &call.name, &call.input)
+                            .await
                     } else {
-                        match crate::tools::append_preview(&st, wid, &filename, &content) {
+                        match crate::tools::write_preview(&st, wid, &call.name, &call.input) {
                             Ok(preview) => {
                                 let hitl_id = Uuid::new_v4();
                                 let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
@@ -546,8 +535,14 @@ async fn send_message(
                                     }),
                                 );
                                 if approved {
-                                    crate::tools::do_append(&st, wid, user_id, &filename, &content)
-                                        .await
+                                    crate::tools::execute_write(
+                                        &st,
+                                        wid,
+                                        user_id,
+                                        &call.name,
+                                        &call.input,
+                                    )
+                                    .await
                                 } else {
                                     Ok("Vom Nutzer abgelehnt.".to_string())
                                 }

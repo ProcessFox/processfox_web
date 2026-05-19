@@ -253,14 +253,24 @@ laufenden Run live (echte Shared Session, CLAUDE.md §4).
   `{answer}`). Frontend unverändert (`AskUserCard`/`pendingQuestion`).
 - Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
 
-## Phase 6b-2b/c — Rest (offen, bewusst verschoben)
+## Phase 6b-2b — write_xlsx ✅ ABGESCHLOSSEN (2026-05-19)
 
-- docx/xlsx/Template/`updateCells`-Schreib-Tools mit den jeweiligen
+- `write_xlsx`-Tool (Skill `files`): erzeugt/überschreibt eine `.xlsx`
+  (via `rust_xlsxwriter`), HITL-Vorschau `writeXlsx` (Frontend-`HitlCard`
+  rendert das bereits). `is_write_tool` deckt jetzt beide Write-Tools ab.
+- Write-Pfad in `chat.rs` aufgeräumt: Dispatch nach Tool-Name in
+  `tools::write_preview` / `tools::execute_write` (append + xlsx); kein
+  per-Tool-Code mehr im Run-Loop.
+- Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
+
+## Phase 6b-2c — Rest (offen, bewusst verschoben)
+
+- docx/Template/`updateCells`-Schreib-Tools mit den jeweiligen
   HitlPreview-Typen; Delegation/Bulk-Worker (`delegateIntoXlsxColumn`).
 
 **Abnahme 6a:** Streaming-Chat live, alle Mitglieder live. **6b-1:**
-Datei-Tools + HITL-Schreiben live für alle. **6b-2a:** Agent kann
-Rückfragen stellen, Run wartet auf die Antwort.
+Datei-Tools + HITL-Schreiben live. **6b-2a:** Rückfragen. **6b-2b:**
+Agent kann Excel-Dateien schreiben (HITL-Vorschau, live für alle).
 
 ---
 
