@@ -29,7 +29,6 @@ import type {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-const BASE = "/api";
 const V1 = "/api/v1";
 
 // In-Memory-Access-Token (kein localStorage — XSS-Härtung). Wird von
@@ -80,21 +79,6 @@ async function parseError(res: Response): Promise<never> {
   throw new Error((err as { message?: string }).message ?? res.statusText);
 }
 
-async function post<T>(command: string, body?: unknown): Promise<T> {
-  const doFetch = () =>
-    fetch(`${BASE}/${command}`, {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-  let res = await doFetch();
-  if (res.status === 401 && (await tryRefresh())) {
-    res = await doFetch();
-  }
-  if (res.status === 401) onSessionLost?.();
-  if (!res.ok) return parseError(res);
-  return res.json() as Promise<T>;
-}
 
 
 // --- Auth (REST, /api/v1/auth/*) ------------------------------------------
@@ -178,14 +162,74 @@ async function v1Upload<T>(path: string, file: File): Promise<T> {
 
 export type UnlistenFn = () => void;
 
+// Eine einzige multiplexte WS-Verbindung zu /api/v1/ws?token=… (PLAN.md
+// Lücke #2). Server sendet { channel, payload }; hier nach Kanal verteilt.
+// Reconnect mit dann aktuellem Access-Token (nach Refresh aktualisiert).
+const wsHandlers = new Map<string, Set<(p: unknown) => void>>();
+let wsConn: WebSocket | null = null;
+let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+function wsConnect(): void {
+  if (
+    wsConn &&
+    (wsConn.readyState === WebSocket.OPEN ||
+      wsConn.readyState === WebSocket.CONNECTING)
+  ) {
+    return;
+  }
+  if (!accessToken || wsHandlers.size === 0) return;
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${proto}//${location.host}/api/v1/ws?token=${encodeURIComponent(
+    accessToken,
+  )}`;
+  const ws = new WebSocket(url);
+  wsConn = ws;
+  ws.onmessage = (evt) => {
+    try {
+      const { channel, payload } = JSON.parse(evt.data) as {
+        channel: string;
+        payload: unknown;
+      };
+      wsHandlers.get(channel)?.forEach((h) => h(payload));
+    } catch {
+      /* ignore malformed frame */
+    }
+  };
+  ws.onclose = () => {
+    if (wsConn === ws) wsConn = null;
+    // Reconnect, solange es Abonnenten gibt (Token ggf. erneuern).
+    if (wsHandlers.size > 0 && !wsReconnectTimer) {
+      wsReconnectTimer = setTimeout(() => {
+        wsReconnectTimer = null;
+        void tryRefresh().finally(wsConnect);
+      }, 2000);
+    }
+  };
+  ws.onerror = () => ws.close();
+}
+
 function subscribeWs<T>(
   channel: string,
   handler: (payload: T) => void,
 ): Promise<UnlistenFn> {
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${protocol}//${location.host}/ws/${channel}`);
-  ws.onmessage = (evt) => handler(JSON.parse(evt.data) as T);
-  return Promise.resolve(() => ws.close());
+  const h = handler as (p: unknown) => void;
+  let set = wsHandlers.get(channel);
+  if (!set) {
+    set = new Set();
+    wsHandlers.set(channel, set);
+  }
+  set.add(h);
+  wsConnect();
+  return Promise.resolve(() => {
+    const s = wsHandlers.get(channel);
+    if (!s) return;
+    s.delete(h);
+    if (s.size === 0) wsHandlers.delete(channel);
+    if (wsHandlers.size === 0) {
+      wsConn?.close();
+      wsConn = null;
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -362,23 +406,30 @@ export const skillsApi = {
 
 export const chatApi = {
   listMessages: (agentId: string) =>
-    post<ChatMessage[]>("list_messages", { agentId }),
+    v1<ChatMessage[]>("GET", `agents/${agentId}/messages`),
 
   sendMessage: (params: {
     agentId: string;
     provider: string;
     modelId: string;
     text: string;
-  }) => post<RunStarted>("send_message", params),
+  }) =>
+    v1<RunStarted>("POST", `agents/${params.agentId}/messages`, {
+      provider: params.provider,
+      modelId: params.modelId,
+      text: params.text,
+    }),
 
-  cancelRun: (runId: string) => post<void>("cancel_run", { runId }),
+  cancelRun: (runId: string) =>
+    v1<void>("POST", `runs/${runId}/cancel`),
 
+  // HITL/Tools folgen in Phase 6b — Endpunkte sind serverseitig No-op-Stubs.
   approveHitl: (hitlId: string) =>
-    post<void>("approve_hitl", { hitlId }),
+    v1<void>("POST", `hitl/${hitlId}/approve`),
   rejectHitl: (hitlId: string, reason?: string) =>
-    post<void>("reject_hitl", { hitlId, reason }),
+    v1<void>("POST", `hitl/${hitlId}/reject`, { reason }),
   respondToQuestion: (questionId: string, answer: string) =>
-    post<void>("respond_to_question", { questionId, answer }),
+    v1<void>("POST", `questions/${questionId}/respond`, { answer }),
 
   subscribeRun: (
     runId: string,

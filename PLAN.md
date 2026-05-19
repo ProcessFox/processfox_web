@@ -197,16 +197,35 @@ HTTP/DB-Integrationstests (Upload→Preview→Download e2e) → CI mit
 
 ---
 
-## Phase 6 — Chat & Realtime
+## Phase 6a — Chat-Kern & Realtime ✅ ABGESCHLOSSEN (2026-05-19)
 
-- ReAct-Loop + ChatRepo aus `processfox_local/core` portiert (Postgres statt JSON).
-- LLM-Provider Anthropic/OpenAI/OpenRouter (§10), Key-Injection serverseitig.
-- WS-Hub: `GET /ws?token=<access>`; Channels `chat:run:<runId>`,
-  `fs-changed`, `agent-attachments-changed`; Broadcast nur an Workspace-Mitglieder.
-- HITL-Endpunkte (approve/reject/respond) + WS-Events.
+- LLM-Provider Anthropic (Messages-API + Prompt-Caching) / OpenAI /
+  OpenRouter, **Streaming** via SSE; Key serverseitig aus `api_keys`
+  entschlüsselt injiziert (`llm.rs`).
+- **Multiplexer WS-Hub** `GET /api/v1/ws?token=<access>` (`ws.rs`): eine
+  Verbindung, Frames `{channel,payload}`, workspace-gescopeter Broadcast
+  (Mitgliedschaft einmalig beim Connect ermittelt). Channels
+  `chat:run:<runId>`, `fs-changed`, `agent-attachments-changed` verdrahtet.
+- `routes/chat.rs`: `GET/POST /agents/{id}/messages` (Run starten →
+  `delta`/`finish`/`error` über WS, Verlauf in `chat_messages`),
+  `POST /runs/{id}/cancel` (kooperativer Abbruch). HITL-Endpunkte als
+  204-Stubs (Tools erst 6b).
+- Frontend-Bridge: `subscribeWs` auf **eine** multiplexte Verbindung
+  (Reconnect mit frischem Token), `chatApi` auf REST. Letzte RPC-Reste
+  (`post`/`/api/<command>`) entfernt — Bridge jetzt vollständig REST + 1×WS.
 
-**Abnahme:** Chat mit Streaming + HITL über WS; mehrere Mitglieder sehen
-denselben Verlauf live.
+**Ergebnis:** `cargo build/fmt/clippy -D warnings` + 8 Tests grün,
+`tsc`/`vite build` grün.
+
+## Phase 6b — Tools / Skills / HITL / Delegation (offen, bewusst verschoben)
+
+- Skill-/Tool-System (gebündelte SKILL.md, `GET /skills` derzeit `[]`),
+  Tool-Calling im LLM-Loop, HITL-Freigaben vor Schreibaktionen mit den
+  `HitlPreview`-Strukturen, Delegation/Bulk-Worker.
+- Setzt das eigenständige Skill-/Tool-System voraus → eigener Block.
+
+**Abnahme 6a:** Streaming-Chat live; mehrere Workspace-Mitglieder sehen
+denselben Verlauf in Echtzeit. **6b:** Tools + HITL über WS.
 
 ---
 

@@ -257,5 +257,11 @@ async fn set_attachment(
     .fetch_one(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.into()))?;
+    // Live an Workspace-Mitglieder (Frontend erwartet die Agent-ID als Payload).
+    state.ws.publish(
+        Some(wid),
+        "agent-attachments-changed",
+        json!(id.to_string()),
+    );
     Ok(Json(row.to_api()))
 }

@@ -9,15 +9,18 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod llm;
 pub mod perm;
 pub mod preview;
 pub mod ratelimit;
 pub mod routes;
 pub mod sandbox;
 pub mod storage;
+pub mod ws;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
 use axum::Router;
@@ -28,6 +31,8 @@ use tower_http::trace::TraceLayer;
 use crate::config::Config;
 use crate::ratelimit::RateLimiter;
 use crate::storage::Storage;
+use crate::ws::WsHub;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -36,8 +41,12 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Brute-Force-Schutz für die Auth-Endpunkte.
     pub ratelimit: Arc<RateLimiter>,
-    /// HTTP-Client für den Magic-Link-Webhook (n8n).
+    /// HTTP-Client (Magic-Link-Webhook + LLM-Provider).
     pub http: reqwest::Client,
+    /// Multiplexer WebSocket-Hub (Chat-Streaming, fs-changed …).
+    pub ws: WsHub,
+    /// Run-IDs, deren Stream abgebrochen werden soll (Cancel).
+    pub cancels: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 /// Baut die komplette App: API-Router + statisches Frontend mit

@@ -255,11 +255,10 @@ processfox_web/
 
 ## 7. API-Konventionen
 
-> **⚠ Offene Diskrepanz (siehe §1a):** Die aktuell im Repo liegende Bridge
-> (`src/lib/tauri.ts`) nutzt RPC-Stil (`POST /api/<command>`, ohne Versionierung,
-> ohne Auth-Header). Das folgende RESTful-Schema ist der **Soll-Zustand**, aber
-> noch nicht implementiert. Bevor das Backend gebaut wird, muss entschieden
-> werden, welche Konvention gilt — und die jeweils andere Seite angepasst werden.
+> **✅ Stand 2026-05-19 (Phase 6a):** Die ehemalige RPC-Diskrepanz ist
+> aufgelöst — die Bridge spricht durchgängig **REST `/api/v1/...`** plus
+> **eine** multiplexte WebSocket-Verbindung. Kein `POST /api/<command>`
+> mehr.
 
 ### HTTP-Endpunkte
 
@@ -271,10 +270,11 @@ processfox_web/
 
 ### WebSocket-Protokoll
 
-- Verbindung: `GET /ws?token=<access_token>` (Token im Query-String, weil WS-Browser-API keinen Auth-Header unterstützt).
-- Nachrichten: JSON-Objekte mit `{ "type": "string", "payload": any }`.
-- Event-Typen spiegeln die Tauri-Events aus Local: `chat:run:<runId>`, `fs-changed`, `agent-attachments-changed`, `model:download:<downloadId>`.
-- Der Backend-WS-Hub sendet Events nur an User, die Mitglied des betreffenden Workspaces sind.
+- Verbindung: **eine** multiplexte WS pro Client — `GET /api/v1/ws?token=<access_token>` (Token im Query-String, weil die WS-Browser-API keinen Auth-Header unterstützt).
+- Server→Client-Frames: `{ "channel": "string", "payload": any }`. Der Client (Bridge `subscribeWs`) verteilt nach `channel`.
+- Channels: `chat:run:<runId>` (Payload = `RunEvent`), `fs-changed`, `agent-attachments-changed` (Payload = Agent-ID).
+- Workspace-Scoping: Broadcasts mit `workspace_id` erreichen nur Mitglieder dieses Workspaces; die Mitgliedschaft wird beim WS-Connect einmalig ermittelt (kein DB-Hit pro Event).
+- Reconnect: der Client verbindet bei Close mit dem dann aktuellen Access-Token neu (Token-Refresh).
 
 ### Frontend-Bridge (`src/lib/tauri.ts`)
 

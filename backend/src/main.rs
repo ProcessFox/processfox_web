@@ -39,6 +39,8 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(config),
         ratelimit,
         http: reqwest::Client::new(),
+        ws: processfox_web::ws::WsHub::new(),
+        cancels: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
 
     let app = build_app(state);

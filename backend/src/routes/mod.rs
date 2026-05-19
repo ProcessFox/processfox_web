@@ -1,9 +1,10 @@
-//! HTTP-Router unter `/api/v1`. Phase 2: Auth. Phase 3: Workspaces &
-//! Mitglieder. Phase 4: Agenten, Org-Settings, API-Keys. Dateien/Chat
-//! folgen in Phase 5–6.
+//! HTTP-Router unter `/api/v1`. Phase 2: Auth. Phase 3: Workspaces.
+//! Phase 4: Agenten/Settings/Keys. Phase 5: Dateien. Phase 6a: Chat
+//! (Streaming) + WebSocket-Hub.
 
 pub mod agents;
 pub mod auth;
+pub mod chat;
 pub mod files;
 pub mod secrets;
 pub mod settings;
@@ -19,6 +20,7 @@ pub fn api_router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/skills", get(skills))
+        .route("/ws", get(crate::ws::ws_handler))
         .route(
             "/orgs/{id}/rotate-invite-code",
             post(auth::rotate_invite_code),
@@ -29,6 +31,7 @@ pub fn api_router() -> Router<AppState> {
         .merge(settings::router())
         .merge(secrets::router())
         .merge(files::router())
+        .merge(chat::router())
 }
 
 async fn health() -> Json<serde_json::Value> {

@@ -356,8 +356,9 @@ struct PreviewQuery {
     sheet: Option<String>,
 }
 
-/// Best-effort `fs-changed`-Broadcast (WS-Hub kommt in Phase 6 — bis dahin
-/// No-op-Platzhalter, damit Aufrufstellen stabil bleiben).
-fn broadcast_fs_changed(_state: &AppState, _workspace_id: Uuid) {
-    // TODO Phase 6: an Workspace-Mitglieder über den WS-Hub broadcasten.
+/// `fs-changed` an alle Mitglieder des Workspaces (Phase 6a, WS-Hub).
+fn broadcast_fs_changed(state: &AppState, workspace_id: Uuid) {
+    state
+        .ws
+        .publish(Some(workspace_id), "fs-changed", serde_json::Value::Null);
 }
