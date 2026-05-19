@@ -27,12 +27,34 @@ pub fn router() -> Router<AppState> {
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/hitl/{id}/approve", post(hitl_approve))
         .route("/hitl/{id}/reject", post(hitl_reject))
-        // askUser kommt in 6b-2 — vorerst No-op.
-        .route("/questions/{id}/respond", post(hitl_noop))
+        .route("/questions/{id}/respond", post(question_respond))
 }
 
-async fn hitl_noop() -> StatusCode {
-    StatusCode::NO_CONTENT
+#[derive(Deserialize)]
+struct RespondBody {
+    answer: String,
+}
+
+/// Beantwortet eine parkende `ask_user`-Rückfrage; den
+/// `askUserResolved`-Broadcast macht der Run-Task.
+async fn question_respond(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(question_id): Path<Uuid>,
+    Json(body): Json<RespondBody>,
+) -> StatusCode {
+    let tx = state
+        .pending_questions
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(&question_id));
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(body.answer);
+            StatusCode::NO_CONTENT
+        }
+        None => StatusCode::NOT_FOUND,
+    }
 }
 
 /// Löst die parkende HITL-Anfrage auf (true = freigegeben). Den
@@ -430,7 +452,47 @@ async fn send_message(
                         "arguments": call.input
                     }),
                 );
-                let outcome: ApiResult<String> = if crate::tools::is_write_tool(&call.name) {
+                let outcome: ApiResult<String> = if crate::tools::is_ask_tool(&call.name) {
+                    let question = call
+                        .input
+                        .get("question")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let qid = Uuid::new_v4();
+                    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+                    if let Ok(mut m) = st.pending_questions.lock() {
+                        m.insert(qid, tx);
+                    }
+                    st.ws.publish(
+                        Some(wid),
+                        channel.clone(),
+                        json!({
+                            "type": "askUserRequest",
+                            "questionId": qid.to_string(),
+                            "toolCallId": call.id,
+                            "question": question
+                        }),
+                    );
+                    let answer =
+                        match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
+                            Ok(Ok(a)) => a,
+                            _ => "(keine Antwort)".to_string(),
+                        };
+                    if let Ok(mut m) = st.pending_questions.lock() {
+                        m.remove(&qid);
+                    }
+                    st.ws.publish(
+                        Some(wid),
+                        channel.clone(),
+                        json!({
+                            "type": "askUserResolved",
+                            "questionId": qid.to_string(),
+                            "answer": answer
+                        }),
+                    );
+                    Ok(answer)
+                } else if crate::tools::is_write_tool(&call.name) {
                     let filename = call
                         .input
                         .get("filename")

@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         cancels: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         pending_hitl: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        pending_questions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = build_app(state);

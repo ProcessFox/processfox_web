@@ -244,14 +244,23 @@ laufenden Run live (echte Shared Session, CLAUDE.md §4).
 **Ergebnis:** `cargo build/fmt/clippy -D warnings` + 8 Tests grün,
 `tsc`/`vite build` grün.
 
-## Phase 6b-2 — Rest (offen, bewusst verschoben)
+## Phase 6b-2a — ask_user ✅ ABGESCHLOSSEN (2026-05-19)
 
-- Weitere HitlPreview-Typen (docx/xlsx/`updateCells`/Template …) + zuge-
-  hörige Schreib-Tools, `askUser` (`/questions/{id}/respond` noch No-op),
-  Delegation/Bulk-Worker (`delegateIntoXlsxColumn`).
+- `ask_user`-Tool (Teil des `files`-Skills): Agent stellt eine Rückfrage,
+  der Run **parkt** (`AppState.pending_questions`, oneshot<String>,
+  Timeout 10 min). `askUserRequest`/`askUserResolved` über den Agenten-
+  Channel (live für alle). `/questions/{id}/respond` real (Body
+  `{answer}`). Frontend unverändert (`AskUserCard`/`pendingQuestion`).
+- Gates: `cargo build/fmt/clippy -D warnings` + 8 Tests, `tsc`/`vite` grün.
+
+## Phase 6b-2b/c — Rest (offen, bewusst verschoben)
+
+- docx/xlsx/Template/`updateCells`-Schreib-Tools mit den jeweiligen
+  HitlPreview-Typen; Delegation/Bulk-Worker (`delegateIntoXlsxColumn`).
 
 **Abnahme 6a:** Streaming-Chat live, alle Mitglieder live. **6b-1:**
-Agent ruft Datei-Tools, Schreiben erst nach HITL-Freigabe, live für alle.
+Datei-Tools + HITL-Schreiben live für alle. **6b-2a:** Agent kann
+Rückfragen stellen, Run wartet auf die Antwort.
 
 ---
 

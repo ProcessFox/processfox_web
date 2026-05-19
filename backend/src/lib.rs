@@ -55,6 +55,9 @@ pub struct AppState {
     /// reject). Der Run-Task wartet auf die Entscheidung.
     pub pending_hitl:
         Arc<Mutex<std::collections::HashMap<Uuid, tokio::sync::oneshot::Sender<bool>>>>,
+    /// Offene `ask_user`-Rückfragen: question_id → Sender (Antworttext).
+    pub pending_questions:
+        Arc<Mutex<std::collections::HashMap<Uuid, tokio::sync::oneshot::Sender<String>>>>,
 }
 
 /// Baut die komplette App: API-Router + statisches Frontend mit

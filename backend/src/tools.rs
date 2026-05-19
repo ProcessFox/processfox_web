@@ -17,6 +17,7 @@ pub struct ToolSpec {
 }
 
 pub const WRITE_TOOL: &str = "append_to_file";
+pub const ASK_TOOL: &str = "ask_user";
 
 fn all_tools() -> Vec<ToolSpec> {
     vec![
@@ -47,6 +48,16 @@ fn all_tools() -> Vec<ToolSpec> {
                 "required": ["filename", "content"]
             }),
         },
+        ToolSpec {
+            name: ASK_TOOL,
+            description: "Stellt dem Nutzer eine Rückfrage und wartet auf \
+                dessen Freitext-Antwort, bevor weitergearbeitet wird.",
+            schema: json!({
+                "type": "object",
+                "properties": { "question": { "type": "string" } },
+                "required": ["question"]
+            }),
+        },
     ]
 }
 
@@ -63,6 +74,10 @@ pub fn is_write_tool(name: &str) -> bool {
     name == WRITE_TOOL
 }
 
+pub fn is_ask_tool(name: &str) -> bool {
+    name == ASK_TOOL
+}
+
 /// `GET /skills`-Payload (Frontend-`Skill`-Vertrag).
 pub fn skills_json() -> Value {
     json!([{
@@ -70,7 +85,7 @@ pub fn skills_json() -> Value {
         "title": "Dateien",
         "description": "Workspace-Dateien lesen und (mit Freigabe) ergänzen.",
         "icon": "Folder",
-        "tools": ["list_files", "read_file", WRITE_TOOL],
+        "tools": ["list_files", "read_file", WRITE_TOOL, ASK_TOOL],
         "hitl": { "default": true },
         "language": "de",
         "body": "",
