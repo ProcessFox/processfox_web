@@ -63,6 +63,15 @@ quick-xml = "0.37"
 # Office-Schreiben (Phase 6b-2b)
 rust_xlsxwriter = "0.79"
 
+[dev-dependencies]
+# HTTP/DB-Integrationstests (Härtung): Axum-Handler via `tower::oneshot`
+# gegen eine pro Test frische Postgres-DB (`#[sqlx::test]`).
+tower = { version = "0.5", features = ["util"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+] }
+
 [profile.release]
 # Auf Build-Geschwindigkeit + niedrigen Peak-RAM optimiert (2-vCPU-VPS).
 # Kein LTO (spart den teuren Whole-Program-Link), opt-level 1 (für einen

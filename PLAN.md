@@ -332,10 +332,25 @@ als Komfort-Vorlagenquelle.
 6b-2e Word-Anhängen · 6b-2f Zell-Edits · 6b-2g Bulk-Delegation
 (jeweils HITL, live für alle).
 
-## Querschnitt — offen: Härtung
+## Querschnitt — Härtung ✅ ABGESCHLOSSEN (2026-05-19)
 
-- HTTP/DB-Integrationstests (Auth/Workspaces/Agents/Files/Chat) mit
-  Postgres-Testcontainer / `#[sqlx::test]` (über alle Phasen vorgemerkt).
+- HTTP/DB-Integrationstests `backend/tests/integration.rs`: echte Axum-
+  Handler via `tower::ServiceExt::oneshot`, pro Test frische Postgres-DB
+  über `#[sqlx::test(migrations = "./src/db/migrations")]`. Abgedeckt:
+  Health/Auth-Guard, Magic-Link-`verify` (Happy-Path, unbekannt, abge-
+  laufen, single-use), Refresh-Token-Rotation + Revoke des alten Cookies,
+  Workspace-Berechtigungen (Owner legt an, Member/Viewer → 403, Viewer
+  liest aber keine Owner-Aktion, Cross-Org → 404 ohne Leak),
+  Account-Enumeration-Schutz bei `request-login`.
+- CI: neuer Workflow `.github/workflows/ci.yml` (push/PR) — fmt + clippy
+  + `cargo test --all-targets` gegen einen Postgres-16-Service-Container.
+- Gates: `cargo fmt/clippy -D warnings` grün, `cargo test --no-run`
+  kompiliert die Integrationstests, Unit-Tests (8) grün. Die DB-Tests
+  laufen in CI (lokal kein Postgres/Docker verfügbar).
+
+**Damit ist auch die letzte über alle Phasen vorgemerkte Härtung
+geschlossen.** Optional offen bleibt nur noch (klein):
+`delegationProfile`-Override, Agent-Attachment-`templateFileId`.
 
 ---
 

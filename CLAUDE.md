@@ -27,52 +27,46 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 ---
 
-## 1a. Ist-Stand (Stand: 2026-05-16)
+## 1a. Ist-Stand (Stand: 2026-05-19 — Phase 6 vollständig)
 
-> **Wichtig:** Der Rest dieses Dokuments (§2–§16) beschreibt den **Soll-Zustand** /
-> die Ziel-Architektur. Der folgende Abschnitt beschreibt, was **tatsächlich im
-> Repo liegt**. Bei jedem Task zuerst hier prüfen, was schon existiert.
+> **Wichtig:** Der Rest dieses Dokuments (§2–§16) beschreibt Architektur &
+> Konventionen. Dieser Abschnitt beschreibt den **realen Umsetzungsstand**.
+> Bei jedem Task zuerst `PLAN.md` (phasenweises Logbuch) konsultieren.
 
-**Was realisiert ist:**
+**Realisiert (live deployt auf `chat.processfox.ai` via GHCR/Coolify):**
 
-- **Nur das Frontend.** Das Repo enthält ausschließlich die React/Vite/TS-App —
-  ein nahezu 1:1-Port des Frontends aus `processfox_local` (ein einziger Commit
-  „Initial commit", 70 Dateien).
-- **API-Bridge umgeschrieben:** `src/lib/tauri.ts` ersetzt die Tauri-`invoke`/`listen`-
-  Bridge durch `fetch` (HTTP POST) + `WebSocket`. Die Funktions-Signaturen sind
-  unverändert, damit die UI-Komponenten ungeändert bleiben.
-- UI-Komponenten vollständig vorhanden: Agent-Editor/-Switcher, Chat-Pane
-  (inkl. HITL-Karten, AskUser, Tool-/Reasoning-Chips), FileTree, Preview-Viewer
-  (docx/xlsx/pptx/pdf/image/markdown/text), Settings (Models + Cloud-APIs),
-  Welcome-Dialog, Theme-Provider, shadcn-UI-Bausteine.
+- **Frontend** (React/Vite/TS) — vom Local- aufs Web-Paradigma umgebaut:
+  Local-Modell-/Hardware-/OS-Ordner-Code entfernt, Auth-Schicht
+  (`useAuth`, `Login.tsx`, `auth.ts`, Magic-Link-Callback), Workspace-/
+  Org-/Rollen-Konzept, `tauri.ts` durchgängig REST `/api/v1` + **eine**
+  multiplexte WS. Portierte UI (HITL, AskUser, Tool-/Reasoning-Chips,
+  Preview-Viewer, Delegation-Fortschritt) unverändert wiederverwendet.
+- **Backend** (Rust/Axum, `backend/`) — vollständig: Auth (Magic-Link,
+  JWT, rotierende Refresh-Tokens), Org/Workspace/Member, Agenten,
+  Org-Settings + AES-256-GCM-verschlüsselte API-Keys, Datei-Upload/
+  Vorschau (lokales Volume), Streaming-Chat (shared session), Tool-
+  Loop + HITL, Rückfragen (`ask_user`), alle Datei-Schreiboperationen
+  (Excel/Word/aus Vorlage/Anhängen/Zell-Edits) und Bulk-Delegation —
+  jeweils live für alle Workspace-Mitglieder über die WS.
+- **CI/Deploy:** GitHub Actions baut das Multi-Stage-Image → GHCR;
+  Coolify zieht das Image (Docker-Image-Resource, kein VPS-Build),
+  Postgres + lokales Persistent Volume `/data`, Domain in Coolify.
 
-**Was NICHT existiert (entgegen §6 ff.):**
+**Bewusst offen (klein/optional):** `delegationProfile`-Override (eigenes
+Worker-Modell je Agent), Vorlage via Agent-Attachment-`templateFileId`.
 
-- **Kein Backend.** Es gibt kein `backend/`-Verzeichnis, keinen Axum-Server,
-  keine DB-Migrations, keine Rust-Crate. Die Bridge zeigt ins Leere
-  (`vite.config.ts` proxyt `/api`+`/ws` → `localhost:3000`, dort läuft nichts).
-- **Kein Auth / Mehrbenutzer.** `src/types/auth.ts`, `src/hooks/useAuth.ts`,
-  `src/views/Login.tsx` und `src/components/workspace/` existieren **nicht**.
-  Es gibt keinerlei Org-/Workspace-/Rollen-Konzept im Frontend.
-- **Local-Paradigma noch durchgängig vorhanden** — d. h. das Frontend ist noch
-  *nicht* an das Web-Konzept angepasst:
-  - Lokale GGUF-Modelle, Hardware-Info, Modell-Katalog & -Download
-    (`modelsApi`, `HardwareInfo`, `provider === "local"`-Pfade in `App.tsx`).
-  - OS-Ordner-Zugriff statt Upload (`list_agent_folder`, `watch_agent_folder`,
-    `import_files_to_agent`, `files-dropped`-Event, `agent.folder`).
-  - `Agent` hat ein `folder`-Feld, kein `workspace_id`.
-- **API-Bridge weicht von §7 ab:** Die Bridge nutzt **RPC-Stil**
-  (`POST /api/<command>`, z. B. `/api/list_agents`), **nicht** das in §7
-  beschriebene RESTful-Schema `/api/v1/...`. Auch ohne `Authorization`-Header.
-  Diese Diskrepanz ist offen und muss bewusst entschieden werden (siehe §7-Notiz).
+**Härtung umgesetzt:** HTTP/DB-Integrationstests (`backend/tests/
+integration.rs`) — echte Axum-Handler via `tower::oneshot` gegen eine pro
+Test frische Postgres-DB (`#[sqlx::test]`). Deckt Magic-Link-`verify`
+(inkl. single-use/expired), Refresh-Token-Rotation und die Workspace-
+Berechtigungen (Owner/Member/Viewer, Cross-Org-No-Leak) ab. Läuft in CI
+(`.github/workflows/ci.yml`, Postgres-Service) zusammen mit fmt+clippy;
+lokal mit erreichbarer `DATABASE_URL`.
 
-**Daraus folgende grobe Roadmap (noch nicht abgestimmt — siehe Fragen):**
-
-1. Backend-Skeleton (Axum + sqlx + S3) anlegen.
-2. Auth-Schicht (JWT, Login-View, `useAuth`) ergänzen.
-3. Frontend vom Local- auf das Web-Paradigma umbauen (Workspaces statt Ordner,
-   Upload statt OS-Zugriff, Local-Modell-/Hardware-Code entfernen).
-4. Bridge-Konvention (RPC vs. REST) festziehen.
+**Bekannte funktionale Grenzen:** siehe `DEPLOY.md` §8 (Word-Platzhalter
+müssen run-zusammenhängend sein; Zell-Edits/Delegation schreiben das
+Zielblatt neu → Formeln/Formate/weitere Blätter gehen verloren;
+Delegation max. 200 Zeilen/Lauf).
 
 ---
 
@@ -81,14 +75,14 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 | Bereich | Technologie |
 |---|---|
 | Frontend | React 19 + Vite + TypeScript + Tailwind CSS + shadcn/ui |
-| API-Bridge | `src/lib/tauri.ts` → HTTP POST `/api/*` + WebSocket `/ws/*` |
-| Backend | Rust + **Axum** |
-| Realtime | Axum WebSocket (tokio-tungstenite) |
-| Datenbank | **PostgreSQL** via `sqlx` (async, compile-time-checked queries) |
+| API-Bridge | `src/lib/tauri.ts` → REST `/api/v1/*` + **eine** multiplexte WebSocket `/api/v1/ws` |
+| Backend | Rust + **Axum** 0.8 |
+| Realtime | Axum WebSocket (eine multiplexte Verbindung pro Client, `tokio::broadcast`-Hub) |
+| Datenbank | **PostgreSQL** via `sqlx` (async, **Runtime-Queries** — bewusst **keine** `query!`-Makros, damit der Docker-Build ohne DB-Verbindung läuft) |
 | Datei-Storage | **Lokales Persistent Volume** (Coolify, Single-Instance) — Pfad `STORAGE_DIR`. *(Geänderte Entscheidung 2026-05-19: ursprünglich S3/MinIO; wegen Self-Hosted-Single-Instance-Maßstab + Betriebskomplexität auf lokales Volume umgestellt.)* |
-| Auth | JWT (Bearer-Token) + Refresh-Token; Ausgabe via `/api/auth/login` |
-| LLM-Provider | Anthropic, OpenAI, OpenRouter — kein lokales GGUF in v1 |
-| Deployment | Docker (multi-stage build) + Coolify |
+| Auth | **Passwordless Magic-Link** (E-Mail-only) → JWT-Access + rotierende Refresh-Tokens; Versand via n8n-Webhook |
+| LLM-Provider | Anthropic (inkl. Prompt-Caching), OpenAI, OpenRouter — kein lokales GGUF in v1 |
+| Deployment | GitHub Actions → GHCR-Image; Coolify zieht das Image (kein VPS-Build) |
 | CI/CD | GitHub Actions |
 
 ---
@@ -97,10 +91,10 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 1. **Team zuerst, Einzelperson zweiter.** Jede Entscheidung muss mit mehreren parallelen Nutzern im Hintergrundmodell funktionieren. Geteilter State ist die Norm, nicht die Ausnahme.
 2. **Cloud-LLM ist Default.** Kein lokales Modell, keine GGUF-Infrastruktur, kein Hardware-Check. Modell-Auswahl = Provider + Modell-String.
-3. **Agent-Workspace statt lokaler Ordner.** Der „Agent-Ordner" ist ein logischer Workspace im Objekt-Storage. Datei-Upload und -Download ersetzen den OS-Dateibaum.
+3. **Agent-Workspace statt lokaler Ordner.** Der „Agent-Ordner" ist ein logischer Workspace auf dem lokalen Persistent Volume (`STORAGE_DIR`). Datei-Upload und -Download ersetzen den OS-Dateibaum.
 4. **Berechtigungen sind workspace-scoped.** Jede Backend-Operation prüft, ob der aufrufende User Mitglied des Workspaces ist. Kein Verlass auf Frontend-Filterung.
 5. **HITL ist Default für Schreibaktionen.** Wie in Local: Freigabe vor jeder destruktiven oder schreibenden Datei-Aktion.
-6. **WebSocket für Echtzeit.** Keine Polling-Lösung. Run-Events, HITL-Anfragen und FS-Änderungen laufen über einen persistenten WS-Kanal pro Nutzer/Session.
+6. **WebSocket für Echtzeit.** Keine Polling-Lösung. Run-Events, HITL-Anfragen und FS-Änderungen laufen über **eine** persistente, multiplexte WS-Verbindung pro Client (channel-basiert, workspace-scoped).
 7. **Kein User-Script in v1.** Gleiche Regel wie in Local — Sandbox-Infrastruktur kann vorbereitet, aber nicht für Endnutzer geöffnet werden.
 8. **Kein Python im Backend.** Alles in Rust.
 
@@ -147,7 +141,7 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 ### Upload-Flow
 
-1. **Frontend:** Drag & Drop oder Datei-Picker → `multipart/form-data` an `POST /api/workspaces/:id/files`.
+1. **Frontend:** Drag & Drop oder Datei-Picker → `multipart/form-data` an `POST /api/v1/workspaces/{id}/files`.
 2. **Backend:** Validierung (Dateityp, Größe ≤ 50 MB), Schreiben ins lokale Volume unter `STORAGE_DIR/workspaces/<workspace_id>/<filename>`.
 3. **Datenbank:** Eintrag in `workspace_files`-Tabelle (workspace_id, filename, s3_key = Storage-Key, size, uploaded_by, uploaded_at). *(Spaltenname `s3_key` historisch beibehalten; enthält den relativen Storage-Pfad.)*
 4. **Frontend:** WS-Broadcast an alle Workspace-Mitglieder → Datei-Baum aktualisiert sich live.
@@ -167,7 +161,7 @@ Jeder Storage-Key wird serverseitig gegen das Schema `workspaces/<workspace_id>/
 
 ---
 
-## 6. Verzeichnis-Layout (Soll-Stand)
+## 6. Verzeichnis-Layout (Ist-Stand)
 
 ```
 processfox_web/
@@ -220,36 +214,33 @@ processfox_web/
 │       ├── theme-provider.tsx
 │       ├── ui/                  # shadcn-Bausteine
 │       └── workspace/           # NEU: WorkspaceSwitcher, MemberList, InviteDialog
-└── backend/                     # Rust-Backend (Axum)
+└── backend/                     # Rust-Backend (Axum) — flaches Modul-Layout
     ├── Cargo.toml
     └── src/
-        ├── main.rs
-        ├── lib.rs
-        ├── config.rs            # Env-Vars (DB_URL, S3_*, JWT_SECRET, ...)
-        ├── db/                  # sqlx-Migrations + Query-Module
-        │   ├── migrations/
-        │   └── mod.rs
-        ├── auth/                # JWT-Middleware, Login/Register-Handler
-        ├── routes/              # Axum-Router
-        │   ├── mod.rs
-        │   ├── agents.rs
-        │   ├── chat.rs
-        │   ├── files.rs
-        │   ├── preview.rs
-        │   ├── settings.rs
-        │   ├── skills.rs
-        │   └── workspaces.rs
-        ├── ws/                  # WebSocket-Hub, Broadcast
+        ├── main.rs              # Bootstrap, AppState, axum::serve
+        ├── lib.rs               # build_app(), AppState-Struct, Modul-Mounts
+        ├── config.rs            # Env-Vars (DATABASE_URL, STORAGE_DIR, ...)
+        ├── error.rs             # ApiError (thiserror) + IntoResponse
+        ├── db/
+        │   ├── migrations/      # 0001_init, 0002_magic_link, 0003_*
+        │   └── mod.rs           # connect() + migrate!
+        ├── auth/                # mod, jwt, token, extractor (JWT-Middleware)
+        ├── routes/              # ein Modul pro Feature
+        │   ├── mod.rs  auth.rs  workspaces.rs  agents.rs
+        │   ├── settings.rs  secrets.rs  files.rs  chat.rs
+        ├── ws.rs                # WsHub (broadcast), ws_handler, pump
+        ├── perm.rs              # require_member/_editor/_org_owner
+        ├── sandbox.rs           # ensure_in_workspace / sanitize_filename
         ├── storage.rs           # lokales Volume (STORAGE_DIR), Pfad-Mapping
-        ├── core/                # Wiederverwendete Logik aus processfox_local
-        │   ├── chat/            # ReAct-Loop, ChatRepo
-        │   ├── llm/             # LlmProvider-Trait + Cloud-Implementierungen
-        │   ├── skill/           # SKILL.md-Parsing, SkillRegistry
-        │   ├── tool/            # Tool-Trait, Registry, Tool-Implementierungen
-        │   ├── sandbox.rs       # ensure_in_workspace()
-        │   └── error.rs
-        └── types.rs
+        ├── crypto.rs            # AES-256-GCM für API-Keys
+        ├── ratelimit.rs         # IP-Rate-Limit für Auth
+        ├── preview.rs           # docx/xlsx/pptx-Preview-JSON
+        ├── llm.rs               # stream_chat + tool_step (Anthropic/OpenAI/OR)
+        └── tools.rs             # Skill-/Tool-Registry, Datei-Schreib-Tools
 ```
+
+> Hinweis: Die in §9 gezeigten Pfade `backend/src/core/...` sind historisch
+> — das reale Layout ist flach (`backend/src/sandbox.rs` etc.).
 
 ---
 
@@ -272,15 +263,23 @@ processfox_web/
 
 - Verbindung: **eine** multiplexte WS pro Client — `GET /api/v1/ws?token=<access_token>` (Token im Query-String, weil die WS-Browser-API keinen Auth-Header unterstützt).
 - Server→Client-Frames: `{ "channel": "string", "payload": any }`. Der Client (Bridge `subscribeWs`) verteilt nach `channel`.
-- Channels: `chat:run:<runId>` (Payload = `RunEvent`), `fs-changed`, `agent-attachments-changed` (Payload = Agent-ID).
+- Channels: `chat:agent:<agentId>` (Payload = `RunEvent`, inkl. `userMessage` für Shared-Session), `fs-changed`, `agent-attachments-changed` (Payload = Agent-ID).
 - Workspace-Scoping: Broadcasts mit `workspace_id` erreichen nur Mitglieder dieses Workspaces; die Mitgliedschaft wird beim WS-Connect einmalig ermittelt (kein DB-Hit pro Event).
 - Reconnect: der Client verbindet bei Close mit dem dann aktuellen Access-Token neu (Token-Refresh).
 
 ### Frontend-Bridge (`src/lib/tauri.ts`)
 
-- `post<T>(command, body)` → `fetch('/api/v1/<command>', { method: 'POST', ... })`
-- `subscribeWs<T>(channel, handler)` → `new WebSocket('/ws/...')`
-- Die Typen (Interfaces, Enums) aus `src/types/` bleiben unverändert gegenüber Local, damit UI-Komponenten wiederverwendbar sind.
+- REST-Helfer `v1()` / `v1Post()` / `v1Upload()` → `fetch('/api/v1/...')`
+  mit automatischem 401 → Refresh → Retry. Domänen-APIs gruppiert
+  (`authApi`, `workspaceApi`, `memberApi`, `agentApi`, `settingsApi`,
+  `secretsApi`, `skillsApi`, `fileApi`, `previewApi`, `chatApi`).
+- `subscribeWs(channel, handler)` registriert einen Handler auf **der
+  einen** multiplexten WS (`wsConnect` → `/api/v1/ws?token=…`),
+  Reconnect mit frischem Token. `chatApi.subscribeAgent` nutzt den
+  Channel `chat:agent:<agentId>`.
+- Kein direkter `fetch` außerhalb von `src/lib/tauri.ts`. Die Typen aus
+  `src/types/` bleiben gegenüber Local unverändert, damit UI-Komponenten
+  wiederverwendbar sind.
 
 ---
 
@@ -293,7 +292,12 @@ processfox_web/
 organizations (id, name, invite_code, created_at)
 
 -- Nutzer (email global eindeutig; ein User gehört zu genau einer Org)
-users (id, email, password_hash, org_id, org_role, created_at)
+-- KEIN password_hash (passwordless; in 0002 entfernt).
+users (id, email, org_id, org_role, created_at)
+
+-- Magic-Link-Tokens (einmalig, 15 min; nur als SHA-256-Hash gespeichert).
+-- purpose: login | register. org_id nur bei register (Invite-Code aufgelöst).
+login_tokens (id, email, purpose, org_id, token_hash, expires_at, consumed_at, created_at)
 
 -- Refresh-Tokens (rotierend, widerrufbar; httpOnly-Cookie hält nur das Token,
 -- der Server hält den Hash + Ablauf)
@@ -330,7 +334,8 @@ Migrations liegen unter `backend/src/db/migrations/` als nummerierte SQL-Dateien
 ### Workspace-Sandbox (Pendant zu `ensure_in_agent_folder`)
 
 ```rust
-// backend/src/core/sandbox.rs
+// backend/src/sandbox.rs (Prinzip-Skizze; Implementierung ergänzt
+// zusätzlich sanitize_filename + workspace_key)
 pub fn ensure_in_workspace(
     workspace_id: Uuid,
     s3_key: &str,
@@ -382,7 +387,7 @@ Da kein lokales Modell unterstützt wird, vereinfacht sich die Provider-Logik ge
 - **Fehler-Handling:** `thiserror` für Domain-Errors, `anyhow` nur in `main.rs`. Kein `unwrap()` in Production-Code.
 - **Async:** `tokio`. DB-Calls async. Datei-I/O läuft via `std::fs` (kleine Dateien ≤ 50 MB, Single-Instance — bewusst simpel statt `tokio::fs`/Streaming); kein `spawn_blocking` nötig.
 - **Serde:** `#[serde(rename_all = "camelCase")]` an der Grenze zum Frontend. Getaggte Enums: zusätzlich `rename_all_fields = "camelCase"` setzen.
-- **sqlx:** Compile-time-geprüfte Queries (`query_as!`, `query!`). Kein ORM.
+- **sqlx:** **Runtime-Queries** (`sqlx::query`/`query_as` mit `.bind()`) — **keine** `query!`/`query_as!`-Makros, damit das Docker-Image **ohne** DB-Verbindung baubar ist (vgl. §12). Kein ORM.
 - **Module-Layout:** Ein Axum-Router-Modul pro Feature unter `backend/src/routes/`.
 
 ### TypeScript / React
@@ -409,19 +414,19 @@ Eckpunkte:
 
 - **Build-Kontext = Repo-Root** (nicht `backend/`), damit Stage 1 das
   Frontend und Stage 2 `backend/` sieht.
-- **Stage 2** nutzt `rust:1-bookworm`; das Runtime-Image ist
-  `debian:bookworm-slim` (gleiche glibc). `ca-certificates` ist im Runtime
-  installiert (TLS zu Postgres/S3).
+- **Stage 2** nutzt `rust:1-bookworm` (`cargo build --release --locked`);
+  das Runtime-Image ist `debian:bookworm-slim` (gleiche glibc) mit
+  `ca-certificates` (TLS zu Postgres) **und `curl`** (Coolify-Healthcheck
+  läuft im Container).
 - Migrationen sind via `sqlx::migrate!` ins Binary eingebettet — beim
-  Image-Bau ist **keine** DB-Verbindung nötig (keine `query!`-Makros im
-  Skeleton).
+  Image-Bau ist **keine** DB-Verbindung nötig (durchgängig
+  Runtime-Queries, keine `query!`-Makros, vgl. §11).
 - Healthcheck-Pfad für Coolify: **`GET /api/v1/health`** → `{"status":"ok"}`.
+- **Image wird in GitHub Actions gebaut → GHCR** (der 2-vCPU-VPS ist zu
+  schwach zum Bauen). Coolify zieht nur das fertige Image.
 
-> Stand Phase 1: Der Server liefert das Frontend aus und beantwortet
-> `/api/v1/health`. Alle übrigen API-Endpunkte folgen in Phase 2–6 — bis
-> dahin lädt die UI, aber Datenaktionen liefern 404. Der Phase-1-Deploy
-> validiert die Pipeline (Build, Coolify, Postgres/MinIO, Health), nicht
-> die App-Funktion.
+> Stand 2026-05-19: voll funktionsfähig (Phase 6 vollständig). Der
+> Phase-1-Hinweis (nur Health/Frontend) ist überholt.
 
 ### Pflicht-Umgebungsvariablen
 
@@ -437,19 +442,24 @@ Eckpunkte:
 | `PORT` | Backend-Port (Default: 3000) |
 | `STATIC_DIR` | Frontend-Verzeichnis (Default `/app/static`) |
 
-### Coolify-Workflow
+### Coolify-Workflow (Details: `DEPLOY.md`)
 
-1. GitHub-Repo verbinden.
-2. Dockerfile als Build-Methode wählen.
-3. Umgebungsvariablen im Coolify-UI hinterlegen.
-4. PostgreSQL-Service + Persistent Volume (Mount `/data`) in Coolify anlegen, `DATABASE_URL` + `STORAGE_DIR` setzen.
-5. Deploy on push to `main`.
+1. Push auf `main` → GitHub Action baut & pusht
+   `ghcr.io/<owner>/processfox_web:latest` (Package public stellen).
+2. Coolify-Resource als **Docker Image** (kein Dockerfile-Build), Port 3000,
+   Healthcheck `/api/v1/health`.
+3. PostgreSQL-Service + Persistent Volume (Mount `/data`) in Coolify anlegen.
+4. Umgebungsvariablen im Coolify-UI hinterlegen (`DATABASE_URL`, `STORAGE_DIR`,
+   Secrets …) **und Domain im Coolify-„Domains"-Feld** setzen (nicht nur
+   `PUBLIC_BASE_URL` — sonst „no available server").
+5. Nach grünem Action-Run in Coolify **Redeploy** (zieht frisches `:latest`).
+6. Erste Org + Owner einmalig per Seed-SQL anlegen (`DEPLOY.md` §6).
 
 ---
 
 ## 13. Test-Strategie
 
-- **Rust:** `cargo test` für Unit-Tests. Integration-Tests für Axum-Handler via `reqwest` gegen einen Test-Server. **DB:** Postgres-Testcontainer bzw. `#[sqlx::test]` mit Wegwerf-Datenbank — **kein** In-Memory-SQLite (sqlx-Queries sind Postgres-spezifisch + compile-time-geprüft, SQLite ist inkompatibel).
+- **Rust:** `cargo test` für Unit-Tests. **HTTP/DB-Integrationstests** in `backend/tests/integration.rs`: die echten Axum-Handler über `tower::ServiceExt::oneshot` (kein Port/Server), DB via `#[sqlx::test(migrations = "./src/db/migrations")]` mit pro Test frischer Wegwerf-Postgres-DB — **kein** In-Memory-SQLite (sqlx-Queries sind Postgres-spezifisch). Lokal eine erreichbare `DATABASE_URL` nötig; in CI ein Postgres-Service-Container (`.github/workflows/ci.yml`).
 - **Frontend:** `vitest` für Hooks und Utility-Funktionen.
 - **Auth-Tests:** Pflicht — Login, Token-Refresh, Workspace-Berechtigungs-Checks.
 - **Build-Gates vor jedem Commit:** `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `npm run build`.

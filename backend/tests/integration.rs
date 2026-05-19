@@ -1,0 +1,542 @@
+//! HTTP/DB-Integrationstests (CLAUDE.md §13 „Härtung").
+//!
+//! Jeder Test bekommt von `#[sqlx::test]` eine **frische Wegwerf-Postgres-DB**
+//! (Migrationen aus `./src/db/migrations` automatisch angewendet). Die echten
+//! Axum-Handler werden via `tower::ServiceExt::oneshot` aufgerufen — kein Port,
+//! kein laufender Server. Fokus: Auth (Magic-Link verify, Refresh-Rotation)
+//! und die sicherheitskritischen Workspace-Berechtigungen (`perm.rs`).
+//!
+//! Voraussetzung: erreichbare Postgres-Instanz via `DATABASE_URL` (in CI ein
+//! Service-Container; lokal z. B. `docker run -e POSTGRES_PASSWORD=postgres
+//! -p 5432:5432 postgres:16`). Ohne DB werden diese Tests nicht ausgeführt.
+
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::{header, Request, StatusCode};
+use serde_json::{json, Value};
+use sqlx::PgPool;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+use processfox_web::auth::encode_access_token;
+use processfox_web::config::Config;
+use processfox_web::ratelimit::RateLimiter;
+use processfox_web::storage::Storage;
+use processfox_web::ws::WsHub;
+use processfox_web::{build_app, AppState};
+
+const JWT_SECRET: &str = "test-jwt-secret-at-least-32-bytes-long!!";
+
+fn test_state(pool: PgPool) -> AppState {
+    let config = Config {
+        database_url: String::new(),
+        storage_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+        jwt_secret: JWT_SECRET.to_string(),
+        api_key_encryption_key: [7u8; 32],
+        port: 0,
+        static_dir: "/nonexistent-static".to_string(),
+        public_base_url: "http://localhost".to_string(),
+        // Bewusst tot: der Webhook-Versand schlägt fehl, wird geloggt und
+        // bricht die Anfrage nicht ab (kein Enumeration-Signal). Tests, die
+        // den Magic-Link brauchen, schreiben das login_token direkt in die DB.
+        magic_link_webhook_url: "http://127.0.0.1:9/unreachable".to_string(),
+        magic_link_webhook_secret: None,
+    };
+    AppState {
+        pool,
+        storage: Storage::new(&config.storage_dir),
+        config: Arc::new(config),
+        // Hoch genug, dass das Rate-Limit die Tests nicht stört.
+        ratelimit: Arc::new(RateLimiter::new(10_000, Duration::from_secs(300))),
+        http: reqwest::Client::new(),
+        ws: WsHub::new(),
+        cancels: Arc::new(Mutex::new(HashSet::new())),
+        active_runs: Arc::new(Mutex::new(HashMap::new())),
+        pending_hitl: Arc::new(Mutex::new(HashMap::new())),
+        pending_questions: Arc::new(Mutex::new(HashMap::new())),
+    }
+}
+
+/// Antwort eines Handler-Aufrufs: Status, evtl. `pfx_refresh`-Cookie und
+/// der geparste JSON-Body (oder `Null` bei leerem Body).
+struct Resp {
+    status: StatusCode,
+    refresh_cookie: Option<String>,
+    body: Value,
+}
+
+/// Schickt eine Anfrage durch die echte App.
+async fn call(
+    pool: &PgPool,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    cookie: Option<&str>,
+    body: Option<Value>,
+) -> Resp {
+    let app = build_app(test_state(pool.clone()));
+
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        // `request_login`/`register` brauchen ConnectInfo (Rate-Limit-Key).
+        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4242))));
+    if let Some(b) = bearer {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {b}"));
+    }
+    if let Some(c) = cookie {
+        req = req.header(header::COOKIE, c);
+    }
+    let req = if let Some(j) = body {
+        req.header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&j).unwrap()))
+            .unwrap()
+    } else {
+        req.body(Body::empty()).unwrap()
+    };
+
+    let res = app.oneshot(req).await.expect("router infallible");
+    let status = res.status();
+    let refresh_cookie = res
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|s| s.starts_with("pfx_refresh="))
+        .map(|s| s.split(';').next().unwrap_or(s).to_string());
+
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    Resp {
+        status,
+        refresh_cookie,
+        body,
+    }
+}
+
+// --- DB-Seed-Helfer -------------------------------------------------------
+
+async fn seed_org(pool: &PgPool, name: &str, invite: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO organizations (name, invite_code) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(name)
+    .bind(invite)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn seed_user(pool: &PgPool, org_id: Uuid, email: &str, role: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO users (email, org_id, org_role) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(email)
+    .bind(org_id)
+    .bind(role)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn bearer_for(user_id: Uuid, org_id: Uuid, role: &str) -> String {
+    encode_access_token(JWT_SECRET, user_id, org_id, role).unwrap()
+}
+
+// --- Tests: Verdrahtung & Auth-Guard --------------------------------------
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn health_is_public(pool: PgPool) {
+    let r = call(&pool, "GET", "/api/v1/health", None, None, None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body, json!({ "status": "ok" }));
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn workspaces_require_authentication(pool: PgPool) {
+    let r = call(&pool, "GET", "/api/v1/workspaces", None, None, None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn garbage_bearer_is_rejected(pool: PgPool) {
+    let r = call(
+        &pool,
+        "GET",
+        "/api/v1/workspaces",
+        Some("not-a-jwt"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+// --- Tests: Magic-Link verify & Refresh-Rotation --------------------------
+
+/// Schreibt ein gültiges Login-Magic-Link-Token in die DB und gibt den
+/// Klartext zurück (der Webhook-Versand wird im Test umgangen).
+async fn insert_login_token(pool: &PgPool, email: &str, valid: bool) -> String {
+    let (raw, hash) = {
+        // Eigene zufällige Zeichenkette + Hash über die echte Funktion.
+        let raw = format!("tok-{}", Uuid::new_v4());
+        (raw.clone(), processfox_web::auth::hash_token(&raw))
+    };
+    let expires = if valid {
+        "now() + interval '15 minutes'"
+    } else {
+        "now() - interval '1 minute'"
+    };
+    sqlx::query(&format!(
+        "INSERT INTO login_tokens (email, purpose, org_id, token_hash, expires_at) \
+         VALUES ($1, 'login', NULL, $2, {expires})"
+    ))
+    .bind(email)
+    .bind(&hash)
+    .execute(pool)
+    .await
+    .unwrap();
+    raw
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn verify_issues_session_and_refresh_cookie(pool: PgPool) {
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let raw = insert_login_token(&pool, "owner@acme.test", true).await;
+
+    let r = call(
+        &pool,
+        "POST",
+        "/api/v1/auth/verify",
+        None,
+        None,
+        Some(json!({ "token": raw })),
+    )
+    .await;
+
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body["user"]["email"], "owner@acme.test");
+    assert_eq!(r.body["user"]["orgRole"], "owner");
+    assert!(r.body["accessToken"].as_str().is_some());
+    assert!(
+        r.refresh_cookie.is_some(),
+        "verify muss ein pfx_refresh-Cookie setzen"
+    );
+
+    // Das ausgegebene Access-Token öffnet authentifizierte Endpunkte.
+    let token = r.body["accessToken"].as_str().unwrap().to_string();
+    let ws = call(&pool, "GET", "/api/v1/workspaces", Some(&token), None, None).await;
+    assert_eq!(ws.status, StatusCode::OK);
+    assert_eq!(ws.body, json!([]));
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn verify_rejects_unknown_token(pool: PgPool) {
+    let r = call(
+        &pool,
+        "POST",
+        "/api/v1/auth/verify",
+        None,
+        None,
+        Some(json!({ "token": "does-not-exist" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn verify_rejects_expired_token(pool: PgPool) {
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let raw = insert_login_token(&pool, "owner@acme.test", false).await;
+
+    let r = call(
+        &pool,
+        "POST",
+        "/api/v1/auth/verify",
+        None,
+        None,
+        Some(json!({ "token": raw })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn verify_token_is_single_use(pool: PgPool) {
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let raw = insert_login_token(&pool, "owner@acme.test", true).await;
+
+    let body = json!({ "token": raw });
+    let first = call(
+        &pool,
+        "POST",
+        "/api/v1/auth/verify",
+        None,
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK);
+
+    let second = call(&pool, "POST", "/api/v1/auth/verify", None, None, Some(body)).await;
+    assert_eq!(
+        second.status,
+        StatusCode::UNAUTHORIZED,
+        "ein konsumiertes Token darf nicht erneut funktionieren"
+    );
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn refresh_rotates_and_revokes_old_cookie(pool: PgPool) {
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let raw = insert_login_token(&pool, "owner@acme.test", true).await;
+
+    let login = call(
+        &pool,
+        "POST",
+        "/api/v1/auth/verify",
+        None,
+        None,
+        Some(json!({ "token": raw })),
+    )
+    .await;
+    let old_cookie = login.refresh_cookie.expect("verify set cookie");
+
+    // Mit dem Cookie refreshen → neues Token + neues Cookie.
+    let r1 = call(
+        &pool,
+        "POST",
+        "/api/v1/auth/refresh",
+        None,
+        Some(&old_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(r1.status, StatusCode::OK);
+    assert!(r1.body["accessToken"].as_str().is_some());
+    let new_cookie = r1.refresh_cookie.expect("refresh rotates cookie");
+    assert_ne!(old_cookie, new_cookie, "Refresh-Token muss rotieren");
+
+    // Das alte (rotierte) Cookie ist jetzt widerrufen.
+    let reuse = call(
+        &pool,
+        "POST",
+        "/api/v1/auth/refresh",
+        None,
+        Some(&old_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(
+        reuse.status,
+        StatusCode::UNAUTHORIZED,
+        "ein rotiertes Refresh-Token darf nicht wiederverwendbar sein"
+    );
+
+    // Das neue Cookie funktioniert weiter.
+    let ok = call(
+        &pool,
+        "POST",
+        "/api/v1/auth/refresh",
+        None,
+        Some(&new_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK);
+}
+
+// --- Tests: Workspace-Berechtigungen (perm.rs) ----------------------------
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn owner_creates_workspace_member_cannot(pool: PgPool) {
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let owner = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let member = seed_user(&pool, org, "member@acme.test", "member").await;
+
+    let as_owner = bearer_for(owner, org, "owner");
+    let created = call(
+        &pool,
+        "POST",
+        "/api/v1/workspaces",
+        Some(&as_owner),
+        None,
+        Some(json!({ "name": "Projekt A" })),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    assert_eq!(created.body["name"], "Projekt A");
+
+    let as_member = bearer_for(member, org, "member");
+    let denied = call(
+        &pool,
+        "POST",
+        "/api/v1/workspaces",
+        Some(&as_member),
+        None,
+        Some(json!({ "name": "Heimlich" })),
+    )
+    .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::FORBIDDEN,
+        "Nur der Org-Owner darf Workspaces anlegen"
+    );
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn foreign_org_workspace_is_not_found_no_leak(pool: PgPool) {
+    // Org A legt einen Workspace an.
+    let org_a = seed_org(&pool, "Acme", "AAAA23").await;
+    let owner_a = seed_user(&pool, org_a, "a@acme.test", "owner").await;
+    let token_a = bearer_for(owner_a, org_a, "owner");
+    let ws = call(
+        &pool,
+        "POST",
+        "/api/v1/workspaces",
+        Some(&token_a),
+        None,
+        Some(json!({ "name": "Geheim A" })),
+    )
+    .await;
+    let ws_id = ws.body["id"].as_str().unwrap().to_string();
+
+    // Ein Owner aus Org B fragt diesen Workspace ab → 404 (kein 403, das
+    // würde die Existenz verraten).
+    let org_b = seed_org(&pool, "Globex", "BBBB23").await;
+    let owner_b = seed_user(&pool, org_b, "b@globex.test", "owner").await;
+    let token_b = bearer_for(owner_b, org_b, "owner");
+    let probe = call(
+        &pool,
+        "GET",
+        &format!("/api/v1/workspaces/{ws_id}/members"),
+        Some(&token_b),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        probe.status,
+        StatusCode::NOT_FOUND,
+        "fremder Workspace muss als nicht gefunden erscheinen (kein Leak)"
+    );
+
+    // Und er taucht auch nicht in seiner Workspace-Liste auf.
+    let list_b = call(
+        &pool,
+        "GET",
+        "/api/v1/workspaces",
+        Some(&token_b),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list_b.body, json!([]));
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn viewer_can_read_but_not_perform_owner_actions(pool: PgPool) {
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let owner = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let viewer = seed_user(&pool, org, "viewer@acme.test", "member").await;
+    let token_owner = bearer_for(owner, org, "owner");
+    let token_viewer = bearer_for(viewer, org, "member");
+
+    // Owner: Workspace anlegen und Viewer als `viewer` aufnehmen.
+    let ws = call(
+        &pool,
+        "POST",
+        "/api/v1/workspaces",
+        Some(&token_owner),
+        None,
+        Some(json!({ "name": "Projekt" })),
+    )
+    .await;
+    let ws_id = ws.body["id"].as_str().unwrap().to_string();
+
+    let add = call(
+        &pool,
+        "POST",
+        &format!("/api/v1/workspaces/{ws_id}/members"),
+        Some(&token_owner),
+        None,
+        Some(json!({ "email": "viewer@acme.test", "role": "viewer" })),
+    )
+    .await;
+    assert_eq!(add.status, StatusCode::NO_CONTENT);
+
+    // Viewer darf Mitglieder lesen …
+    let read = call(
+        &pool,
+        "GET",
+        &format!("/api/v1/workspaces/{ws_id}/members"),
+        Some(&token_viewer),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK);
+    assert_eq!(read.body.as_array().map(|a| a.len()), Some(1));
+
+    // … aber keinen Owner-Vorbehalt ausführen (Mitglied hinzufügen).
+    let forbidden = call(
+        &pool,
+        "POST",
+        &format!("/api/v1/workspaces/{ws_id}/members"),
+        Some(&token_viewer),
+        None,
+        Some(json!({ "email": "owner@acme.test", "role": "editor" })),
+    )
+    .await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    // … und keinen Workspace anlegen.
+    let no_create = call(
+        &pool,
+        "POST",
+        "/api/v1/workspaces",
+        Some(&token_viewer),
+        None,
+        Some(json!({ "name": "Nope" })),
+    )
+    .await;
+    assert_eq!(no_create.status, StatusCode::FORBIDDEN);
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn request_login_for_unknown_email_creates_no_token(pool: PgPool) {
+    // Kein User mit dieser Adresse → generische 200, aber kein Token in der
+    // DB (keine Account-Enumeration, kein Webhook-Aufruf).
+    let r = call(
+        &pool,
+        "POST",
+        "/api/v1/auth/request-login",
+        None,
+        None,
+        Some(json!({ "email": "nobody@nowhere.test" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body["ok"], true);
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM login_tokens")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "für unbekannte E-Mail darf kein Token entstehen");
+}

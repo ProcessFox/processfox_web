@@ -184,6 +184,8 @@ Der Link ist 15 Minuten gültig und einmalig nutzbar.
 - **Grenze Zell-Edits/Delegation:** Schreiben erzeugt das Zielblatt neu;
   Formeln/Formate/weitere Blätter gehen verloren. Delegation max. 200
   Zeilen pro Lauf.
-- **Optional offen:** `delegationProfile`-Override (eigenes Worker-
-  Modell je Agent), Vorlage via Agent-Attachment. **Härtung:** HTTP/DB-
-  Integrationstests stehen noch aus (für CI mit Test-Postgres vorgemerkt).
+- **Härtung erledigt:** HTTP/DB-Integrationstests (`backend/tests/
+  integration.rs`) laufen in CI (`.github/workflows/ci.yml`, Postgres-
+  Service) — Auth, Refresh-Rotation, Workspace-Berechtigungen.
+- **Optional offen (klein):** `delegationProfile`-Override (eigenes
+  Worker-Modell je Agent), Vorlage via Agent-Attachment.
