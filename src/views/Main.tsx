@@ -17,7 +17,7 @@ import type { ChatMessage, PendingHitl, PendingQuestion } from "@/types/chat";
 type Props = {
   workspaces: Workspace[];
   activeWorkspace: Workspace | null;
-  isOwner: boolean;
+  isAdmin: boolean;
   onWorkspacesChanged: (selectId?: string) => void;
   agents: Agent[];
   activeAgent: Agent | null;
@@ -76,7 +76,7 @@ export function Main({
   onAgentUpdated,
   chatFooter,
   fileTreeRefresh,
-  isOwner,
+  isAdmin,
   onWorkspacesChanged,
   onSelectWorkspace,
   onSelectAgent,
@@ -105,7 +105,7 @@ export function Main({
           <WorkspaceSwitcher
             workspaces={workspaces}
             activeWorkspace={activeWorkspace}
-            isOwner={isOwner}
+            isAdmin={isAdmin}
             onSelect={onSelectWorkspace}
             onChanged={onWorkspacesChanged}
           />

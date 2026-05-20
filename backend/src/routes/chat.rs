@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
 use crate::llm::{self, stream_chat, ChatMsg};
-use crate::perm::{require_editor, require_member};
+use crate::perm::require_member;
 use crate::{crypto, AppState};
 
 /// System-Prompt für den Delegations-Worker (knappe Zell-Antwort).
@@ -483,7 +483,7 @@ async fn send_message(
         hitl_disabled,
         reasoning_enabled,
     } = agent_ctx(&state, agent_id).await?;
-    require_editor(&state, &user, wid).await?;
+    require_member(&state, &user, wid).await?;
     if body.text.trim().is_empty() {
         return Err(ApiError::BadRequest("Leere Nachricht.".into()));
     }

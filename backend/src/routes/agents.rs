@@ -1,5 +1,8 @@
 //! Agenten (PLAN.md Phase 4). REST unter `/api/v1`. Workspace-scoped:
-//! Lesen = `require_member`, Schreiben = `require_editor` (CLAUDE.md §4).
+//! jedes Workspace-Mitglied darf Agenten anlegen/bearbeiten (CLAUDE.md §4,
+//! Migration 0006). **Löschen** ist Admin-only, weil ein Agent (inkl.
+//! Chat-History und Attachments) für alle anderen Mitglieder mit
+//! verschwindet — gleicher Sicherheits-Vorbehalt wie Workspace-Löschen.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -13,7 +16,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
-use crate::perm::{require_editor, require_member};
+use crate::perm::{require_member, require_org_owner};
 use crate::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -157,7 +160,7 @@ async fn create_agent(
     Path(wid): Path<Uuid>,
     Json(body): Json<AgentInput>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    require_editor(&state, &user, wid).await?;
+    require_member(&state, &user, wid).await?;
     let name = body.name.unwrap_or_default();
     if name.trim().is_empty() {
         return Err(ApiError::BadRequest("Name erforderlich.".into()));
@@ -196,7 +199,7 @@ async fn update_agent(
     Json(body): Json<AgentInput>,
 ) -> ApiResult<Json<Value>> {
     let wid = agent_workspace(&state, id).await?;
-    require_editor(&state, &user, wid).await?;
+    require_member(&state, &user, wid).await?;
     let name = body.name.unwrap_or_default();
     if name.trim().is_empty() {
         return Err(ApiError::BadRequest("Name erforderlich.".into()));
@@ -234,7 +237,10 @@ async fn delete_agent(
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     let wid = agent_workspace(&state, id).await?;
-    require_editor(&state, &user, wid).await?;
+    // Erst Membership (sichert Org-Zugehörigkeit + verhindert Existenz-Leak
+    // über NotFound), dann Admin-Check für den eigentlichen Schreibzugriff.
+    require_member(&state, &user, wid).await?;
+    require_org_owner(&user)?;
     sqlx::query("DELETE FROM agents WHERE id = $1")
         .bind(id)
         .execute(&state.pool)
@@ -250,7 +256,7 @@ async fn set_attachment(
     Json(body): Json<AttachmentBody>,
 ) -> ApiResult<Json<Value>> {
     let wid = agent_workspace(&state, id).await?;
-    require_editor(&state, &user, wid).await?;
+    require_member(&state, &user, wid).await?;
     if body.kind != "template" {
         return Err(ApiError::BadRequest("Unbekannter Attachment-Typ.".into()));
     }

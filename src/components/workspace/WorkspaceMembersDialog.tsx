@@ -11,17 +11,15 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { memberApi } from "@/lib/tauri";
-import type { Workspace, WorkspaceMember, WorkspaceRole } from "@/types/auth";
+import type { Workspace, WorkspaceMember } from "@/types/auth";
 
 type Props = {
   open: boolean;
   workspace: Workspace;
-  /** Org-Owner darf Mitglieder verwalten (CLAUDE.md §4). */
+  /** Admin (Org-Owner) darf Mitglieder einladen/entfernen (CLAUDE.md §4). */
   canManage: boolean;
   onClose: () => void;
 };
-
-const ROLES: WorkspaceRole[] = ["editor", "viewer"];
 
 export function WorkspaceMembersDialog({
   open,
@@ -33,7 +31,6 @@ export function WorkspaceMembersDialog({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [email, setEmail] = useState("");
-  const [role, setRole] = useState<WorkspaceRole>("editor");
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(() => {
@@ -55,22 +52,13 @@ export function WorkspaceMembersDialog({
     setBusy(true);
     setError(null);
     try {
-      await memberApi.add(workspace.id, email.trim(), role);
+      await memberApi.add(workspace.id, email.trim());
       setEmail("");
       refresh();
     } catch (e) {
       setError(String((e as { message?: string })?.message ?? e));
     } finally {
       setBusy(false);
-    }
-  }
-
-  async function changeRole(userId: string, next: WorkspaceRole) {
-    try {
-      await memberApi.setRole(workspace.id, userId, next);
-      refresh();
-    } catch (e) {
-      setError(String((e as { message?: string })?.message ?? e));
     }
   }
 
@@ -91,31 +79,25 @@ export function WorkspaceMembersDialog({
         </DialogHeader>
 
         <div className="flex flex-col gap-4 py-2">
-          {canManage && (
+          {canManage ? (
             <div className="flex flex-col gap-2 rounded-md border border-border bg-surface p-3">
-              <Label className="text-xs">Mitglied hinzufügen</Label>
+              <Label className="text-xs">Mitglied einladen</Label>
               <div className="flex gap-2">
                 <Input
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="E-Mail (bereits registriertes Org-Mitglied)"
                   className="flex-1 text-xs"
+                  onKeyDown={(e) => e.key === "Enter" && add()}
                 />
-                <select
-                  value={role}
-                  onChange={(e) => setRole(e.target.value as WorkspaceRole)}
-                  className="h-9 rounded-md border border-border bg-background px-2 text-xs"
-                >
-                  {ROLES.map((r) => (
-                    <option key={r} value={r}>
-                      {r === "editor" ? "Editor" : "Viewer"}
-                    </option>
-                  ))}
-                </select>
                 <Button size="sm" onClick={add} disabled={busy}>
-                  Hinzufügen
+                  Einladen
                 </Button>
               </div>
+            </div>
+          ) : (
+            <div className="rounded-md border border-border bg-surface px-3 py-2 text-xs text-muted-foreground">
+              Nur Admins können Mitglieder einladen oder entfernen.
             </div>
           )}
 
@@ -143,33 +125,14 @@ export function WorkspaceMembersDialog({
                   <span className="min-w-0 flex-1 truncate" title={m.email}>
                     {m.email}
                   </span>
-                  {canManage ? (
-                    <>
-                      <select
-                        value={m.role}
-                        onChange={(e) =>
-                          changeRole(m.userId, e.target.value as WorkspaceRole)
-                        }
-                        className="h-7 rounded-md border border-border bg-background px-1.5 text-xs"
-                      >
-                        {ROLES.map((r) => (
-                          <option key={r} value={r}>
-                            {r === "editor" ? "Editor" : "Viewer"}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        onClick={() => remove(m.userId)}
-                        className="flex h-7 w-7 items-center justify-center rounded-sm text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
-                        title="Entfernen"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </>
-                  ) : (
-                    <span className="text-xs text-muted-foreground">
-                      {m.role === "editor" ? "Editor" : "Viewer"}
-                    </span>
+                  {canManage && (
+                    <button
+                      onClick={() => remove(m.userId)}
+                      className="flex h-7 w-7 items-center justify-center rounded-sm text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+                      title="Entfernen"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
                   )}
                 </div>
               ))

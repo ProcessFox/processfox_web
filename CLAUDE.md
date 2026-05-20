@@ -27,7 +27,7 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 ---
 
-## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + Read-Tools + `rewrite_file` + Skill-Registry 6c-1/-2/-3)
+## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + Read-Tools + `rewrite_file` + Skill-Registry 6c-1/-2/-3 + Rollen-Modell vereinfacht 6e)
 
 > **Wichtig:** Der Rest dieses Dokuments (§2–§16) beschreibt Architektur &
 > Konventionen. Dieser Abschnitt beschreibt den **realen Umsetzungsstand**.
@@ -88,6 +88,24 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
   mit den Results; Mitglieder, die den Agenten erst **nach** Run-Ende
   öffnen, sehen damit Tool-Chips und Resultate im Verlauf — vorher gab
   es nur die finale Text-Bubble.
+- **Rollen-Modell vereinfacht (Phase 6e, 2026-05-20):** Die zweite
+  Rollen-Ebene `workspace_members.role` (editor|viewer) wurde abgeschafft.
+  Frontend und Backend kennen nur noch **Admin** (`users.org_role =
+  'owner'`) vs. **Nutzer** (`users.org_role = 'member'`). Migration
+  `0006_workspace_member_role_removed` droppt die Spalte (Bestandsdaten
+  behalten ihre Mitgliedschaft, niemand verliert Zugriff). `require_editor`
+  ist aus `perm.rs` entfernt — alle Routen nutzen jetzt `require_member`,
+  weil jedes Workspace-Mitglied uneingeschränkt arbeiten darf. Admin-only
+  bleiben: `POST/PATCH/DELETE /workspaces`, `POST/DELETE
+  /workspaces/{id}/members/*`, alle `/secrets/*`-Schreibrouten, alle
+  `/settings`-Schreibrouten **und `DELETE /agents/{id}`** — durchgängig
+  per `require_org_owner` gegated. Frontend (`WorkspaceSwitcher`,
+  `WorkspaceMembersDialog`, `SettingsDialog`, `AgentEditorDialog`)
+  versteckt Admin-Aktionen für Nutzer; der Cloud-APIs-Tab ist für Nutzer
+  unsichtbar, der Trash-Button im Agent-Editor erscheint nur für Admins
+  beim Bearbeiten eines bestehenden Agenten. Neue UI-Aktionen:
+  **Workspace umbenennen** im Switcher-Dropdown und **Agent löschen** im
+  Editor-Footer — Routen gab's schon, Frontend-Trigger fehlten.
 - **Reasoning-Stream / Extended Thinking (Phase 6d-2, 2026-05-20):**
   Per-Agent-Toggle `agents.reasoning_enabled` (Migration 0005, Default
   aus). Aktiviert schaltet `llm.rs` den Provider-spezifischen
@@ -163,19 +181,27 @@ Delegation max. 200 Zeilen/Lauf).
 | **Organisation** | Oberste Einheit. Eine Org hat mehrere Workspaces und mehrere User. |
 | **Workspace** | Entspricht dem „Agent-Ordner" in Local. Hat einen Namen, Mitglieder und eine Datei-Liste. |
 | **Agent** | Gehört zu einem Workspace. Alle Workspace-Mitglieder können ihn nutzen. |
-| **User** | Hat eine Org-Rolle (`owner`, `member`) und eine optionale Workspace-Rolle (`editor`, `viewer`). |
+| **User** | Hat genau eine Org-Rolle: `owner` (= **Admin**) oder `member` (= **Nutzer**). Workspace-Mitgliedschaft ist binär (drin / nicht drin) — siehe Migration 0006. |
 | **Session** | Eine Chat-Session pro Agent, shared. Alle Mitglieder sehen den gleichen Chat-Verlauf live. |
 
-### Berechtigungs-Matrix
+### Berechtigungs-Matrix (Stand Migration 0006)
 
-| Aktion | Owner | Editor | Viewer |
-|---|---|---|---|
-| Agent erstellen/löschen | ✓ | ✓ | — |
-| Chat senden | ✓ | ✓ | — |
-| HITL freigeben | ✓ | ✓ | — |
-| Dateien hochladen/löschen | ✓ | ✓ | — |
-| Workspace-Mitglieder verwalten | ✓ | — | — |
-| API-Keys hinterlegen | ✓ | — | — |
+| Aktion | Admin (`org_role = 'owner'`) | Nutzer (`org_role = 'member'`) |
+|---|---|---|
+| Workspace anlegen / umbenennen / löschen | ✓ | — |
+| Mitglieder einladen / entfernen | ✓ | — |
+| Org-Settings (Default-Provider/Modell) | ✓ | — |
+| API-Keys hinterlegen / validieren / löschen | ✓ | — |
+| Agent **löschen** | ✓ | — |
+| Agent anlegen / konfigurieren / Attachment setzen | ✓ | ✓ |
+| Chat senden, HITL freigeben, `ask_user` beantworten | ✓ | ✓ |
+| Dateien hoch-/herunterladen, löschen, editieren | ✓ | ✓ |
+| Workspace-Liste / Mitglieder-Liste lesen | ✓ | ✓ (nur eigene Workspaces) |
+
+Admin-Status wird ausschließlich an `users.org_role = 'owner'` erkannt.
+Backend nutzt `require_org_owner(&user)` für Admin-Routen und
+`require_member(state, &user, ws_id)` als Workspace-Sandbox-Check. Die
+frühere Helper-Funktion `require_editor` ist entfernt.
 
 ### User-Identität
 
@@ -368,8 +394,8 @@ refresh_tokens (id, user_id, token_hash, expires_at, revoked_at, created_at)
 -- Workspaces (= Agent-Ordner)
 workspaces (id, org_id, name, created_at)
 
--- Workspace-Mitgliedschaft
-workspace_members (workspace_id, user_id, role)  -- role: editor | viewer
+-- Workspace-Mitgliedschaft (Migration 0006: role-Spalte entfernt — Mitgliedschaft ist binär)
+workspace_members (workspace_id, user_id)
 
 -- Agenten
 agents (id, workspace_id, name, icon, system_prompt, provider, model_id, skills jsonb, skill_settings jsonb, hitl_disabled, reasoning_enabled, attachments jsonb, delegation_profile jsonb, created_at, updated_at)

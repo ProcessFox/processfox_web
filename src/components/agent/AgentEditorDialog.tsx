@@ -1,4 +1,4 @@
-import { Wrench } from "lucide-react";
+import { Trash2, Wrench } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -24,8 +24,14 @@ type Props = {
   agent: Agent | null;
   /** Workspace the new agent belongs to (required when mode === "create"). */
   workspaceId: string | null;
+  /** Nur Admins dürfen Agenten löschen (CLAUDE.md §4) — blendet den
+   *  Trash-Button im Footer für Nutzer aus. */
+  isAdmin: boolean;
   onClose: () => void;
   onSaved: (agent: Agent) => void;
+  /** Wird nach erfolgreichem DELETE aufgerufen, damit der Parent die
+   *  Agent-Liste auffrischt und einen anderen Agenten aktiv setzt. */
+  onDeleted: (agentId: string) => void;
 };
 
 type ModelSelection =
@@ -134,8 +140,10 @@ export function AgentEditorDialog({
   mode,
   agent,
   workspaceId,
+  isAdmin,
   onClose,
   onSaved,
+  onDeleted,
 }: Props) {
   const [name, setName] = useState("");
   const [icon, setIcon] = useState("Bot");
@@ -153,6 +161,27 @@ export function AgentEditorDialog({
   );
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  async function handleDelete() {
+    if (!agent) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await agentApi.delete(agent.id);
+      onDeleted(agent.id);
+      setConfirmDelete(false);
+      onClose();
+    } catch (e) {
+      const msg =
+        typeof e === "object" && e && "message" in e
+          ? String((e as { message: unknown }).message)
+          : String(e);
+      setError(msg);
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   useEffect(() => {
     if (!isOpen) return;
@@ -456,18 +485,71 @@ export function AgentEditorDialog({
           )}
         </div>
 
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose} disabled={submitting}>
-            Abbrechen
-          </Button>
-          <Button
-            onClick={handleSave}
-            disabled={submitting || name.trim().length === 0}
-          >
-            {mode === "create" ? "Anlegen" : "Speichern"}
-          </Button>
+        <DialogFooter className="sm:justify-between">
+          {/* Trash-Button hängt links im Footer, nur sichtbar für Admins
+              beim Bearbeiten eines bestehenden Agenten. Nutzer sehen ihn
+              nicht — sie können keinen Agenten löschen (siehe CLAUDE.md §4). */}
+          {mode === "edit" && isAdmin && agent ? (
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setError(null);
+                setConfirmDelete(true);
+              }}
+              disabled={submitting}
+              className="text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+              title="Agent löschen"
+            >
+              <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+              Löschen
+            </Button>
+          ) : (
+            <span /> /* Platzhalter, damit `justify-between` zieht. */
+          )}
+          <div className="flex gap-2">
+            <Button variant="ghost" onClick={onClose} disabled={submitting}>
+              Abbrechen
+            </Button>
+            <Button
+              onClick={handleSave}
+              disabled={submitting || name.trim().length === 0}
+            >
+              {mode === "create" ? "Anlegen" : "Speichern"}
+            </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
+
+      <Dialog
+        open={confirmDelete}
+        onOpenChange={(v) => !v && setConfirmDelete(false)}
+      >
+        <DialogContent className="sm:max-w-[440px]">
+          <DialogHeader>
+            <DialogTitle>Agent löschen?</DialogTitle>
+          </DialogHeader>
+          <p className="text-xs text-muted-foreground">
+            „{agent?.name}" und der gesamte Chat-Verlauf werden für alle
+            Workspace-Mitglieder unwiderruflich entfernt.
+          </p>
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={() => setConfirmDelete(false)}
+              disabled={submitting}
+            >
+              Abbrechen
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleDelete}
+              disabled={submitting}
+            >
+              Löschen
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Dialog>
   );
 }

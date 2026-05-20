@@ -1,9 +1,14 @@
-//! Workspaces & Mitglieder (PLAN.md Phase 3). REST unter `/api/v1`.
+//! Workspaces & Mitglieder (PLAN.md Phase 3, CLAUDE.md §4). REST unter
+//! `/api/v1`.
 //!
-//! Berechtigungen (CLAUDE.md §4): Org-`owner` darf alles in seiner Org
-//! (inkl. Mitglieder verwalten, Workspaces anlegen/löschen). Workspace-
-//! `editor` darf inhaltlich arbeiten, `viewer` nur lesen. Jeder Handler
-//! prüft serverseitig — kein Verlass auf Frontend-Filterung.
+//! Berechtigungs-Matrix (ab Migration 0006):
+//!   - Workspace anlegen/umbenennen/löschen ........... Admin (Org-Owner)
+//!   - Mitglied einladen/entfernen .................... Admin
+//!   - Workspace-Liste / Mitglieder-Liste lesen ....... jedes Workspace-Mitglied
+//!
+//! Die frühere zweite Rollen-Ebene `workspace_members.role` ist abgeschafft;
+//! wer im Workspace ist, ist gleichberechtigter Nutzer. Jeder Handler prüft
+//! serverseitig — kein Verlass auf Frontend-Filterung.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -30,10 +35,7 @@ pub fn router() -> Router<AppState> {
             "/workspaces/{id}/members",
             get(list_members).post(add_member),
         )
-        .route(
-            "/workspaces/{id}/members/{user_id}",
-            delete(remove_member).patch(set_member_role),
-        )
+        .route("/workspaces/{id}/members/{user_id}", delete(remove_member))
 }
 
 // --- DTOs -----------------------------------------------------------------
@@ -44,7 +46,6 @@ struct ApiWorkspace {
     id: String,
     org_id: String,
     name: String,
-    role: String,
     created_at: String,
 }
 
@@ -53,7 +54,6 @@ struct ApiWorkspace {
 struct ApiMember {
     user_id: String,
     email: String,
-    role: String,
 }
 
 #[derive(Deserialize)]
@@ -64,23 +64,11 @@ struct NameBody {
 #[derive(Deserialize)]
 struct AddMemberBody {
     email: String,
-    role: String,
-}
-
-#[derive(Deserialize)]
-struct RoleBody {
-    role: String,
-}
-
-fn valid_role(role: &str) -> bool {
-    role == "editor" || role == "viewer"
 }
 
 fn rfc3339(t: OffsetDateTime) -> String {
     t.format(&Rfc3339).unwrap_or_default()
 }
-
-// Berechtigungs-Helper sind jetzt in `crate::perm` (von Phase 4 mitgenutzt).
 
 // --- Workspace-Handler ----------------------------------------------------
 
@@ -88,21 +76,23 @@ async fn list_workspaces(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> ApiResult<Json<Vec<ApiWorkspace>>> {
-    let rows: Vec<(Uuid, Uuid, String, OffsetDateTime, Option<String>)> = if user.is_owner() {
+    // Admin sieht alle Workspaces seiner Org; Nutzer nur die, in denen
+    // sie als `workspace_members`-Eintrag stehen.
+    let rows: Vec<(Uuid, Uuid, String, OffsetDateTime)> = if user.is_owner() {
         sqlx::query_as(
-            "SELECT id, org_id, name, created_at, NULL::text \
-                 FROM workspaces WHERE org_id = $1 ORDER BY created_at",
+            "SELECT id, org_id, name, created_at \
+             FROM workspaces WHERE org_id = $1 ORDER BY created_at",
         )
         .bind(user.org_id)
         .fetch_all(&state.pool)
         .await
     } else {
         sqlx::query_as(
-            "SELECT w.id, w.org_id, w.name, w.created_at, m.role \
-                 FROM workspaces w \
-                 JOIN workspace_members m \
-                   ON m.workspace_id = w.id AND m.user_id = $1 \
-                 WHERE w.org_id = $2 ORDER BY w.created_at",
+            "SELECT w.id, w.org_id, w.name, w.created_at \
+             FROM workspaces w \
+             JOIN workspace_members m \
+               ON m.workspace_id = w.id AND m.user_id = $1 \
+             WHERE w.org_id = $2 ORDER BY w.created_at",
         )
         .bind(user.user_id)
         .bind(user.org_id)
@@ -113,11 +103,10 @@ async fn list_workspaces(
 
     let out = rows
         .into_iter()
-        .map(|(id, org_id, name, created_at, role)| ApiWorkspace {
+        .map(|(id, org_id, name, created_at)| ApiWorkspace {
             id: id.to_string(),
             org_id: org_id.to_string(),
             name,
-            role: role.unwrap_or_else(|| "editor".to_string()),
             created_at: rfc3339(created_at),
         })
         .collect();
@@ -149,7 +138,6 @@ async fn create_workspace(
             id: row.0.to_string(),
             org_id: user.org_id.to_string(),
             name: name.to_string(),
-            role: "editor".to_string(),
             created_at: rfc3339(row.1),
         }),
     ))
@@ -199,8 +187,8 @@ async fn list_members(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<ApiMember>>> {
     require_member(&state, &user, id).await?;
-    let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT u.id, u.email, m.role FROM workspace_members m \
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT u.id, u.email FROM workspace_members m \
          JOIN users u ON u.id = m.user_id \
          WHERE m.workspace_id = $1 ORDER BY u.email",
     )
@@ -210,10 +198,9 @@ async fn list_members(
     .map_err(|e| ApiError::Internal(e.into()))?;
     Ok(Json(
         rows.into_iter()
-            .map(|(uid, email, role)| ApiMember {
+            .map(|(uid, email)| ApiMember {
                 user_id: uid.to_string(),
                 email,
-                role,
             })
             .collect(),
     ))
@@ -227,9 +214,6 @@ async fn add_member(
 ) -> ApiResult<StatusCode> {
     require_org_owner(&user)?;
     require_member(&state, &user, id).await?;
-    if !valid_role(&body.role) {
-        return Err(ApiError::BadRequest("Rolle: editor|viewer.".into()));
-    }
     // Nutzer muss in derselben Org registriert sein (Self-Service via Code).
     let email = body.email.trim().to_lowercase();
     let target: Option<(Uuid,)> =
@@ -248,43 +232,15 @@ async fn add_member(
         .0;
 
     sqlx::query(
-        "INSERT INTO workspace_members (workspace_id, user_id, role) \
-         VALUES ($1, $2, $3) \
-         ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = $3",
+        "INSERT INTO workspace_members (workspace_id, user_id) \
+         VALUES ($1, $2) \
+         ON CONFLICT (workspace_id, user_id) DO NOTHING",
     )
-    .bind(id)
-    .bind(target_id)
-    .bind(&body.role)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.into()))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn set_member_role(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Path((id, target_id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<RoleBody>,
-) -> ApiResult<StatusCode> {
-    require_org_owner(&user)?;
-    require_member(&state, &user, id).await?;
-    if !valid_role(&body.role) {
-        return Err(ApiError::BadRequest("Rolle: editor|viewer.".into()));
-    }
-    let res = sqlx::query(
-        "UPDATE workspace_members SET role = $1 \
-         WHERE workspace_id = $2 AND user_id = $3",
-    )
-    .bind(&body.role)
     .bind(id)
     .bind(target_id)
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.into()))?;
-    if res.rows_affected() == 0 {
-        return Err(ApiError::NotFound);
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -305,18 +261,4 @@ async fn remove_member(
     .await
     .map_err(|e| ApiError::Internal(e.into()))?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::valid_role;
-
-    #[test]
-    fn role_validation() {
-        assert!(valid_role("editor"));
-        assert!(valid_role("viewer"));
-        assert!(!valid_role("owner"));
-        assert!(!valid_role(""));
-        assert!(!valid_role("Editor"));
-    }
 }

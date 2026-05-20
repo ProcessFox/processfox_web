@@ -22,7 +22,6 @@ import type {
   AuthSession,
   Workspace,
   WorkspaceMember,
-  WorkspaceRole,
 } from "@/types/auth";
 
 // ---------------------------------------------------------------------------
@@ -247,10 +246,8 @@ export const workspaceApi = {
 export const memberApi = {
   list: (workspaceId: string) =>
     v1<WorkspaceMember[]>("GET", `workspaces/${workspaceId}/members`),
-  add: (workspaceId: string, email: string, role: WorkspaceRole) =>
-    v1<void>("POST", `workspaces/${workspaceId}/members`, { email, role }),
-  setRole: (workspaceId: string, userId: string, role: WorkspaceRole) =>
-    v1<void>("PATCH", `workspaces/${workspaceId}/members/${userId}`, { role }),
+  add: (workspaceId: string, email: string) =>
+    v1<void>("POST", `workspaces/${workspaceId}/members`, { email }),
   remove: (workspaceId: string, userId: string) =>
     v1<void>("DELETE", `workspaces/${workspaceId}/members/${userId}`),
 };

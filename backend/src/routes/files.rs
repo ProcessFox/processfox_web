@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
-use crate::perm::{require_editor, require_member};
+use crate::perm::require_member;
 use crate::sandbox::{ensure_in_workspace, sanitize_filename, workspace_key};
 use crate::{preview, AppState};
 
@@ -162,7 +162,7 @@ async fn upload_file(
     Path(wid): Path<Uuid>,
     mut multipart: Multipart,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    require_editor(&state, &user, wid).await?;
+    require_member(&state, &user, wid).await?;
 
     let mut found: Option<(String, String, axum::body::Bytes)> = None;
     while let Some(f) = multipart
@@ -235,7 +235,7 @@ async fn delete_file(
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     let row = file_row(&state, id).await?;
-    require_editor(&state, &user, row.workspace_id).await?;
+    require_member(&state, &user, row.workspace_id).await?;
     ensure_in_workspace(row.workspace_id, &row.s3_key)?;
     let _ = std::fs::remove_file(state.storage.path(&row.s3_key));
     sqlx::query("DELETE FROM workspace_files WHERE id = $1")
@@ -316,7 +316,7 @@ async fn write_text(
     Json(body): Json<WriteBody>,
 ) -> ApiResult<Json<Value>> {
     let row = file_row(&state, id).await?;
-    require_editor(&state, &user, row.workspace_id).await?;
+    require_member(&state, &user, row.workspace_id).await?;
     ensure_in_workspace(row.workspace_id, &row.s3_key)?;
     let path = state.storage.path(&row.s3_key);
 

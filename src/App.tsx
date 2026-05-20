@@ -56,15 +56,15 @@ function AuthGate() {
       />
     );
   }
-  return <AppShell onLogout={auth.logout} isOwner={auth.user!.orgRole === "owner"} />;
+  return <AppShell onLogout={auth.logout} isAdmin={auth.user!.orgRole === "owner"} />;
 }
 
 function AppShell({
   onLogout,
-  isOwner,
+  isAdmin,
 }: {
   onLogout: () => void;
-  isOwner: boolean;
+  isAdmin: boolean;
 }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspace, setActiveWorkspace] = useState<Workspace | null>(null);
@@ -281,6 +281,21 @@ function AppShell({
     setActiveAgent((curr) => (curr && curr.id === updated.id ? updated : curr));
   }, []);
 
+  // Admin hat den Agenten gelöscht: aus der Liste raus, einen anderen
+  // (oder „kein Agent") aktiv setzen. Workspace-Mitglieder, die parallel
+  // im Editor stehen, bekommen den Wegfall beim nächsten Agent-Wechsel /
+  // Reload mit — eine WS-Broadcast wäre eine spätere Verbesserung.
+  const handleAgentDeleted = useCallback((deletedId: string) => {
+    setAgents((prev) => {
+      const next = prev.filter((a) => a.id !== deletedId);
+      setActiveAgent((curr) =>
+        curr && curr.id === deletedId ? (next[0] ?? null) : curr,
+      );
+      return next;
+    });
+    setSelectedFile(null);
+  }, []);
+
   const handleSelectFile = useCallback((fileId: string, name: string) => {
     setSelectedFile({ fileId, name });
   }, []);
@@ -359,7 +374,7 @@ function AppShell({
       <Main
         workspaces={workspaces}
         activeWorkspace={activeWorkspace}
-        isOwner={isOwner}
+        isAdmin={isAdmin}
         onWorkspacesChanged={refreshWorkspaces}
         agents={agents}
         activeAgent={activeAgent}
@@ -401,13 +416,16 @@ function AppShell({
         mode={agentEditor?.mode ?? "create"}
         agent={agentEditor?.mode === "edit" ? activeAgent : null}
         workspaceId={activeWorkspace?.id ?? null}
+        isAdmin={isAdmin}
         onClose={() => setAgentEditor(null)}
         onSaved={handleAgentSaved}
+        onDeleted={handleAgentDeleted}
       />
 
       <SettingsDialog
         open={settingsState.open}
         defaultTab={settingsState.open ? settingsState.tab : undefined}
+        isAdmin={isAdmin}
         onClose={handleCloseSettings}
         onSettingsChange={handleSettingsChange}
         onLogout={onLogout}

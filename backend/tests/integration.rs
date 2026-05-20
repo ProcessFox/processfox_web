@@ -536,14 +536,17 @@ async fn foreign_org_workspace_is_not_found_no_leak(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./src/db/migrations")]
-async fn viewer_can_read_but_not_perform_owner_actions(pool: PgPool) {
+async fn member_can_read_workspace_but_not_perform_admin_actions(pool: PgPool) {
+    // Nach Migration 0006: workspace_members.role ist weg. Wer im Workspace
+    // ist, ist gleichberechtigter Nutzer (CLAUDE.md §4). Admin-only sind
+    // Workspace-Mgmt, Mitglieder-Verwaltung, Settings/API-Keys.
     let org = seed_org(&pool, "Acme", "ABCD23").await;
     let owner = seed_user(&pool, org, "owner@acme.test", "owner").await;
-    let viewer = seed_user(&pool, org, "viewer@acme.test", "member").await;
+    let member = seed_user(&pool, org, "member@acme.test", "member").await;
     let token_owner = bearer_for(owner, org, "owner");
-    let token_viewer = bearer_for(viewer, org, "member");
+    let token_member = bearer_for(member, org, "member");
 
-    // Owner: Workspace anlegen und Viewer als `viewer` aufnehmen.
+    // Admin legt Workspace an und lädt Nutzer ein.
     let ws = call(
         &pool,
         "POST",
@@ -561,47 +564,172 @@ async fn viewer_can_read_but_not_perform_owner_actions(pool: PgPool) {
         &format!("/api/v1/workspaces/{ws_id}/members"),
         Some(&token_owner),
         None,
-        Some(json!({ "email": "viewer@acme.test", "role": "viewer" })),
+        Some(json!({ "email": "member@acme.test" })),
     )
     .await;
     assert_eq!(add.status, StatusCode::NO_CONTENT);
 
-    // Viewer darf Mitglieder lesen …
+    // Nutzer darf Mitglieder lesen …
     let read = call(
         &pool,
         "GET",
         &format!("/api/v1/workspaces/{ws_id}/members"),
-        Some(&token_viewer),
+        Some(&token_member),
         None,
         None,
     )
     .await;
     assert_eq!(read.status, StatusCode::OK);
     assert_eq!(read.body.as_array().map(|a| a.len()), Some(1));
+    // Im Member-DTO gibt es keine Rolle mehr.
+    assert!(
+        read.body[0].get("role").is_none(),
+        "member-DTO darf kein role-Feld haben"
+    );
 
-    // … aber keinen Owner-Vorbehalt ausführen (Mitglied hinzufügen).
-    let forbidden = call(
+    // … kann aber keine Admin-Aktion ausführen: weder Mitglied hinzufügen …
+    let forbidden_add = call(
         &pool,
         "POST",
         &format!("/api/v1/workspaces/{ws_id}/members"),
-        Some(&token_viewer),
+        Some(&token_member),
         None,
-        Some(json!({ "email": "owner@acme.test", "role": "editor" })),
+        Some(json!({ "email": "owner@acme.test" })),
     )
     .await;
-    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+    assert_eq!(forbidden_add.status, StatusCode::FORBIDDEN);
 
-    // … und keinen Workspace anlegen.
+    // … noch einen Workspace anlegen …
     let no_create = call(
         &pool,
         "POST",
         "/api/v1/workspaces",
-        Some(&token_viewer),
+        Some(&token_member),
         None,
         Some(json!({ "name": "Nope" })),
     )
     .await;
     assert_eq!(no_create.status, StatusCode::FORBIDDEN);
+
+    // … noch umbenennen.
+    let no_rename = call(
+        &pool,
+        "PATCH",
+        &format!("/api/v1/workspaces/{ws_id}"),
+        Some(&token_member),
+        None,
+        Some(json!({ "name": "Hijack" })),
+    )
+    .await;
+    assert_eq!(no_rename.status, StatusCode::FORBIDDEN);
+
+    // … noch löschen.
+    let no_delete = call(
+        &pool,
+        "DELETE",
+        &format!("/api/v1/workspaces/{ws_id}"),
+        Some(&token_member),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(no_delete.status, StatusCode::FORBIDDEN);
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn member_cannot_delete_agent_only_admin_can(pool: PgPool) {
+    // Agent-Löschen entfernt für alle Workspace-Mitglieder die Historie —
+    // gleicher Vorbehalt wie Workspace-Löschen (CLAUDE.md §4). Admin
+    // (= Org-Owner) darf, Nutzer nicht; Workspace-Mitgliedschaft alleine
+    // reicht nicht.
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let owner = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let member = seed_user(&pool, org, "member@acme.test", "member").await;
+    let token_owner = bearer_for(owner, org, "owner");
+    let token_member = bearer_for(member, org, "member");
+
+    // Admin: Workspace + Agent anlegen, Nutzer als Mitglied aufnehmen.
+    let ws = call(
+        &pool,
+        "POST",
+        "/api/v1/workspaces",
+        Some(&token_owner),
+        None,
+        Some(json!({ "name": "Projekt" })),
+    )
+    .await;
+    let ws_id = ws.body["id"].as_str().unwrap().to_string();
+
+    let add = call(
+        &pool,
+        "POST",
+        &format!("/api/v1/workspaces/{ws_id}/members"),
+        Some(&token_owner),
+        None,
+        Some(json!({ "email": "member@acme.test" })),
+    )
+    .await;
+    assert_eq!(add.status, StatusCode::NO_CONTENT);
+
+    let agent = call(
+        &pool,
+        "POST",
+        &format!("/api/v1/workspaces/{ws_id}/agents"),
+        Some(&token_owner),
+        None,
+        Some(json!({ "name": "Buchhaltung" })),
+    )
+    .await;
+    assert_eq!(agent.status, StatusCode::CREATED);
+    let agent_id = agent.body["id"].as_str().unwrap().to_string();
+
+    // Nutzer ist Mitglied → darf den Agenten lesen.
+    let read = call(
+        &pool,
+        "GET",
+        &format!("/api/v1/agents/{agent_id}"),
+        Some(&token_member),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK);
+
+    // … aber NICHT löschen.
+    let forbidden = call(
+        &pool,
+        "DELETE",
+        &format!("/api/v1/agents/{agent_id}"),
+        Some(&token_member),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    // Agent ist noch da.
+    let still_there = call(
+        &pool,
+        "GET",
+        &format!("/api/v1/agents/{agent_id}"),
+        Some(&token_owner),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(still_there.status, StatusCode::OK);
+
+    // Admin darf — abräumen.
+    let ok = call(
+        &pool,
+        "DELETE",
+        &format!("/api/v1/agents/{agent_id}"),
+        Some(&token_owner),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::NO_CONTENT);
 }
 
 #[sqlx::test(migrations = "./src/db/migrations")]

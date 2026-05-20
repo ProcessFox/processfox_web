@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ChevronsUpDown, Folders, Plus, Trash2, Users } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ChevronsUpDown, Folders, Pencil, Plus, Trash2, Users } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -25,16 +25,18 @@ import { WorkspaceMembersDialog } from "./WorkspaceMembersDialog";
 type Props = {
   workspaces: Workspace[];
   activeWorkspace: Workspace | null;
-  isOwner: boolean;
+  /** Admin (= Org-Owner) darf Workspaces anlegen, umbenennen, löschen
+   *  und Mitglieder verwalten — siehe CLAUDE.md §4. */
+  isAdmin: boolean;
   onSelect: (ws: Workspace) => void;
-  /** Parent lädt die Workspace-Liste neu (nach Create/Delete). */
+  /** Parent lädt die Workspace-Liste neu (nach Create/Rename/Delete). */
   onChanged: (selectId?: string) => void;
 };
 
 export function WorkspaceSwitcher({
   workspaces,
   activeWorkspace,
-  isOwner,
+  isAdmin,
   onSelect,
   onChanged,
 }: Props) {
@@ -44,6 +46,16 @@ export function WorkspaceSwitcher({
   const [error, setError] = useState<string | null>(null);
   const [membersOpen, setMembersOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameName, setRenameName] = useState("");
+
+  // Sync the rename input each time the dialog opens for the active workspace.
+  useEffect(() => {
+    if (renaming && activeWorkspace) {
+      setRenameName(activeWorkspace.name);
+      setError(null);
+    }
+  }, [renaming, activeWorkspace]);
 
   async function create() {
     if (!newName.trim()) return;
@@ -54,6 +66,26 @@ export function WorkspaceSwitcher({
       setCreating(false);
       setNewName("");
       onChanged(ws.id);
+    } catch (e) {
+      setError(String((e as { message?: string })?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rename() {
+    if (!activeWorkspace) return;
+    const next = renameName.trim();
+    if (!next || next === activeWorkspace.name) {
+      setRenaming(false);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await workspaceApi.rename(activeWorkspace.id, next);
+      setRenaming(false);
+      onChanged(activeWorkspace.id);
     } catch (e) {
       setError(String((e as { message?: string })?.message ?? e));
     } finally {
@@ -113,7 +145,7 @@ export function WorkspaceSwitcher({
               <span className="truncate">{w.name}</span>
             </DropdownMenuItem>
           ))}
-          {isOwner && (
+          {isAdmin && (
             <>
               <DropdownMenuSeparator />
               <DropdownMenuItem
@@ -126,6 +158,15 @@ export function WorkspaceSwitcher({
                 <Plus className="h-3.5 w-3.5" />
                 Neuer Workspace
               </DropdownMenuItem>
+              {activeWorkspace && (
+                <DropdownMenuItem
+                  onSelect={() => setRenaming(true)}
+                  className="gap-2"
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                  Workspace umbenennen
+                </DropdownMenuItem>
+              )}
             </>
           )}
         </DropdownMenuContent>
@@ -141,7 +182,7 @@ export function WorkspaceSwitcher({
       >
         <Users className="h-3.5 w-3.5" />
       </Button>
-      {isOwner && (
+      {isAdmin && (
         <Button
           variant="ghost"
           size="icon"
@@ -186,6 +227,45 @@ export function WorkspaceSwitcher({
         </DialogContent>
       </Dialog>
 
+      <Dialog open={renaming} onOpenChange={(v) => !v && setRenaming(false)}>
+        <DialogContent className="sm:max-w-[420px]">
+          <DialogHeader>
+            <DialogTitle>Workspace umbenennen</DialogTitle>
+          </DialogHeader>
+          <Input
+            value={renameName}
+            onChange={(e) => setRenameName(e.target.value)}
+            placeholder="Neuer Name"
+            autoFocus
+            onKeyDown={(e) => e.key === "Enter" && rename()}
+          />
+          {error && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/15 px-3 py-2 text-xs text-destructive">
+              {error}
+            </div>
+          )}
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={() => setRenaming(false)}
+              disabled={busy}
+            >
+              Abbrechen
+            </Button>
+            <Button
+              onClick={rename}
+              disabled={
+                busy ||
+                !renameName.trim() ||
+                renameName.trim() === activeWorkspace?.name
+              }
+            >
+              Speichern
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog
         open={confirmDelete}
         onOpenChange={(v) => !v && setConfirmDelete(false)}
@@ -217,7 +297,7 @@ export function WorkspaceSwitcher({
         <WorkspaceMembersDialog
           open={membersOpen}
           workspace={activeWorkspace}
-          canManage={isOwner}
+          canManage={isAdmin}
           onClose={() => setMembersOpen(false)}
         />
       )}
