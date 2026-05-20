@@ -1781,3 +1781,283 @@ async fn grep_caps_hits_at_one_hundred(pool: PgPool) {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+// --- Tests: Chat-History-Persistenz (Phase 6d-1) --------------------------
+
+/// Helfer: legt einen Minimal-Agenten an und gibt seine ID zurück. Der
+/// Agent gehört keinem konkreten Modell — die Tests treiben den Provider-
+/// Pfad nicht an, sie prüfen nur den `GET /agents/{id}/messages`-Decoder.
+async fn seed_agent(pool: &PgPool, workspace_id: Uuid, name: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO agents (workspace_id, name, provider, model_id) \
+         VALUES ($1, $2, 'openai', 'gpt-4o') RETURNING id",
+    )
+    .bind(workspace_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Helfer: schreibt direkt eine `chat_messages`-Zeile mit beliebigem
+/// `content`-JSON. Wird in den Persistenz-Tests benutzt, um die Form der
+/// Zeile (Legacy-String vs. neue Struktur) gezielt zu kontrollieren.
+async fn insert_chat_row(pool: &PgPool, agent_id: Uuid, role: &str, content: Value) {
+    sqlx::query(
+        "INSERT INTO chat_messages (agent_id, role, content) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(agent_id)
+    .bind(role)
+    .bind(content)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Wie `insert_chat_row`, aber mit explizitem `created_at` — damit Tests,
+/// die mehrere Zeilen in schneller Folge schreiben, eine deterministische
+/// `ORDER BY created_at`-Reihenfolge bekommen (Postgres-`now()` kann
+/// unter Last in derselben Mikrosekunde landen).
+async fn insert_chat_row_at(pool: &PgPool, agent_id: Uuid, role: &str, content: Value, seq: i32) {
+    sqlx::query(
+        "INSERT INTO chat_messages (agent_id, role, content, created_at) \
+         VALUES ($1, $2, $3, now() + ($4 || ' microseconds')::interval)",
+    )
+    .bind(agent_id)
+    .bind(role)
+    .bind(content)
+    .bind(seq.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn list_messages_decodes_legacy_string_content(pool: PgPool) {
+    // Vor 6d-1 wurden Assistenten-Antworten als bloßer JSON-String
+    // geschrieben. Solche Bestandsdaten müssen weiter korrekt geliefert
+    // werden — ohne `toolCalls`/`reasoning`, aber mit dem Text als `content`.
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let owner = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let agent = seed_agent(&pool, ws, "Helper").await;
+    let token = bearer_for(owner, org, "owner");
+
+    insert_chat_row(&pool, agent, "user", Value::String("Hallo".into())).await;
+    insert_chat_row(&pool, agent, "assistant", Value::String("Hi!".into())).await;
+
+    let r = call(
+        &pool,
+        "GET",
+        &format!("/api/v1/agents/{agent}/messages"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let arr = r.body.as_array().expect("Array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["role"], "user");
+    assert_eq!(arr[0]["content"], "Hallo");
+    assert_eq!(arr[1]["role"], "assistant");
+    assert_eq!(arr[1]["content"], "Hi!");
+    // Wichtig: keine Phantom-Felder bei Legacy-Zeilen — das Frontend
+    // soll `toolCalls`/`reasoning` als „undefined" rendern.
+    assert!(arr[1].get("toolCalls").is_none(), "{:?}", arr[1]);
+    assert!(arr[1].get("reasoning").is_none(), "{:?}", arr[1]);
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn list_messages_decodes_structured_assistant_content(pool: PgPool) {
+    // Eine Assistenten-Zeile im neuen Objekt-Format wird so an die API
+    // zurückgespielt, dass das Frontend `toolCalls` und `reasoning` direkt
+    // an das `ChatMessage`-Typ vergibt (CamelCase, ohne Schachtelung in
+    // `content`).
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let owner = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let agent = seed_agent(&pool, ws, "Helper").await;
+    let token = bearer_for(owner, org, "owner");
+
+    let body = json!({
+        "text": "Hier ist deine Antwort.",
+        "reasoning": "Erst recherchiert, dann zusammengefasst.",
+        "toolCalls": [{
+            "id": "call_1",
+            "name": "list_files",
+            "arguments": { "path": "." }
+        }]
+    });
+    insert_chat_row(&pool, agent, "assistant", body).await;
+
+    let r = call(
+        &pool,
+        "GET",
+        &format!("/api/v1/agents/{agent}/messages"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let arr = r.body.as_array().expect("Array");
+    assert_eq!(arr.len(), 1);
+    let m = &arr[0];
+    assert_eq!(m["role"], "assistant");
+    assert_eq!(m["content"], "Hier ist deine Antwort.");
+    assert_eq!(m["reasoning"], "Erst recherchiert, dann zusammengefasst.");
+    let calls = m["toolCalls"].as_array().expect("toolCalls Array");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "call_1");
+    assert_eq!(calls[0]["name"], "list_files");
+    assert_eq!(calls[0]["arguments"]["path"], ".");
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn list_messages_returns_tool_role_with_tool_results(pool: PgPool) {
+    // Tool-Rows tragen die Ergebnisse einer Tool-Loop-Iteration. Das
+    // Frontend (`findToolResults`) ordnet sie anhand der `toolUseId`
+    // der vorangegangenen Assistant-Tool-Calls zu.
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let owner = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let agent = seed_agent(&pool, ws, "Helper").await;
+    let token = bearer_for(owner, org, "owner");
+
+    let body = json!({
+        "toolResults": [{
+            "toolUseId": "call_1",
+            "content": "drei Dateien gefunden",
+            "isError": false
+        }, {
+            "toolUseId": "call_2",
+            "content": "Tool nicht gefunden",
+            "isError": true
+        }]
+    });
+    insert_chat_row(&pool, agent, "tool", body).await;
+
+    let r = call(
+        &pool,
+        "GET",
+        &format!("/api/v1/agents/{agent}/messages"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let arr = r.body.as_array().expect("Array");
+    assert_eq!(arr.len(), 1);
+    let m = &arr[0];
+    assert_eq!(m["role"], "tool");
+    assert_eq!(m["content"], "");
+    let results = m["toolResults"].as_array().expect("toolResults Array");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["toolUseId"], "call_1");
+    assert_eq!(results[0]["isError"], false);
+    assert_eq!(results[1]["toolUseId"], "call_2");
+    assert_eq!(results[1]["isError"], true);
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn late_joiner_sees_tool_chips_after_run_end(pool: PgPool) {
+    // Simuliert den DB-Zustand **nach** einem abgeschlossenen Run:
+    // user → assistant(toolCall) → tool(result) → assistant(final-text).
+    // Ein Workspace-Mitglied, das den Agenten erst jetzt öffnet, lädt
+    // diese Historie und muss alle vier Einträge in chronologischer
+    // Reihenfolge sehen — vor 6d-1 war hier nur das `assistant(final-
+    // text)` zu sehen, weil Tool-Rows nie geschrieben wurden.
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let owner = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let agent = seed_agent(&pool, ws, "Helper").await;
+    let token = bearer_for(owner, org, "owner");
+
+    insert_chat_row_at(
+        &pool,
+        agent,
+        "user",
+        Value::String("Liste die Dateien.".into()),
+        1,
+    )
+    .await;
+    insert_chat_row_at(
+        &pool,
+        agent,
+        "assistant",
+        json!({
+            "text": "",
+            "toolCalls": [{
+                "id": "call_1",
+                "name": "list_files",
+                "arguments": {}
+            }]
+        }),
+        2,
+    )
+    .await;
+    insert_chat_row_at(
+        &pool,
+        agent,
+        "tool",
+        json!({
+            "toolResults": [{
+                "toolUseId": "call_1",
+                "content": "report.pdf, notes.md",
+                "isError": false
+            }]
+        }),
+        3,
+    )
+    .await;
+    insert_chat_row_at(
+        &pool,
+        agent,
+        "assistant",
+        json!({ "text": "Es gibt zwei Dateien: report.pdf und notes.md." }),
+        4,
+    )
+    .await;
+
+    let r = call(
+        &pool,
+        "GET",
+        &format!("/api/v1/agents/{agent}/messages"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let arr = r.body.as_array().expect("Array");
+    assert_eq!(arr.len(), 4, "Erwarte user→assistant→tool→assistant");
+
+    // Chronologische Reihenfolge: dank `insert_chat_row_at` haben die
+    // Zeilen strikt monoton wachsende `created_at`, sodass `ORDER BY
+    // created_at` deterministisch sortiert.
+    let roles: Vec<&str> = arr.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
+
+    // Der zweite Eintrag (Assistant mit Tool-Call) muss den Chip-relevanten
+    // Block tragen — sonst sieht der Late Joiner die Aktion nicht.
+    let calls = arr[1]["toolCalls"].as_array().expect("toolCalls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "call_1");
+
+    // Der dritte (Tool-Row) muss das passende Ergebnis liefern — sonst
+    // bleibt der Chip auf „lief gerade noch" hängen.
+    let results = arr[2]["toolResults"].as_array().expect("toolResults");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["toolUseId"], "call_1");
+    assert_eq!(results[0]["content"], "report.pdf, notes.md");
+
+    // Der finale Assistant-Eintrag hat den Antwort-Text und keine Tools.
+    assert_eq!(
+        arr[3]["content"],
+        "Es gibt zwei Dateien: report.pdf und notes.md."
+    );
+    assert!(arr[3].get("toolCalls").is_none());
+}

@@ -241,9 +241,22 @@ export function useAgentChat(
             );
             break;
           case "finish":
-            chatApi.listMessages(agentId).then(setMessages).catch(() => {});
+            // Phase 6d-1: das Backend persistiert jetzt strukturierte
+            // Assistant-/Tool-Rows. Wir warten den Reload ab, **bevor**
+            // wir den Live-State (`pendingTools`, `streamingText`,
+            // `streamingReasoning`) löschen — sonst flackert die UI
+            // zwischen Stream-Ende und persistiertem Verlauf einen
+            // Frame lang leer.
             currentRunRef.current = null;
-            resetStream();
+            chatApi
+              .listMessages(agentId)
+              .then((msgs) => {
+                setMessages(msgs);
+                resetStream();
+              })
+              .catch(() => {
+                resetStream();
+              });
             break;
           case "error":
             setError(`${event.code}: ${event.message}`);

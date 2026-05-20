@@ -78,6 +78,17 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
   Body), Thoroughness-Policy, Sprach-Direktive. `effective_hitl(loaded,
   tool_name)` ersetzt das alte `is_write_tool` — Skill-`perTool`-
   Override kann HITL **nur strenger machen**, nie abschalten.
+- **Strukturierte Chat-History (Phase 6d-1, 2026-05-20):**
+  `chat_messages.content` (JSONB) trägt jetzt strukturierte Inhalte —
+  assistant-Rows `{ text, reasoning?, toolCalls? }`, neue tool-Rows
+  `{ toolResults }`, user-Rows bleiben Plain-String (kein Schema-
+  Change, Backward-Compat: alte Bestandsdaten werden weiter als reine
+  Text-Bubbles dekodiert). Tool-Loop persistiert pro Iteration eine
+  intermediäre Assistant-Row mit ihren Tool-Calls plus eine Tool-Row
+  mit den Results; Mitglieder, die den Agenten erst **nach** Run-Ende
+  öffnen, sehen damit Tool-Chips und Resultate im Verlauf — vorher gab
+  es nur die finale Text-Bubble. Das `reasoning`-Feld ist Vertrag und
+  wird in Phase 6d-2 vom Stream gefüllt.
 - **CI/Deploy:** GitHub Actions baut das Multi-Stage-Image → GHCR;
   Coolify zieht das Image (Docker-Image-Resource, kein VPS-Build),
   Postgres + lokales Persistent Volume `/data`, Domain in Coolify.
@@ -351,6 +362,12 @@ workspace_members (workspace_id, user_id, role)  -- role: editor | viewer
 agents (id, workspace_id, name, icon, system_prompt, provider, model_id, skills jsonb, skill_settings jsonb, created_at, updated_at)
 
 -- Chat-Nachrichten
+-- content-JSONB:
+--   role = 'user'      → Value::String(text)                            (Plain-String)
+--   role = 'assistant' → { text, reasoning?, toolCalls? }               (Phase 6d-1+)
+--   role = 'tool'      → { toolResults: [{ toolUseId, content, isError }] }
+-- Bestandsdaten vor 6d-1 waren ausschließlich Plain-String; der
+-- list_messages-Decoder behandelt sie weiter als reine Text-Nachricht.
 chat_messages (id, agent_id, role, content jsonb, created_at)
 
 -- Dateien im Workspace

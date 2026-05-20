@@ -1632,6 +1632,335 @@ geschlossen.** Optional offen bleibt nur noch (klein):
 
 ---
 
+## Phase 6d — Reasoning-Stream + Tool-History-Persistenz (Bugfix)
+
+> Stand: 2026-05-20. Während des Dogfooding der Phase 6c-3 zwei
+> zusammenhängende Defekte festgestellt:
+>
+> 1. **Tool-Calls (und ein potenzieller Reasoning-Chip) verschwinden,
+>    sobald der Stream endet.** Live während des Runs sehen Sender und
+>    alle Workspace-Mitglieder mit offenem Agenten die Tool-Chips. Nach
+>    `finish` lädt das Frontend die Historie aus der DB neu und alles
+>    davon ist weg. Mitglieder, die später dazustoßen, sehen nur die
+>    Assistenten-Text-Bubble.
+> 2. **„Thinking" wird bei keinem Provider angezeigt.** Anthropic-
+>    Extended-Thinking ist API-seitig nicht aktiviert; der SSE-Parser
+>    kennt `thinking_delta` nicht. OpenRouter/OpenAI: weder
+>    `delta.reasoning` (OR-Standard) noch `delta.reasoning_content`
+>    (DeepSeek-Style) werden gelesen. Folge: `reasoningDelta`-WS-Event
+>    wird **nie** ausgelöst, obwohl die Frontend-Pipeline (`useAgentChat`
+>    + `ReasoningChip` + `MessageBlock.reasoning`) komplett da ist.
+
+### Wurzelursachen (Code-Belege)
+
+- `backend/src/routes/chat.rs:236` (`finish_run`): persistiert
+  Assistenten-Antwort als `Value::String(text)` — keine `toolCalls`,
+  kein `reasoning`. Tool-Results werden **nie** in `chat_messages`
+  geschrieben (nur per WS broadcastet).
+- `backend/src/routes/chat.rs:149` (`list_messages` → `row_to_msg`):
+  flacht `content` per `as_str()` ab — selbst wenn die JSONB-Spalte
+  Struktur enthielte, würde die API sie als String zurückgeben.
+- `backend/src/llm.rs:76+137+237+330`: kein Code-Pfad extrahiert
+  `thinking`/`reasoning`. Anthropic-Body hat kein
+  `thinking: { type: "enabled", … }`. OpenAI-compat-Body hat kein
+  `reasoning: { effort: … }`. SSE-Parser lesen nur Text-Deltas.
+- `src/hooks/useAgentChat.ts:243` (`case "finish"`): ruft
+  `chatApi.listMessages` und gleich darauf `resetStream()` — letzteres
+  löscht `pendingTools` und `streamingReasoning`. Da der API-Reload
+  diese Felder nicht enthält, kippt die UI in den nackten Text-Zustand.
+
+Die Render-Seite (`ChatPane.tsx:271–296`) ist bereits vollständig
+vorbereitet — sie ist heute ein toter Pfad, weil keine Daten kommen.
+
+### Phase 6d-1 — Tool-Call-/Reasoning-Persistenz ✅ ABGESCHLOSSEN (2026-05-20)
+
+**Ergebnis:** `chat_messages.content` ist jetzt strukturiert — assistant-
+Rows tragen `{ text, reasoning?, toolCalls? }`, neue tool-Rows tragen
+`{ toolResults }`, user-Rows bleiben Plain-String (kein Schema-Change,
+keine DB-Migration). `finish_run` schreibt das strukturierte Objekt und
+broadcastet `finish.message` 1:1 zum Frontend-Vertrag; der Tool-Loop
+persistiert pro Iteration zusätzlich eine intermediäre Assistant-Row
+mit den Tool-Calls plus eine Tool-Row mit den passenden Results.
+`list_messages` dekodiert beide Formen (Legacy-String + neues Objekt) —
+Bestandsdaten bleiben sichtbar. Frontend-Hook (`useAgentChat.ts`)
+chained `resetStream()` ans Ende des `listMessages`-Promise, damit
+zwischen Stream-Ende und persistiertem Verlauf kein Flash mehr
+auftritt. 52 Integrations- + 39 Unit-Tests grün (vier davon explizit
+für 6d-1: legacy-string, structured-assistant, tool-row-results,
+late-joiner-sieht-Tool-Chips). `reasoning`-Feld ist im Vertrag
+bereits da und wird mit 6d-2 gefüllt.
+
+**Ziel (ursprünglich):** Was während des Runs live über die WS läuft
+(Tool-Calls, Tool-Results, später auch Reasoning), überlebt das Run-
+Ende und ist auch für später dazukommende Workspace-Mitglieder im
+Verlauf sichtbar.
+
+**Schema:** `chat_messages.content` ist bereits JSONB — keine
+Migration nötig. Statt heutiger `Value::String(text)` schreiben wir
+ab jetzt ein strukturiertes Objekt:
+
+- **assistant** (`role = 'assistant'`):
+  ```json
+  {
+    "text": "…",
+    "reasoning": "…",            // optional; leer-String ≡ kein Reasoning
+    "toolCalls": [               // optional
+      { "id": "...", "name": "rewrite_file", "arguments": { ... } }
+    ]
+  }
+  ```
+- **tool** (neu, `role = 'tool'`) — ein Eintrag **pro Tool-Loop-
+  Iteration** mit allen Results dieser Iteration:
+  ```json
+  {
+    "toolResults": [
+      { "toolUseId": "...", "content": "…", "isError": false }
+    ]
+  }
+  ```
+  Genau diese Form erwartet `findToolResults` in `ChatPane.tsx:232`
+  bereits — der Code lebt damit ohne Anpassung auf.
+- **user** (`role = 'user'`): bleibt `Value::String(text)` — keine
+  Backward-Inkompatibilität nötig.
+
+**Backward-Compat (Bestandsdaten):** `list_messages` muss alte
+String-Zeilen weiterhin korrekt deserialisieren. Helfer
+`decode_content(role, value) -> ApiMessage` mit Match auf JSON-Form:
+String → reiner Text; Objekt → strukturiert. Keine DB-Migration für
+Altdaten — die alten Assistenten-Nachrichten bleiben einfach ohne
+Tools/Reasoning sichtbar (akzeptabel; Prod ist jung, Test-Stages dürfen
+mixed history haben).
+
+**Backend (`backend/src/routes/chat.rs`):**
+- `finish_run`-Signatur erweitert: nimmt `final_text`,
+  `final_reasoning: String`, `final_tool_calls: Vec<ToolUse>`. Schreibt
+  das Assistenten-JSON und broadcastet `finish` mit der vollständigen
+  `ChatMessage` (das `message`-Feld im Event-Type
+  `src/types/chat.ts:180` ist bereits vorgesehen).
+- Tool-Loop sammelt pro Iteration die `Vec<ToolUse>` und die zugehörige
+  `Vec<ToolResult>` und schreibt **nach jeder Iteration** eine
+  `role = 'tool'`-Zeile mit allen Results dieser Iteration. So bleibt
+  die zeitliche Reihenfolge im Chat erhalten:
+  Assistant₁(toolCalls) → Tool₁(results) → Assistant₂(toolCalls) →
+  Tool₂(results) → … → AssistantFinal(text).
+- Reasoning aus dem Stream (kommt aus 6d-2) wird in `chat.rs`-Run als
+  `acc_reasoning: String` mitgeführt und an `finish_run` weitergegeben.
+  Bis 6d-2 deployed ist: `acc_reasoning` bleibt leer — Tool-Persistenz
+  funktioniert trotzdem.
+- `list_messages` ersetzt `row_to_msg` durch ein Decoding, das das
+  strukturierte JSON parst. Rückgabe-Shape entspricht jetzt 1:1 dem
+  `ChatMessage`-Type im Frontend (`toolCalls`, `toolResults`,
+  `reasoning` jeweils optional).
+
+**Frontend:**
+- `useAgentChat.ts`: auf `case "finish"` zuerst `event.message` in
+  `setMessages` mergen (idempotent über `id`), **dann** `resetStream()`.
+  Damit kein Flash — der Live-Buffer wird durch die äquivalente
+  persistierte Nachricht ersetzt. `listMessages`-Reload bleibt als
+  Fallback bei `error`.
+- `ChatPane.tsx`: keine Änderung nötig. Render-Pfade für
+  `message.toolCalls`, `message.reasoning` und `findToolResults`
+  existieren bereits — sie werden nur mit echten Daten gefüttert.
+
+**Tests (`backend/tests/integration.rs`):**
+- `list_messages_decodes_legacy_string_content`: alter
+  `Value::String`-Eintrag wird zu `{ id, role, content, createdAt }`
+  ohne Crash, `toolCalls`/`reasoning` fehlen (optional).
+- `list_messages_decodes_structured_assistant_content`: neues
+  Objekt-Format → `toolCalls` und `reasoning` werden im Response
+  geliefert.
+- `list_messages_returns_tool_role_with_tool_results`: `role: 'tool'`-
+  Zeile mit `toolResults` taucht im Response auf und ordnet sich
+  zeitlich vor der nächsten Assistant-Zeile ein.
+- `finish_persists_text_reasoning_and_tool_calls_for_late_joiners`:
+  Run mit einem Tool-Call durchgespielt (Mock-Provider, der einen
+  Tool-Call und finalen Text zurückgibt); nach `finish` liefert
+  `listMessages` Tool-Call + Tool-Result + finalen Text.
+
+**Gates:** `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test --all-targets`, `npm run build`.
+
+**Abnahme:**
+- Run mit `rewrite_file`: Sender sieht Live-Tool-Chip → nach `finish`
+  bleibt der Chip stehen, Inhalt unverändert.
+- Zweiter Browser (anderes Workspace-Member) öffnet den Agenten **nach**
+  Run-Ende → sieht die Tool-Chips im Verlauf, nicht nur den finalen Text.
+- Reload (F5) → Tool-Chips immer noch da.
+- Bestehende ältere Chats (vor diesem Deploy) rendern weiterhin als
+  reine Text-Bubbles ohne Crash.
+
+---
+
+### Phase 6d-2 — Reasoning-Stream über alle Provider
+
+**Ziel:** „Thinking" wird live während des Runs angezeigt — bei
+Anthropic (Extended Thinking) wie bei OpenRouter/OpenAI (Reasoning-
+Models). Persistiert wird das Ergebnis dank 6d-1 automatisch mit.
+
+**Design-Entscheidung — Wer entscheidet, ob Thinking an ist?**
+
+Reasoning kostet Tokens (Anthropic Extended Thinking: separates
+`budget_tokens`; OpenRouter je nach Modell variabel). Optionen:
+
+1. **Immer an** — einfach, aber bei Nicht-Reasoning-Modellen wirkungslos
+   (keine Kosten); bei Reasoning-Modellen verteuert es jeden Call.
+2. **Per Agent toggle** (`agents.reasoning_enabled`) — sauber, braucht
+   eine Checkbox im Agent-Editor.
+3. **Per Modell heuristisch** — Modell-IDs wie `o1*`, `o3*`,
+   `*-r1*`, `*-thinking*` automatisch an; sonst aus.
+
+**Festgelegt: Option 2** (per-Agent-Toggle, Default aus). Macht Kosten
+transparent, ist UI-konsistent mit dem Modell-Picker im Agent-Editor,
+vermeidet überraschende Mehrkosten. Heuristik (Option 3) wird **innerhalb**
+des Toggles verwendet, um bei Nicht-Reasoning-Modellen das
+`reasoning`-Feld gar nicht erst zu senden (manche OR-Provider lehnen
+unbekannte Felder ab → siehe `MODELS_WITH_REASONING` unten).
+
+**Schema-Migration `0005_agent_reasoning.sql`:**
+```sql
+ALTER TABLE agents
+  ADD COLUMN reasoning_enabled BOOLEAN NOT NULL DEFAULT false;
+```
+
+**Backend (`backend/src/llm.rs`):**
+
+- `stream_chat`-Signatur: statt einem Callback zwei:
+  ```rust
+  on_delta:     impl FnMut(&str) -> bool,
+  on_reasoning: impl FnMut(&str) -> bool,
+  ```
+  Beide bekommen den Cancel-Stop via Bool-Rückgabe (wie bisher).
+- Neuer `LlmOptions { reasoning_enabled: bool }` als Parameter, um die
+  Signaturen nicht weiter aufzublähen.
+- Provider-spezifisch:
+  - **Anthropic:** Wenn `reasoning_enabled && model_supports_thinking`:
+    Request-Body bekommt `thinking: { type: "enabled", budget_tokens: 4000 }`.
+    SSE-Parser erweitert um:
+    - `content_block_delta` mit `/delta/type == "thinking_delta"` →
+      `on_reasoning(/delta/thinking)`.
+    - `content_block_start` mit `type == "thinking"` → kennzeichnet den
+      Block, ignoriert (nur seine Deltas zählen).
+  - **OpenAI-compat (OpenRouter/OpenAI):** Wenn `reasoning_enabled &&
+    matches_reasoning_pattern(model)`: Body bekommt
+    `reasoning: { effort: "medium" }`. SSE-Parser erweitert:
+    - `/choices/0/delta/reasoning` als String → `on_reasoning(...)`
+      (OpenRouter-Standard).
+    - `/choices/0/delta/reasoning_content` als String → `on_reasoning(...)`
+      (DeepSeek-Style, von einigen OR-Routes durchgereicht).
+- `tool_step` (non-streaming) analog: `Step` bekommt `reasoning: String`
+  (default `""`). Quellen:
+  - Anthropic: `content[]`-Block mit `type == "thinking"` → `thinking`
+    konkatenieren.
+  - OpenAI: `choices[0].message.reasoning` bzw. `reasoning_content`.
+
+**`MODELS_WITH_REASONING`-Patterns** (statisch in `llm.rs`,
+case-insensitive, konservativ — falsch-negativ ist okay (Reasoning kommt
+halt nicht), falsch-positiv ist schlimmer (Request schlägt fehl)):
+- `^o1`, `^o3`, `^o4` (OpenAI o-Serien)
+- `deepseek.*r1`
+- `qwen.*qwq`
+- `.*thinking.*` (z. B. `claude-*-thinking`)
+- `grok.*reasoning`
+
+Liste ist Doc-kommentiert mit Verweis auf die OpenRouter-Modell-Seite
+für künftige Ergänzungen.
+
+**Backend (`backend/src/routes/chat.rs`):**
+- `agent_ctx` zieht `reasoning_enabled` mit und gibt es weiter.
+- `stream_chat` und `tool_step` werden mit `LlmOptions { reasoning_enabled }`
+  aufgerufen.
+- Streaming-Pfad (no-tools): neuer `on_reasoning`-Callback broadcastet
+  `{ type: "reasoningDelta", text }` über `chat:agent:<id>`. Akkumuliert
+  in `acc_reasoning`, das `finish_run` (aus 6d-1) mit persistiert.
+- Tool-Loop-Pfad: `tool_step` liefert `Step.reasoning` zurück; wird in
+  einem Run-übergreifenden `acc_reasoning`-String akkumuliert (alle
+  Iterationen zusammen — das Frontend rendert pro Assistant-Block einen
+  Reasoning-Chip). `acc_reasoning` fließt am Ende in `finish_run`.
+- Reasoning wird **vor** dem ersten `delta`/`toolCallStarted`-Event
+  gestreamt; das Frontend rendert den ReasoningChip oberhalb der
+  Tool-Chips, was zur natürlichen zeitlichen Reihenfolge passt.
+
+**Frontend:**
+
+- `useAgentChat.ts`: keine Logik-Änderung — der `case "reasoningDelta"`-
+  Handler existiert seit Phase 6a (war tot, weil kein Backend ihn auslöste).
+- `AgentEditorDialog.tsx`: neue Checkbox „Reasoning-Modus aktivieren"
+  mit Tooltip „Aktiviert Extended Thinking bei Anthropic / Reasoning bei
+  OpenRouter — verbraucht zusätzliche Tokens".
+- `src/types/agent.ts`: `reasoningEnabled?: boolean` ergänzen.
+- `tauri.ts` `agentApi.update`: Feld durchreichen.
+- `backend/src/routes/agents.rs`: Feld in `UpdateAgent`-Body + DB-Update.
+
+**Tests:**
+
+- **Unit-Tests in `llm.rs`** (kein Postgres nötig, fixturer SSE-Stream):
+  - `anthropic_parses_thinking_delta`: synthetisches `data: {"type":
+    "content_block_delta","delta":{"type":"thinking_delta","thinking":"hm"}}`
+    → `on_reasoning("hm")` aufgerufen, `on_delta` nicht.
+  - `openai_parses_delta_reasoning_field`: SSE-Snippet mit
+    `delta.reasoning` → `on_reasoning` getriggert.
+  - `openai_parses_reasoning_content_field`: SSE-Snippet mit
+    `delta.reasoning_content` → `on_reasoning` getriggert.
+  - `reasoning_disabled_omits_request_field`: Body-Inspection — wenn
+    `reasoning_enabled = false`, ist weder `thinking` (Anthropic) noch
+    `reasoning` (OpenAI) im Request-Body.
+  - `non_reasoning_model_skips_field_even_when_enabled`: bei `gpt-4o`
+    + `reasoning_enabled = true` wird `reasoning` **nicht** gesendet
+    (Pattern matched nicht).
+- **Integrationstest in `backend/tests/integration.rs`**:
+  - `reasoning_persists_via_finish_message`: schickt einen Run mit
+    `reasoning_enabled = true` durch einen Mock-Provider, der sowohl
+    `reasoningDelta` als auch finalen Text sendet → `listMessages`
+    enthält `reasoning` im persistierten Assistenten-Eintrag.
+    (Kombiniert mit 6d-1.)
+
+**Gates:** wie üblich + ein manueller A/B-Smoke-Test mit OpenRouter
+(`deepseek/deepseek-r1`) und Anthropic (`claude-sonnet-4-thinking` o. ä.).
+
+**Abnahme:**
+- Frischer Run mit `reasoning_enabled = true` und einem Reasoning-Modell
+  bei OpenRouter → Reasoning-Chip erscheint live während des Streams
+  („still thinking"-Puls), kollabiert auf einen einklappbaren Chip wenn
+  der Stream beendet ist, bleibt nach Reload sichtbar.
+- Gleiches Verhalten mit Anthropic Extended Thinking.
+- Mit `reasoning_enabled = false`: Request-Body enthält weder `thinking`
+  (Anthropic) noch `reasoning` (OpenAI/OR); keine Mehrkosten.
+- Mit OpenAI `gpt-4o` (kein Reasoning-Modell) bei `reasoning_enabled =
+  true`: wird automatisch übersprungen (Pattern matched nicht), kein
+  API-Fehler.
+
+---
+
+### Reihenfolge & Abhängigkeiten
+
+- **6d-1 zuerst** — fixt den größeren UX-Bruch (verschwindende Tool-
+  Chips) eigenständig. Persistiert das `reasoning`-Feld bereits, auch
+  wenn es bis 6d-2 leer bleibt.
+- **6d-2 danach** — füllt den Reasoning-Pfad. Sichtbarkeit nach
+  Run-Ende ergibt sich automatisch, weil 6d-1 die Persistenz mitbringt.
+
+Jede Sub-Phase ist eigenständig deploybar — Backend bleibt zwischen
+den Etappen funktionsfähig.
+
+### Dokumentations-Patches
+
+- **`CLAUDE.md §1a` (Ist-Stand):** neuer Bullet „Run-Historie persistiert
+  jetzt strukturiert (Text + Reasoning + Tool-Calls/-Results); Reasoning-
+  Stream für Anthropic Extended Thinking und OpenRouter/OpenAI-Reasoning-
+  Modelle implementiert; per-Agent-Toggle `reasoning_enabled`."
+- **`CLAUDE.md §8` (Datenbank-Schema):** Kommentar an `chat_messages.content`:
+  „JSONB; assistant-Rows enthalten `{text, reasoning?, toolCalls?}`;
+  tool-Rows enthalten `{toolResults: [...]}`; user-Rows enthalten den
+  reinen Text-String." Plus `agents.reasoning_enabled BOOLEAN` ergänzen.
+- **`CLAUDE.md §10` (LLM-Provider-Strategie):** Absatz „Reasoning/Extended
+  Thinking" mit Hinweis auf den Per-Agent-Toggle und die `MODELS_WITH_REASONING`-
+  Heuristik.
+- **`DEPLOY.md §8` (Bekannte Grenzen):** Hinweis „Reasoning-Tokens werden
+  je nach Provider abgerechnet — bei Anthropic separates Budget, bei
+  OpenRouter modellabhängig."
+
+---
+
 ## Phase 7 — Deployment
 
 - Multi-Stage-Dockerfile (Frontend → Backend → Runtime, §12).

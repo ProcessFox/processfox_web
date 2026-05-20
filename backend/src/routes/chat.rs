@@ -102,14 +102,85 @@ struct ApiMessage {
     role: String,
     content: String,
     created_at: String,
+    /// Nur bei `role = "assistant"` und nur, wenn das Modell in dieser Iteration
+    /// Tools aufgerufen hat (Phase 6d-1). Optional, damit alte Plain-Text-
+    /// Nachrichten ohne Änderung weiter funktionieren.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<Value>>,
+    /// Nur bei `role = "tool"` (Phase 6d-1). Ergebnisse einer Tool-Loop-
+    /// Iteration; vom Frontend per `findToolResults` zur passenden Assistenten-
+    /// Nachricht zugeordnet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_results: Option<Vec<Value>>,
+    /// Optionales Chain-of-Thought (Phase 6d-2 füllt dieses Feld; bis dahin
+    /// bleibt es bei Anthropic Extended Thinking / OpenRouter Reasoning
+    /// strukturell schon im Vertrag).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<String>,
 }
 
+/// Dekodiert eine `chat_messages.content`-JSONB-Zeile in die API-Antwort.
+///
+/// **Backward-Compat**: vor Phase 6d-1 war `content` immer ein bloßer JSON-
+/// String. Solche Zeilen werden wie bisher gerendert (kein `toolCalls`/
+/// `reasoning`). Neue Zeilen sind Objekte:
+///
+/// - `assistant` → `{ "text": "...", "reasoning"?: "...", "toolCalls"?: [...] }`
+/// - `tool`      → `{ "toolResults": [...] }`
+/// - `user`      → bleibt `Value::String(text)` (kein Schema-Change nötig)
 fn row_to_msg(id: Uuid, role: String, content: Value, at: OffsetDateTime) -> ApiMessage {
-    ApiMessage {
-        id: id.to_string(),
-        role,
-        content: content.as_str().unwrap_or_default().to_string(),
-        created_at: at.format(&Rfc3339).unwrap_or_default(),
+    let created_at = at.format(&Rfc3339).unwrap_or_default();
+    let id_s = id.to_string();
+    match content {
+        Value::String(s) => ApiMessage {
+            id: id_s,
+            role,
+            content: s,
+            created_at,
+            tool_calls: None,
+            tool_results: None,
+            reasoning: None,
+        },
+        Value::Object(mut map) => {
+            // Reasoning: leere Strings filtern, damit der Frontend-Chip nicht
+            // mit „nichts gedacht" rendert.
+            let reasoning = map
+                .remove("reasoning")
+                .and_then(|v| v.as_str().map(String::from))
+                .filter(|s| !s.is_empty());
+            let tool_calls = map
+                .remove("toolCalls")
+                .and_then(|v| v.as_array().cloned())
+                .filter(|a| !a.is_empty());
+            let tool_results = map
+                .remove("toolResults")
+                .and_then(|v| v.as_array().cloned())
+                .filter(|a| !a.is_empty());
+            let text = map
+                .remove("text")
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
+            ApiMessage {
+                id: id_s,
+                role,
+                content: text,
+                created_at,
+                tool_calls,
+                tool_results,
+                reasoning,
+            }
+        }
+        // Defensive Fallback: kein bekanntes Format → leeres Content-Feld,
+        // statt 500 für eine einzelne defekte Zeile.
+        _ => ApiMessage {
+            id: id_s,
+            role,
+            content: String::new(),
+            created_at,
+            tool_calls: None,
+            tool_results: None,
+            reasoning: None,
+        },
     }
 }
 
@@ -222,40 +293,164 @@ fn is_cancelled(state: &AppState, run_id: Uuid) -> bool {
         .unwrap_or(false)
 }
 
-/// Assistenten-Nachricht persistieren + `finish` broadcasten.
+/// Baut den `content`-JSONB-Body einer Assistenten-Zeile.
+/// Leere Felder werden weggelassen, damit `decode_content` (s. `row_to_msg`)
+/// sie sauber als `None` interpretiert und die JSON klein bleibt.
+fn assistant_content_json(text: &str, reasoning: &str, tool_calls: &[llm::ToolUse]) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("text".to_string(), Value::String(text.to_string()));
+    if !reasoning.is_empty() {
+        obj.insert(
+            "reasoning".to_string(),
+            Value::String(reasoning.to_string()),
+        );
+    }
+    if !tool_calls.is_empty() {
+        let calls: Vec<Value> = tool_calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "arguments": c.input,
+                })
+            })
+            .collect();
+        obj.insert("toolCalls".to_string(), Value::Array(calls));
+    }
+    Value::Object(obj)
+}
+
+/// Schreibt eine intermediäre Assistenten-Zeile (mit Tool-Calls). Verwendet
+/// eine neue UUID — die `assistant_id` aus `send_message` bleibt für die
+/// **letzte** Antwort reserviert.
+async fn persist_assistant_with_calls(
+    st: &AppState,
+    agent_id: Uuid,
+    text: &str,
+    tool_calls: &[llm::ToolUse],
+) {
+    let body = assistant_content_json(text, "", tool_calls);
+    let res = sqlx::query(
+        "INSERT INTO chat_messages (agent_id, role, content) \
+         VALUES ($1, 'assistant', $2)",
+    )
+    .bind(agent_id)
+    .bind(body)
+    .execute(&st.pool)
+    .await;
+    if let Err(e) = res {
+        tracing::error!(error = %e, "persist intermediate assistant row failed");
+    }
+}
+
+/// Schreibt die Tool-Result-Zeile einer Tool-Loop-Iteration. Reihenfolge der
+/// Einträge entspricht der Aufruf-Reihenfolge der `tool_calls`.
+async fn persist_tool_results(st: &AppState, agent_id: Uuid, results: &[(String, String, bool)]) {
+    if results.is_empty() {
+        return;
+    }
+    let arr: Vec<Value> = results
+        .iter()
+        .map(|(id, content, is_error)| {
+            json!({
+                "toolUseId": id,
+                "content": content,
+                "isError": is_error,
+            })
+        })
+        .collect();
+    let body = json!({ "toolResults": arr });
+    let res = sqlx::query(
+        "INSERT INTO chat_messages (agent_id, role, content) \
+         VALUES ($1, 'tool', $2)",
+    )
+    .bind(agent_id)
+    .bind(body)
+    .execute(&st.pool)
+    .await;
+    if let Err(e) = res {
+        tracing::error!(error = %e, "persist tool results row failed");
+    }
+}
+
+/// Inhalt der finalen Assistenten-Antwort. Wird strukturiert persistiert
+/// (Phase 6d-1) und 1:1 als `finish.message` an alle Clients broadcastet.
+struct FinalAssistant {
+    text: String,
+    /// Phase 6d-2 wird dieses Feld füllen; aktuell immer leer.
+    reasoning: String,
+    /// Verbleibende Tool-Calls auf der finalen Nachricht — heute leer, da
+    /// Tool-Iterationen eigene Zwischen-Rows bekommen. Defensiv mitgeführt,
+    /// damit ein zukünftiger Pfad „letzter Step liefert Text + Tools" hier
+    /// ohne API-Anpassung andocken kann.
+    tool_calls: Vec<llm::ToolUse>,
+}
+
+/// Letzte Assistenten-Nachricht persistieren + `finish` broadcasten.
+///
+/// Phase 6d-1: `content` ist jetzt strukturiert (`{ text, reasoning?,
+/// toolCalls? }`). Das `finish.message`-Payload spiegelt diese Struktur
+/// 1:1 zum Frontend-`ChatMessage`-Type.
 async fn finish_run(
     st: &AppState,
     agent_id: Uuid,
     assistant_id: Uuid,
     wid: Uuid,
     channel: &str,
-    text: String,
+    final_msg: FinalAssistant,
     reason: &str,
 ) {
+    let FinalAssistant {
+        text,
+        reasoning,
+        tool_calls,
+    } = final_msg;
+    let body = assistant_content_json(&text, &reasoning, &tool_calls);
     let saved: Result<(OffsetDateTime,), _> = sqlx::query_as(
         "INSERT INTO chat_messages (id, agent_id, role, content) \
          VALUES ($1, $2, 'assistant', $3) RETURNING created_at",
     )
     .bind(assistant_id)
     .bind(agent_id)
-    .bind(Value::String(text.clone()))
+    .bind(&body)
     .fetch_one(&st.pool)
     .await;
     let created_at = saved
         .map(|r| r.0.format(&Rfc3339).unwrap_or_default())
         .unwrap_or_default();
+
+    // Payload-Shape für den Frontend-`ChatMessage`-Type: text als `content`,
+    // optionale `toolCalls`/`reasoning` (Klein-camelCase wie API).
+    let mut msg = serde_json::Map::new();
+    msg.insert("id".to_string(), Value::String(assistant_id.to_string()));
+    msg.insert("role".to_string(), Value::String("assistant".to_string()));
+    msg.insert("content".to_string(), Value::String(text));
+    msg.insert("createdAt".to_string(), Value::String(created_at));
+    if !reasoning.is_empty() {
+        msg.insert("reasoning".to_string(), Value::String(reasoning));
+    }
+    if !tool_calls.is_empty() {
+        let calls: Vec<Value> = tool_calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "arguments": c.input,
+                })
+            })
+            .collect();
+        msg.insert("toolCalls".to_string(), Value::Array(calls));
+    }
+
     st.ws.publish(
         Some(wid),
         channel.to_string(),
         json!({
             "type": "finish",
             "reason": reason,
-            "message": {
-                "id": assistant_id.to_string(),
-                "role": "assistant",
-                "content": text,
-                "createdAt": created_at,
-            },
+            "message": Value::Object(msg),
         }),
     );
 }
@@ -418,7 +613,23 @@ async fn send_message(
                     } else {
                         "stop"
                     };
-                    finish_run(&st, agent_id, assistant_id, wid, &channel, acc, reason).await;
+                    // Phase 6d-1: kein Reasoning/Tools in diesem Pfad
+                    // (kein Tool-Loop). Phase 6d-2 wird `reasoning`
+                    // hier mitführen.
+                    finish_run(
+                        &st,
+                        agent_id,
+                        assistant_id,
+                        wid,
+                        &channel,
+                        FinalAssistant {
+                            text: acc,
+                            reasoning: String::new(),
+                            tool_calls: Vec::new(),
+                        },
+                        reason,
+                    )
+                    .await;
                 }
                 Err(e) => error_run(&st, wid, &channel, e.to_string()),
             }
@@ -485,8 +696,20 @@ async fn send_message(
                 final_text = Some(step.text.unwrap_or_default());
                 break;
             }
+            // Phase 6d-1: intermediäre Assistant-Row mit den Tool-Calls
+            // dieser Iteration persistieren — sonst sehen Mitglieder, die
+            // den Agenten erst nach Run-Ende öffnen, die Tool-Chips nicht.
+            // (`step.text` ist bei reinen Tool-Iterationen heute leer; der
+            // optionale Text-Anteil wird mitgenommen, falls ein Provider
+            // doch Text+Tools im selben Schritt liefert.)
+            let iter_text = step.text.clone().unwrap_or_default();
+            persist_assistant_with_calls(&st, agent_id, &iter_text, &step.calls).await;
+
             turns.push(llm::Turn::ToolUse(step.calls.clone()));
             let mut results = Vec::new();
+            // Parallel zu `results` für die Persistenz: enthält zusätzlich
+            // `is_error` pro Tool-Result.
+            let mut persisted_results: Vec<(String, String, bool)> = Vec::new();
             for call in &step.calls {
                 st.ws.publish(
                     Some(wid),
@@ -803,17 +1026,38 @@ async fn send_message(
                         "isError": is_error
                     }),
                 );
+                persisted_results.push((call.id.clone(), content.clone(), is_error));
                 results.push(llm::ToolResult {
                     id: call.id.clone(),
                     content,
                 });
             }
+            // Phase 6d-1: Tool-Row dieser Iteration persistieren — bildet
+            // zusammen mit der vorherigen intermediären Assistant-Row das
+            // Paar, das `findToolResults` im Frontend für die Chips
+            // benötigt.
+            persist_tool_results(&st, agent_id, &persisted_results).await;
             turns.push(llm::Turn::ToolResults(results));
         }
 
         let text =
             final_text.unwrap_or_else(|| "(Maximale Tool-Iterationen erreicht.)".to_string());
-        finish_run(&st, agent_id, assistant_id, wid, &channel, text, reason).await;
+        // Phase 6d-1: Reasoning bleibt leer bis 6d-2; finale Antwort hat
+        // selbst keine Tool-Calls mehr (die wurden iterativ persistiert).
+        finish_run(
+            &st,
+            agent_id,
+            assistant_id,
+            wid,
+            &channel,
+            FinalAssistant {
+                text,
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            },
+            reason,
+        )
+        .await;
         release_run(&st, agent_id, run_id);
     });
 
