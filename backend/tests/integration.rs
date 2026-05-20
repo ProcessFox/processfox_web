@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -539,4 +540,226 @@ async fn request_login_for_unknown_email_creates_no_token(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(count, 0, "für unbekannte E-Mail darf kein Token entstehen");
+}
+
+// --- Tests: grep_in_files (Phase 6b-2h) -----------------------------------
+//
+// Diese Tests rufen `tools::execute_read_tool` direkt auf — der Tool-Loop
+// im Chat tut dasselbe und verlässt sich für Read-Tools auf identische
+// Semantik (kein HITL, kein Broadcast).
+
+/// AppState mit eigenem, eindeutigem Storage-Verzeichnis pro Test, damit
+/// sich Volume-Inhalte zwischen parallel laufenden Tests nicht mischen.
+fn tool_state(pool: PgPool) -> (AppState, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("pfx-grep-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut state = test_state(pool);
+    state.storage = Storage::new(&dir.to_string_lossy());
+    (state, dir)
+}
+
+/// Legt einen Workspace + Volume-Bytes + `workspace_files`-Zeile an.
+async fn seed_file(
+    pool: &PgPool,
+    storage_root: &Path,
+    workspace_id: Uuid,
+    uploaded_by: Uuid,
+    filename: &str,
+    bytes: &[u8],
+) {
+    let key = format!("workspaces/{workspace_id}/{filename}");
+    let path = storage_root.join(&key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_files \
+         (workspace_id, filename, s3_key, size_bytes, content_type, uploaded_by) \
+         VALUES ($1, $2, $3, $4, 'text/plain', $5)",
+    )
+    .bind(workspace_id)
+    .bind(filename)
+    .bind(&key)
+    .bind(bytes.len() as i64)
+    .bind(uploaded_by)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn seed_workspace(pool: &PgPool, org_id: Uuid, name: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO workspaces (org_id, name) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(org_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn grep_finds_hits_with_path_and_line(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, GREP_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    seed_file(
+        &pool,
+        &root,
+        ws,
+        user,
+        "notes.md",
+        b"alpha bravo\nFoo line two\ncharlie\n",
+    )
+    .await;
+    seed_file(
+        &pool,
+        &root,
+        ws,
+        user,
+        "more.txt",
+        b"unrelated\nanother foo here\n",
+    )
+    .await;
+
+    let out = execute_read_tool(&state, ws, GREP_TOOL, &json!({ "pattern": "foo" }))
+        .await
+        .unwrap();
+    // Case-insensitive Default: matched „Foo" und „foo".
+    assert!(out.contains("notes.md:2: Foo line two"), "{out}");
+    assert!(out.contains("more.txt:2: another foo here"), "{out}");
+    assert!(out.starts_with("2 Treffer"), "{out}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn grep_respects_case_sensitive_flag(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, GREP_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    seed_file(&pool, &root, ws, user, "notes.md", b"Foo\nfoo\nFOO\n").await;
+
+    let ci = execute_read_tool(&state, ws, GREP_TOOL, &json!({ "pattern": "foo" }))
+        .await
+        .unwrap();
+    assert!(ci.starts_with("3 Treffer"), "{ci}");
+
+    let cs = execute_read_tool(
+        &state,
+        ws,
+        GREP_TOOL,
+        &json!({ "pattern": "foo", "caseSensitive": true }),
+    )
+    .await
+    .unwrap();
+    assert!(cs.starts_with("1 Treffer"), "{cs}");
+    assert!(cs.contains("notes.md:2: foo"), "{cs}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn grep_skips_non_whitelisted_extensions(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, GREP_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    // `.bin` ist nicht in der Whitelist — auch wenn da Text drin steht, wird
+    // sie übersprungen. `.md` mit identischem Inhalt liefert den Treffer.
+    seed_file(&pool, &root, ws, user, "data.bin", b"needle in haystack\n").await;
+    seed_file(&pool, &root, ws, user, "ok.md", b"needle in haystack\n").await;
+
+    let out = execute_read_tool(&state, ws, GREP_TOOL, &json!({ "pattern": "needle" }))
+        .await
+        .unwrap();
+    assert!(out.starts_with("1 Treffer"), "{out}");
+    assert!(out.contains("ok.md:1:"), "{out}");
+    assert!(!out.contains("data.bin"), "{out}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn grep_does_not_leak_across_workspaces(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, GREP_TOOL};
+
+    let org_a = seed_org(&pool, "Acme", "AAAA23").await;
+    let user_a = seed_user(&pool, org_a, "a@acme.test", "owner").await;
+    let ws_a = seed_workspace(&pool, org_a, "A").await;
+
+    let org_b = seed_org(&pool, "Globex", "BBBB23").await;
+    let user_b = seed_user(&pool, org_b, "b@globex.test", "owner").await;
+    let ws_b = seed_workspace(&pool, org_b, "B").await;
+
+    let (state, root) = tool_state(pool.clone());
+    seed_file(
+        &pool,
+        &root,
+        ws_a,
+        user_a,
+        "secret.md",
+        b"alpha needle omega\n",
+    )
+    .await;
+    // ws_b enthält das Wort nicht.
+    seed_file(&pool, &root, ws_b, user_b, "other.md", b"nothing to see\n").await;
+
+    let probe = execute_read_tool(&state, ws_b, GREP_TOOL, &json!({ "pattern": "needle" }))
+        .await
+        .unwrap();
+    assert!(probe.starts_with("Keine Treffer"), "{probe}");
+    assert!(!probe.contains("secret.md"), "{probe}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn grep_rejects_invalid_regex(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, GREP_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, _root) = tool_state(pool.clone());
+
+    let err = execute_read_tool(&state, ws, GREP_TOOL, &json!({ "pattern": "(" }))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, processfox_web::error::ApiError::BadRequest(_)),
+        "ungültiges Regex muss 400 werden, war: {err:?}"
+    );
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn grep_caps_hits_at_one_hundred(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, GREP_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    // 150 Trefferzeilen → Tool kappt bei 100 und meldet den Cap.
+    let body: String = (0..150).map(|i| format!("hit {i}\n")).collect();
+    seed_file(&pool, &root, ws, user, "many.md", body.as_bytes()).await;
+
+    let out = execute_read_tool(&state, ws, GREP_TOOL, &json!({ "pattern": "hit" }))
+        .await
+        .unwrap();
+    assert!(out.starts_with("100 Treffer"), "{out}");
+    assert!(out.contains("[Trefferlimit erreicht"), "{out}");
+
+    std::fs::remove_dir_all(&root).ok();
 }

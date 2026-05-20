@@ -27,7 +27,7 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 ---
 
-## 1a. Ist-Stand (Stand: 2026-05-19 — Phase 6 vollständig)
+## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + `grep_in_files`)
 
 > **Wichtig:** Der Rest dieses Dokuments (§2–§16) beschreibt Architektur &
 > Konventionen. Dieser Abschnitt beschreibt den **realen Umsetzungsstand**.
@@ -47,7 +47,9 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
   Vorschau (lokales Volume), Streaming-Chat (shared session), Tool-
   Loop + HITL, Rückfragen (`ask_user`), alle Datei-Schreiboperationen
   (Excel/Word/aus Vorlage/Anhängen/Zell-Edits) und Bulk-Delegation —
-  jeweils live für alle Workspace-Mitglieder über die WS.
+  jeweils live für alle Workspace-Mitglieder über die WS. Plus
+  `grep_in_files` (read-only Regex-Suche über die Workspace-Textdateien,
+  Caps 300 Dateien/2 MiB/100 Hits, Endungs-Whitelist).
 - **CI/Deploy:** GitHub Actions baut das Multi-Stage-Image → GHCR;
   Coolify zieht das Image (Docker-Image-Resource, kein VPS-Build),
   Postgres + lokales Persistent Volume `/data`, Domain in Coolify.

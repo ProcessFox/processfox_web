@@ -63,6 +63,9 @@ quick-xml = "0.37"
 # Office-Schreiben (Phase 6b-2b)
 rust_xlsxwriter = "0.79"
 
+# Workspace-Volltextsuche (Phase 6b-2h, grep_in_files)
+regex = "1"
+
 [dev-dependencies]
 # HTTP/DB-Integrationstests (Härtung): Axum-Handler via `tower::oneshot`
 # gegen eine pro Test frische Postgres-DB (`#[sqlx::test]`).

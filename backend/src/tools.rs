@@ -25,8 +25,21 @@ pub const APPEND_DOCX_TOOL: &str = "append_to_docx";
 pub const UPDATE_CELLS_TOOL: &str = "update_cells";
 pub const DELEGATE_TOOL: &str = "delegate_into_xlsx_column";
 pub const ASK_TOOL: &str = "ask_user";
+pub const GREP_TOOL: &str = "grep_in_files";
 /// Sicherheits-Obergrenze für Bulk-Delegation (eine Inferenz je Zeile).
 pub const DELEGATE_MAX_ROWS: usize = 200;
+
+/// Caps für `grep_in_files` (analog Local).
+const GREP_MAX_FILES: usize = 300;
+const GREP_MAX_FILE_BYTES: i64 = 2 * 1024 * 1024;
+const GREP_MAX_HITS: usize = 100;
+const GREP_SNIPPET_CHARS: usize = 200;
+/// Whitelist textbasierter Endungen — Office-Formate (pdf/docx/xlsx/pptx)
+/// und Bilder werden bewusst ausgeschlossen.
+const GREP_SCAN_EXTENSIONS: &[&str] = &[
+    "md", "txt", "csv", "json", "yaml", "yml", "toml", "html", "htm", "xml", "rs", "ts", "tsx",
+    "js", "jsx", "py", "go", "c", "cpp", "h", "hpp", "sh",
+];
 
 fn all_tools() -> Vec<ToolSpec> {
     vec![
@@ -42,6 +55,29 @@ fn all_tools() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": { "filename": { "type": "string" } },
                 "required": ["filename"]
+            }),
+        },
+        ToolSpec {
+            name: GREP_TOOL,
+            description: "Sucht per Regex in den Textdateien des Workspaces \
+                (.md, .txt, .csv, .json, .yaml, .toml, .html, .xml und \
+                gängige Source-Endungen; Binär-/Office-Formate werden \
+                übersprungen). Liefert bis zu 100 Treffer mit \
+                Dateiname:Zeile: Snippet. Standardmäßig case-insensitiv.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regulärer Ausdruck (Rust-`regex`-Syntax)."
+                    },
+                    "caseSensitive": {
+                        "type": "boolean",
+                        "description": "Wenn `true`, Groß-/Kleinschreibung \
+                            beachten. Default: false."
+                    }
+                },
+                "required": ["pattern"]
             }),
         },
         ToolSpec {
@@ -220,9 +256,10 @@ pub fn skills_json() -> Value {
         "title": "Dateien",
         "description": "Workspace-Dateien lesen und (mit Freigabe) ergänzen.",
         "icon": "Folder",
-        "tools": ["list_files", "read_file", WRITE_TOOL, WRITE_XLSX_TOOL,
-                  WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL, APPEND_DOCX_TOOL,
-                  UPDATE_CELLS_TOOL, DELEGATE_TOOL, ASK_TOOL],
+        "tools": ["list_files", "read_file", GREP_TOOL, WRITE_TOOL,
+                  WRITE_XLSX_TOOL, WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL,
+                  APPEND_DOCX_TOOL, UPDATE_CELLS_TOOL, DELEGATE_TOOL,
+                  ASK_TOOL],
         "hitl": { "default": true },
         "language": "de",
         "body": "",
@@ -260,6 +297,102 @@ fn read_file(state: &AppState, wid: Uuid, filename: &str) -> ApiResult<String> {
     }
 }
 
+/// Workspace-weite Regex-Suche (Phase 6b-2h). Read-only Pendant zu
+/// `grep_in_files` aus ProcessFox Local. Wir iterieren über die DB-Zeilen
+/// (`workspace_files`) — die DB ist die Wahrheit, das Volume nur die Bytes.
+async fn grep_in_files(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<String> {
+    let pattern = input
+        .get("pattern")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("pattern fehlt".into()))?;
+    let case_sensitive = input
+        .get("caseSensitive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let regex_src = if case_sensitive {
+        pattern.to_string()
+    } else {
+        format!("(?i){pattern}")
+    };
+    let re = regex::Regex::new(&regex_src)
+        .map_err(|e| ApiError::BadRequest(format!("Ungültiges Regex: {e}")))?;
+
+    // Kandidaten kommen aus der DB, nicht aus `read_dir` — Sichtbarkeits-/
+    // Permission-Invarianten leben in `workspace_files`. `ensure_in_workspace`
+    // läuft trotzdem als Defense-in-Depth über jeden Storage-Key.
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT filename, s3_key, size_bytes FROM workspace_files \
+         WHERE workspace_id = $1 ORDER BY filename",
+    )
+    .bind(wid)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+
+    let mut files_scanned = 0usize;
+    let mut hits: Vec<String> = Vec::new();
+    let mut hit_cap_reached = false;
+    for (filename, s3_key, size_bytes) in &rows {
+        if files_scanned >= GREP_MAX_FILES {
+            break;
+        }
+        if hits.len() >= GREP_MAX_HITS {
+            hit_cap_reached = true;
+            break;
+        }
+        // Endungs-Whitelist (Office/Bilder sind binär → andere Tools).
+        let ext_ok = std::path::Path::new(filename.as_str())
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| GREP_SCAN_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+            .unwrap_or(false);
+        if !ext_ok {
+            continue;
+        }
+        if *size_bytes > GREP_MAX_FILE_BYTES {
+            continue;
+        }
+        if ensure_in_workspace(wid, s3_key).is_err() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(state.storage.path(s3_key)) else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        files_scanned += 1;
+        for (i, line) in text.lines().enumerate() {
+            if hits.len() >= GREP_MAX_HITS {
+                hit_cap_reached = true;
+                break;
+            }
+            if re.is_match(line) {
+                let snippet: String = line.chars().take(GREP_SNIPPET_CHARS).collect();
+                hits.push(format!("{filename}:{}: {snippet}", i + 1));
+            }
+        }
+    }
+
+    let body = if hits.is_empty() {
+        format!("Keine Treffer für /{pattern}/ in {files_scanned} Datei(en).")
+    } else {
+        let mut out = format!(
+            "{} Treffer für /{pattern}/ in {files_scanned} Datei(en):\n\n",
+            hits.len()
+        );
+        for h in &hits {
+            out.push_str(h);
+            out.push('\n');
+        }
+        if hit_cap_reached {
+            out.push_str("\n[Trefferlimit erreicht — Muster oder Suche einschränken]");
+        }
+        out
+    };
+    Ok(body)
+}
+
 /// Read-Tools ohne Seiteneffekt (kein HITL nötig).
 pub async fn execute_read_tool(
     state: &AppState,
@@ -276,6 +409,7 @@ pub async fn execute_read_tool(
                 .ok_or_else(|| ApiError::BadRequest("filename fehlt".into()))?;
             read_file(state, wid, fname)
         }
+        GREP_TOOL => grep_in_files(state, wid, input).await,
         other => Err(ApiError::BadRequest(format!("Unbekanntes Tool: {other}"))),
     }
 }

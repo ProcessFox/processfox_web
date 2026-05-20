@@ -332,6 +332,114 @@ als Komfort-Vorlagenquelle.
 6b-2e Word-Anhängen · 6b-2f Zell-Edits · 6b-2g Bulk-Delegation
 (jeweils HITL, live für alle).
 
+## Phase 6b-2h — grep_in_files (Workspace-Volltextsuche) ✅ ABGESCHLOSSEN (2026-05-20)
+
+**Ergebnis:** Tool registriert (`backend/src/tools.rs`,
+`GREP_TOOL = "grep_in_files"`), als Eintrag im `files`-Skill
+(`skills_json()`), Dispatch in `execute_read_tool` ohne HITL/Broadcast.
+Lesepfad: Kandidaten aus `workspace_files` (DB), Extension-Whitelist +
+Größen-Cap pro Datei, `ensure_in_workspace` als Defense-in-Depth, Bytes
+aus dem Volume, Treffer als `Datei:Zeile: Snippet`. Caps: 300 Dateien,
+2 MiB pro Datei, 100 Hits, 200 Snippet-Chars. Integrationstests in
+`backend/tests/integration.rs` decken: Happy-Path mit Pfad+Zeile,
+`caseSensitive`-Schalter, Whitelist (`.bin` ignoriert), Cross-Workspace-
+No-Leak, ungültiges Regex → 400, Hit-Cap mit Hinweis-Footer. Gates
+grün: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
+`cargo test --lib` (8), `cargo test --no-run` (Integration kompiliert),
+`npm run build`. DB-Integrationstests laufen wie alle DB-Tests in CI
+gegen den Postgres-Service-Container (§13).
+
+Ziel: Read-only-Tool, mit dem ein Agent in **einem** Aufruf mehrere
+Workspace-Dateien per Regex durchsucht und bis zu 100 Treffer mit
+`Datei:Zeile: Snippet` zurückbekommt. Pendant zu `grep_in_files` aus
+ProcessFox Local (`processfox_local/src-tauri/src/core/tool/tools/
+grep_in_files.rs`), gehört dort zum `folder-search`-Skill; im Web
+sitzt es im bestehenden `files`-Skill, damit kein neuer Skill nötig
+ist. Konzeptionell schon in `CONCEPT.md` §3.3/§6 vermerkt — bei der
+Skill-Migration in 6b-1 versehentlich rausgefallen.
+
+**Aufruf-Vertrag (Tool-Input):**
+- `pattern: string` — Rust-`regex`-Syntax.
+- `caseSensitive?: boolean` — Default `false` (`(?i)`-Prefix vorne anhängen).
+
+Bewusst **kein** `path`-Parameter: Der Web-Workspace ist flach
+(siehe `sandbox::workspace_key`, alle Dateien direkt unter
+`workspaces/<wid>/<filename>`), eine Unterordner-Begrenzung gäbe es nicht zu
+filtern. Spart außerdem einen Eingabevektor für Pfad-Tricks.
+
+**Implementierung in `backend/src/tools.rs`:**
+
+1. Konstante `GREP_TOOL: &str = "grep_in_files"`.
+2. `ToolSpec` in `all_tools()` mit obigem Schema und einer Beschreibung,
+   die Caps + Whitelist nennt (das LLM braucht das, um sinnvolle Pattern
+   zu wählen).
+3. `skills_json()` `tools`-Array um `"grep_in_files"` erweitern (sonst
+   filtert der Provider-Layer das Tool wieder weg).
+4. Neue Funktion `async fn grep_in_files(state, wid, input) -> ApiResult<String>`:
+   - Regex bauen (`(?i)`-Prefix wenn `caseSensitive != Some(true)`),
+     Parse-Fehler → `ApiError::BadRequest`.
+   - `SELECT filename, s3_key, size_bytes, content_type FROM
+     workspace_files WHERE workspace_id = $1 ORDER BY filename`
+     (Runtime-Query, kein Makro — CLAUDE.md §11). Nie `read_dir`
+     aufs Volume: „DB ist Wahrheit, Volume ist Bytes" — alle
+     Sichtbarkeits-/Permission-Invarianten leben in der DB.
+   - Pro Zeile:
+     - **Extension-Whitelist** analog Local: `md, txt, csv, json, yaml,
+       yml, toml, html, htm, xml, rs, ts, tsx, js, jsx, py, go, c,
+       cpp, h, hpp, sh`. Office-Formate (`pdf/docx/xlsx/pptx`) und
+       Bilder sind binär und werden bewusst ausgeschlossen — für die
+       gibt es eigene Reader (`preview.rs`, `read_xlsx_grid` etc.).
+     - **Größen-Cap** `size_bytes > 2 MiB` → überspringen.
+     - **Datei-Cap** total 300 (frühes Break, damit pathologische
+       Workspaces nicht das Tool füllen).
+   - `ensure_in_workspace(wid, &s3_key)` als Defense-in-Depth (auch wenn
+     die DB-Zeile per Definition schon scoped ist).
+   - Bytes via `std::fs::read(state.storage.path(&s3_key))`, dann
+     `String::from_utf8` — nicht-UTF-8 still überspringen.
+   - Zeile für Zeile matchen, max. 100 Treffer total. Pro Treffer:
+     `format!("{filename}:{lineno}: {snippet}")`, `snippet =
+     line.chars().take(200).collect()`.
+   - Ausgabe wie in Local: Header-Zeile mit Anzahl Treffer + Anzahl
+     gescannter Dateien, dann die Trefferliste, plus Cap-Hinweis
+     („[hit cap reached — narrow the pattern]") wenn 100 erreicht.
+5. Dispatcher-Arm in `execute_read_tool` (tools.rs:264) für `GREP_TOOL` —
+   **kein** HITL, **kein** `fs-changed`-Broadcast (read-only).
+
+**Sandbox & Sicherheit:**
+- DB-Scoping (`WHERE workspace_id = $1`) + `ensure_in_workspace` pro
+  `s3_key` → zwei Schichten gegen Cross-Workspace-Lecks.
+- Kein `path`-Input vom LLM, also kein Traversal-Vektor.
+- Regex-Compile via `regex` (kein Backtracking, lineare Worst-Case-
+  Zeit) — kein ReDoS-Risiko nötig zu mitigieren.
+
+**Frontend:**
+- `src/lib/toolIcons.ts:19` (`grep_in_files: FileSearch`) ist schon
+  vorhanden — keine Änderung nötig.
+- Läuft im bestehenden Tool-Stream (`toolCallStarted/Completed` auf
+  `chat:agent:<agentId>`); keine neuen WS-Channels.
+
+**Tests (`backend/tests/integration.rs`):**
+- Workspace + zwei `.md` + eine `.bin` (nicht-Whitelist) anlegen, über
+  den Chat-Tool-Loop `grep_in_files` mit Pattern aufrufen, Treffer-
+  Anzahl + Format prüfen, `.bin` ignoriert.
+- Case-Insensitivity: `"Foo"` matched `"foo bar"` ohne `caseSensitive`,
+  matched **nicht** mit `caseSensitive: true`.
+- Cross-Workspace: Treffer-Pattern existiert nur in **anderer** Org →
+  null Hits, kein Leak.
+- Ungültiges Regex → `isError: true` mit lesbarer Meldung.
+- Hit-Cap: viele Treffer in einer Datei → genau 100 Treffer, Cap-Hinweis
+  in der Ausgabe.
+
+**Build-Gates:** `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test --all-targets`, `npm run build`.
+
+**Abnahme:** Agent mit aktiviertem `files`-Skill kann in einem Chat-Turn
+`grep_in_files` aufrufen, bekommt eine deterministische Trefferliste im
+Format `Datei:Zeile: Snippet`, scannt nur den eigenen Workspace,
+respektiert die Caps (300 Dateien, 2 MiB pro Datei, 100 Hits, Whitelist)
+und ist read-only. CLAUDE.md §1a um „grep_in_files" im Tool-Inventar
+ergänzen.
+
 ## Querschnitt — Härtung ✅ ABGESCHLOSSEN (2026-05-19)
 
 - HTTP/DB-Integrationstests `backend/tests/integration.rs`: echte Axum-
