@@ -87,8 +87,21 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
   intermediäre Assistant-Row mit ihren Tool-Calls plus eine Tool-Row
   mit den Results; Mitglieder, die den Agenten erst **nach** Run-Ende
   öffnen, sehen damit Tool-Chips und Resultate im Verlauf — vorher gab
-  es nur die finale Text-Bubble. Das `reasoning`-Feld ist Vertrag und
-  wird in Phase 6d-2 vom Stream gefüllt.
+  es nur die finale Text-Bubble.
+- **Reasoning-Stream / Extended Thinking (Phase 6d-2, 2026-05-20):**
+  Per-Agent-Toggle `agents.reasoning_enabled` (Migration 0005, Default
+  aus). Aktiviert schaltet `llm.rs` den Provider-spezifischen
+  Reasoning-Pfad zu: **Anthropic** bekommt `thinking: { type:
+  "enabled", budget_tokens: 4000 }` und liefert das CoT via
+  `thinking_delta`-SSE bzw. `content[type=thinking]`-Blöcken;
+  **OpenAI/OpenRouter** bekommt `reasoning: { effort: "medium" }`
+  **und** das Modell muss ein Pattern aus `MODELS_WITH_REASONING`
+  matchen (`o1*`/`o3*`/`o4*`, DeepSeek-R1, Qwen-QwQ, `*-thinking`,
+  `grok-*-reasoning`) — sonst wird das Feld weggelassen (manche
+  OR-Routen lehnen unbekannte Keys mit 400 ab). Der Stream broadcastet
+  `reasoningDelta`-WS-Events live; Persistenz erfolgt im
+  `assistant.content.reasoning`-Feld dank Phase 6d-1. Anthropic-Body
+  wird für Claude-3-* defensiv gar nicht gesendet (lehnt es ab).
 - **CI/Deploy:** GitHub Actions baut das Multi-Stage-Image → GHCR;
   Coolify zieht das Image (Docker-Image-Resource, kein VPS-Build),
   Postgres + lokales Persistent Volume `/data`, Domain in Coolify.
@@ -359,7 +372,10 @@ workspaces (id, org_id, name, created_at)
 workspace_members (workspace_id, user_id, role)  -- role: editor | viewer
 
 -- Agenten
-agents (id, workspace_id, name, icon, system_prompt, provider, model_id, skills jsonb, skill_settings jsonb, created_at, updated_at)
+agents (id, workspace_id, name, icon, system_prompt, provider, model_id, skills jsonb, skill_settings jsonb, hitl_disabled, reasoning_enabled, attachments jsonb, delegation_profile jsonb, created_at, updated_at)
+-- reasoning_enabled BOOLEAN DEFAULT false (Phase 6d-2): per-Agent-Toggle für
+-- Anthropic Extended Thinking / OpenRouter Reasoning. Greift nur bei
+-- Modellen aus MODELS_WITH_REASONING (siehe backend/src/llm.rs).
 
 -- Chat-Nachrichten
 -- content-JSONB:
@@ -432,6 +448,7 @@ Da kein lokales Modell unterstützt wird, vereinfacht sich die Provider-Logik ge
 - **Streaming:** LLM-Antworten werden per WebSocket live an den Client gestreamt, exakt wie die Tauri-Events in Local.
 - **Tool-Calling:** Nur Provider, die `supports_tools()` zurückgeben, erhalten Tool-Schemas. `openai_compat.rs` und `anthropic.rs` aus Local können mit minimalen Anpassungen (kein `spawn_blocking` nötig, da kein lokales Modell) übernommen werden.
 - **Progressive Disclosure & Cache (Phase 6c-3):** Der Tool-Loop sendet pro Iteration nur die Tool-Schemas der bereits geladenen Skills (`base_tool_schemas` + `schemas_for_loaded`). Anthropic-Prompt-Caching profitiert davon, solange der Load-Stand stabil bleibt; bei jedem `read_skill` wächst der Tools-Block und invalidiert seinen Cache — bewusst hingenommen, weil Tool-Choice-Qualität die paar Token-Cents schlägt. Der System-Prompt ist so geschichtet, dass das statische Skill-Listing **vor** dem volatilen Workspace-Block steht — Cache-Effekt bleibt für den oberen Teil erhalten.
+- **Reasoning / Extended Thinking (Phase 6d-2):** Per-Agent-Toggle `agents.reasoning_enabled` (Default `false`). Aktiviert schickt `llm.rs` provider-spezifische Felder mit: bei Anthropic `thinking: { type: "enabled", budget_tokens: 4000 }` (nur Claude 4+; Claude-3-* lehnt das Feld ab und bekommt es defensiv gar nicht erst), bei OpenAI-compat `reasoning: { effort: "medium" }` **nur** wenn das Modell ein dokumentiertes Reasoning-Pattern matched (`MODELS_WITH_REASONING` in `backend/src/llm.rs` — `o1*`/`o3*`/`o4*`, DeepSeek-R1, Qwen-QwQ, `*-thinking`, `grok-*-reasoning`). Reasoning-Deltas kommen über `thinking_delta`-SSE (Anthropic) bzw. `/choices/0/delta/reasoning` und `/choices/0/delta/reasoning_content` (OpenAI/OR/DeepSeek-Style) rein und werden als `reasoningDelta`-WS-Event live broadcastet; persistiert wird das CoT als `assistant.content.reasoning` (Phase 6d-1). Reasoning-Tokens kosten extra — daher Default aus.
 
 ---
 

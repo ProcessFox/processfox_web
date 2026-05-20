@@ -202,6 +202,14 @@ Der Link ist 15 Minuten gültig und einmalig nutzbar.
 - **Grenze `rewrite_file`:** überschreibt nur Text-Dateien mit den
   Endungen `.md`, `.markdown`, `.txt`, `.text`, `.csv` (Word/Excel
   haben eigene Schreib-Tools, PDFs sind nicht text-überschreibbar).
+- **Reasoning/Thinking (Phase 6d-2):** Per-Agent-Toggle „Reasoning-
+  Modus aktivieren" (Default aus). An: Backend schickt Anthropic
+  `thinking`-Feld bzw. OpenAI/OR `reasoning`-Feld mit. **Kosten:**
+  Anthropic rechnet Extended-Thinking-Tokens separat ab (4 000-Token-
+  Budget pro Antwort), OpenRouter abhängig vom Modell (DeepSeek R1 /
+  OpenAI o-Serie /…) — siehe deren Preisseite. Bei Nicht-Reasoning-
+  Modellen (gpt-4o, Claude 3.x, Llama, …) ist der Toggle wirkungslos
+  und kostet **nichts** extra; das Feld wird gar nicht erst gesendet.
   Bestand max. 5 MB — sonst BadRequest mit Hinweis auf
   append-Workflow. Bestand muss UTF-8 sein (sonst BadRequest). HITL
   ist Pflicht; der Nutzer sieht einen Zeilen-Diff (`DiffSection` im

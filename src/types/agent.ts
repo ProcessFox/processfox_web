@@ -33,6 +33,10 @@ export interface Agent {
   skills: string[];
   skillSettings: Record<string, SkillSetting>;
   hitlDisabled: boolean;
+  /** Phase 6d-2: aktiviert Anthropic Extended Thinking bzw. OpenRouter
+   *  Reasoning. Default `false`; greift nur bei Modellen, die das
+   *  jeweilige Provider-Feld unterstützen (sonst no-op, kein Fehler). */
+  reasoningEnabled: boolean;
   attachments: AgentAttachments;
   delegationProfile: DelegationProfile | null;
   createdAt: string;
@@ -47,6 +51,7 @@ export interface AgentDraft {
   model?: ModelRef;
   skills?: string[];
   hitlDisabled?: boolean;
+  reasoningEnabled?: boolean;
   delegationProfile?: DelegationProfile;
 }
 
@@ -57,5 +62,6 @@ export interface AgentUpdate {
   model?: ModelRef;
   skills?: string[];
   hitlDisabled?: boolean;
+  reasoningEnabled?: boolean;
   delegationProfile?: DelegationProfile;
 }

@@ -1791,11 +1791,39 @@ mixed history haben).
 
 ---
 
-### Phase 6d-2 — Reasoning-Stream über alle Provider
+### Phase 6d-2 — Reasoning-Stream über alle Provider ✅ ABGESCHLOSSEN (2026-05-20)
 
-**Ziel:** „Thinking" wird live während des Runs angezeigt — bei
-Anthropic (Extended Thinking) wie bei OpenRouter/OpenAI (Reasoning-
-Models). Persistiert wird das Ergebnis dank 6d-1 automatisch mit.
+**Ergebnis:** Migration `0005_agent_reasoning.sql` ergänzt
+`agents.reasoning_enabled` (BOOLEAN, Default `false`). `llm.rs` extra-
+hiert Reasoning aus drei Quellen: Anthropic `thinking_delta`-SSE-Blöcke
+und `content[type=thinking]`-Blöcke (non-streaming), OpenAI-compat
+`/choices/0/delta/reasoning` (OpenRouter-Standard) sowie
+`/choices/0/delta/reasoning_content` (DeepSeek-Style). `LlmOptions`
+und ein zweiter `on_reasoning`-Callback fließen durch `stream_chat` und
+`tool_step`; `Step.reasoning` trägt CoT pro Iteration. Request-Body
+bekommt `thinking: { type: "enabled", budget_tokens: 4000 }` (Anthropic,
+nur Claude 4+) bzw. `reasoning: { effort: "medium" }` (OpenAI/OR, nur
+für Pattern-matched Reasoning-Modelle aus `MODELS_WITH_REASONING`).
+`chat.rs` broadcastet `reasoningDelta`-WS-Events, akkumuliert in
+`acc_reasoning` und reicht sie an `finish_run` (Phase 6d-1) durch —
+Persistenz im strukturierten `assistant.content`-JSONB inklusive.
+Agent-Editor: neue Checkbox „Reasoning-Modus aktivieren". 19 neue Unit-
+Tests in `llm.rs` (Pattern-Matcher + Body-Builder + SSE-Klassifikatoren
+für Anthropic/OpenAI/OpenRouter inkl. DeepSeek-Style), plus die 4
+Integrationstests aus 6d-1 weiter grün. Insgesamt 110 Tests
+(58 Unit + 52 Integration).
+
+**Festgelegt im Vorfeld** (statt offene Frage): Option 2 (per-Agent-
+Toggle, Default aus) — transparente Kosten, UI-konsistent mit dem
+Modell-Picker, kein überraschender Aufpreis. Heuristik (Option 3) wird
+**innerhalb** des Toggles verwendet, um bei Nicht-Reasoning-Modellen
+das `reasoning`-Feld gar nicht erst zu senden (manche OR-Routen
+antworten sonst 400).
+
+**Ziel (ursprünglich):** „Thinking" wird live während des Runs
+angezeigt — bei Anthropic (Extended Thinking) wie bei OpenRouter/
+OpenAI (Reasoning-Models). Persistiert wird das Ergebnis dank 6d-1
+automatisch mit.
 
 **Design-Entscheidung — Wer entscheidet, ob Thinking an ist?**
 

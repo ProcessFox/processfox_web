@@ -189,18 +189,23 @@ struct AgentCtx {
     system_prompt: String,
     skills: Vec<String>,
     hitl_disabled: bool,
+    /// Phase 6d-2: Per-Agent-Toggle für Extended Thinking / Reasoning.
+    /// Default `false`; bestimmt zusammen mit der Modell-Heuristik in
+    /// `llm.rs`, ob das `thinking`/`reasoning`-Feld an den Provider geht.
+    reasoning_enabled: bool,
 }
 
 async fn agent_ctx(state: &AppState, id: Uuid) -> ApiResult<AgentCtx> {
-    let row: Option<(Uuid, String, Value, bool)> = sqlx::query_as(
-        "SELECT workspace_id, system_prompt, skills, hitl_disabled \
+    let row: Option<(Uuid, String, Value, bool, bool)> = sqlx::query_as(
+        "SELECT workspace_id, system_prompt, skills, hitl_disabled, reasoning_enabled \
          FROM agents WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.into()))?;
-    let (wid, system_prompt, skills, hitl_disabled) = row.ok_or(ApiError::NotFound)?;
+    let (wid, system_prompt, skills, hitl_disabled, reasoning_enabled) =
+        row.ok_or(ApiError::NotFound)?;
     let skills = skills
         .as_array()
         .map(|a| {
@@ -214,6 +219,7 @@ async fn agent_ctx(state: &AppState, id: Uuid) -> ApiResult<AgentCtx> {
         system_prompt,
         skills,
         hitl_disabled,
+        reasoning_enabled,
     })
 }
 
@@ -475,6 +481,7 @@ async fn send_message(
         system_prompt,
         skills,
         hitl_disabled,
+        reasoning_enabled,
     } = agent_ctx(&state, agent_id).await?;
     require_editor(&state, &user, wid).await?;
     if body.text.trim().is_empty() {
@@ -582,9 +589,12 @@ async fn send_message(
             }
         };
 
+        let llm_options = llm::LlmOptions { reasoning_enabled };
+
         // --- Kein Skill aktiviert → reines Streaming (Phase 6a, beste UX) ----
         if agent_skills.is_empty() {
             let mut acc = String::new();
+            let mut acc_reasoning = String::new();
             let res = stream_chat(
                 &st.http,
                 &provider,
@@ -592,6 +602,7 @@ async fn send_message(
                 &model,
                 &system_prompt,
                 &history,
+                llm_options,
                 |chunk| {
                     if is_cancelled(&st, run_id) {
                         return false;
@@ -604,6 +615,18 @@ async fn send_message(
                     );
                     true
                 },
+                |chunk| {
+                    if is_cancelled(&st, run_id) {
+                        return false;
+                    }
+                    acc_reasoning.push_str(chunk);
+                    st.ws.publish(
+                        Some(wid),
+                        channel.clone(),
+                        json!({ "type": "reasoningDelta", "text": chunk }),
+                    );
+                    true
+                },
             )
             .await;
             match res {
@@ -613,9 +636,6 @@ async fn send_message(
                     } else {
                         "stop"
                     };
-                    // Phase 6d-1: kein Reasoning/Tools in diesem Pfad
-                    // (kein Tool-Loop). Phase 6d-2 wird `reasoning`
-                    // hier mitführen.
                     finish_run(
                         &st,
                         agent_id,
@@ -624,7 +644,7 @@ async fn send_message(
                         &channel,
                         FinalAssistant {
                             text: acc,
-                            reasoning: String::new(),
+                            reasoning: acc_reasoning,
                             tool_calls: Vec::new(),
                         },
                         reason,
@@ -656,6 +676,10 @@ async fn send_message(
 
         const MAX_ITERS: usize = 8;
         let mut final_text: Option<String> = None;
+        // Phase 6d-2: Reasoning aus allen Tool-Loop-Iterationen wird
+        // hier akkumuliert. Das Frontend rendert pro Assistant-Block
+        // einen Chip — entsprechend „alle Iterationen zusammen".
+        let mut acc_reasoning = String::new();
         let mut reason = "stop";
 
         for _ in 0..MAX_ITERS {
@@ -682,6 +706,7 @@ async fn send_message(
                 &composed_system,
                 &turns,
                 &tools,
+                llm_options,
             )
             .await
             {
@@ -692,6 +717,18 @@ async fn send_message(
                     return;
                 }
             };
+            // Phase 6d-2: Reasoning aus dem (non-streaming) Step in einem
+            // Schub broadcasten und akkumulieren. Im Frontend landet das
+            // wie ein nachträgliches `reasoningDelta`-Event.
+            if !step.reasoning.is_empty() {
+                let chunk = step.reasoning.clone();
+                acc_reasoning.push_str(&chunk);
+                st.ws.publish(
+                    Some(wid),
+                    channel.clone(),
+                    json!({ "type": "reasoningDelta", "text": chunk }),
+                );
+            }
             if step.calls.is_empty() {
                 final_text = Some(step.text.unwrap_or_default());
                 break;
@@ -879,6 +916,9 @@ async fn send_message(
                                         WORKER_SYS,
                                         &[llm::Turn::User(prompt)],
                                         &[],
+                                        // Delegations-Worker antwortet
+                                        // bewusst kurz; kein Reasoning.
+                                        llm::LlmOptions::default(),
                                     )
                                     .await
                                     {
@@ -1042,8 +1082,9 @@ async fn send_message(
 
         let text =
             final_text.unwrap_or_else(|| "(Maximale Tool-Iterationen erreicht.)".to_string());
-        // Phase 6d-1: Reasoning bleibt leer bis 6d-2; finale Antwort hat
-        // selbst keine Tool-Calls mehr (die wurden iterativ persistiert).
+        // Phase 6d-2: Reasoning aller Iterationen sammelt sich in
+        // `acc_reasoning`; finale Antwort hat selbst keine Tool-Calls
+        // (die wurden iterativ persistiert, Phase 6d-1).
         finish_run(
             &st,
             agent_id,
@@ -1052,7 +1093,7 @@ async fn send_message(
             &channel,
             FinalAssistant {
                 text,
-                reasoning: String::new(),
+                reasoning: acc_reasoning,
                 tool_calls: Vec::new(),
             },
             reason,

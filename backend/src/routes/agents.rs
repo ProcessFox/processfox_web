@@ -43,6 +43,8 @@ struct AgentRow {
     skills: Value,
     skill_settings: Value,
     hitl_disabled: bool,
+    /// Phase 6d-2: Per-Agent-Toggle für Extended Thinking / Reasoning.
+    reasoning_enabled: bool,
     attachments: Value,
     delegation_profile: Option<Value>,
     created_at: OffsetDateTime,
@@ -65,6 +67,7 @@ impl AgentRow {
             "skills": self.skills,
             "skillSettings": self.skill_settings,
             "hitlDisabled": self.hitl_disabled,
+            "reasoningEnabled": self.reasoning_enabled,
             "attachments": self.attachments,
             "delegationProfile":
                 self.delegation_profile.clone().unwrap_or(Value::Null),
@@ -89,6 +92,8 @@ struct AgentInput {
     model: Option<ModelInput>,
     skills: Option<Vec<String>>,
     hitl_disabled: Option<bool>,
+    /// Phase 6d-2: optional, Default `false` beim Anlegen.
+    reasoning_enabled: Option<bool>,
     delegation_profile: Option<Value>,
 }
 
@@ -101,8 +106,8 @@ struct AttachmentBody {
 }
 
 const COLS: &str = "id, workspace_id, name, icon, system_prompt, provider, \
-    model_id, skills, skill_settings, hitl_disabled, attachments, \
-    delegation_profile, created_at, updated_at";
+    model_id, skills, skill_settings, hitl_disabled, reasoning_enabled, \
+    attachments, delegation_profile, created_at, updated_at";
 
 async fn agent_workspace(state: &AppState, id: Uuid) -> ApiResult<Uuid> {
     let row: Option<(Uuid,)> = sqlx::query_as("SELECT workspace_id FROM agents WHERE id = $1")
@@ -165,8 +170,8 @@ async fn create_agent(
     let row: AgentRow = sqlx::query_as(&format!(
         "INSERT INTO agents \
          (workspace_id, name, icon, system_prompt, provider, model_id, \
-          skills, hitl_disabled, delegation_profile) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING {COLS}"
+          skills, hitl_disabled, reasoning_enabled, delegation_profile) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING {COLS}"
     ))
     .bind(wid)
     .bind(name.trim())
@@ -176,6 +181,7 @@ async fn create_agent(
     .bind(model_id)
     .bind(skills)
     .bind(body.hitl_disabled.unwrap_or(false))
+    .bind(body.reasoning_enabled.unwrap_or(false))
     .bind(body.delegation_profile)
     .fetch_one(&state.pool)
     .await
@@ -202,8 +208,9 @@ async fn update_agent(
     let skills = json!(body.skills.unwrap_or_default());
     let row: AgentRow = sqlx::query_as(&format!(
         "UPDATE agents SET name=$2, icon=$3, system_prompt=$4, provider=$5, \
-         model_id=$6, skills=$7, hitl_disabled=$8, delegation_profile=$9, \
-         updated_at=now() WHERE id=$1 RETURNING {COLS}"
+         model_id=$6, skills=$7, hitl_disabled=$8, reasoning_enabled=$9, \
+         delegation_profile=$10, updated_at=now() \
+         WHERE id=$1 RETURNING {COLS}"
     ))
     .bind(id)
     .bind(name.trim())
@@ -213,6 +220,7 @@ async fn update_agent(
     .bind(model_id)
     .bind(skills)
     .bind(body.hitl_disabled.unwrap_or(false))
+    .bind(body.reasoning_enabled.unwrap_or(false))
     .bind(body.delegation_profile)
     .fetch_one(&state.pool)
     .await

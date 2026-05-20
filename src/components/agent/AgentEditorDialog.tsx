@@ -145,6 +145,7 @@ export function AgentEditorDialog({
   const [availableSkills, setAvailableSkills] = useState<Skill[]>([]);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [hitlDisabled, setHitlDisabled] = useState(false);
+  const [reasoningEnabled, setReasoningEnabled] = useState(false);
   const [delegationEnabled, setDelegationEnabled] = useState(false);
   const [delegationSystemPrompt, setDelegationSystemPrompt] = useState("");
   const [delegationSelection, setDelegationSelection] = useState<ModelSelection>(
@@ -175,6 +176,7 @@ export function AgentEditorDialog({
       setSelection(modelRefToSelection(agent.model));
       setActiveSkills(agent.skills);
       setHitlDisabled(agent.hitlDisabled);
+      setReasoningEnabled(agent.reasoningEnabled);
       const dp = agent.delegationProfile;
       setDelegationEnabled(dp?.enabled ?? false);
       setDelegationSystemPrompt(dp?.systemPromptOverride ?? "");
@@ -186,6 +188,7 @@ export function AgentEditorDialog({
       setSelection({ kind: "inherit" });
       setActiveSkills([]);
       setHitlDisabled(false);
+      setReasoningEnabled(false);
       setDelegationEnabled(false);
       setDelegationSystemPrompt("");
       setDelegationSelection({ kind: "inherit" });
@@ -230,6 +233,7 @@ export function AgentEditorDialog({
               model,
               skills: activeSkills,
               hitlDisabled,
+              reasoningEnabled,
               delegationProfile,
             })
           : await agentApi.update(agent!.id, {
@@ -239,6 +243,7 @@ export function AgentEditorDialog({
               model,
               skills: activeSkills,
               hitlDisabled,
+              reasoningEnabled,
               delegationProfile,
             });
       onSaved(saved);
@@ -367,6 +372,29 @@ export function AgentEditorDialog({
                 Schreib-Tools laufen sofort durch — der Freigabe-Dialog wird
                 übersprungen. Vorsicht: nur für Agenten verwenden, denen du
                 das eigenständige Arbeiten in „ihrem" Workspace zutraust.
+              </span>
+            </div>
+          </label>
+
+          <label className="flex cursor-pointer items-start gap-2 rounded-md border border-border bg-background p-2">
+            <input
+              type="checkbox"
+              checked={reasoningEnabled}
+              onChange={(e) => setReasoningEnabled(e.target.checked)}
+              className="mt-0.5"
+            />
+            <div className="flex flex-col gap-0.5">
+              <span className="text-xs font-medium">
+                Reasoning-Modus aktivieren
+              </span>
+              <span className="text-xs text-muted-foreground">
+                Schaltet Anthropic Extended Thinking bzw. OpenRouter
+                Reasoning ein. Der Chip „Denken" erscheint live während
+                der Antwort und bleibt im Verlauf einklappbar erhalten.
+                Greift nur bei Modellen, die das Feld unterstützen
+                (z. B. Claude Sonnet 4 Thinking, OpenAI o-Serie,
+                DeepSeek R1) — sonst wirkungslos. Verbraucht
+                zusätzliche Tokens.
               </span>
             </div>
           </label>
