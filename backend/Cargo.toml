@@ -70,6 +70,10 @@ regex = "1"
 # `spawn_blocking`-Pool — siehe `tools::read_pdf` und CLAUDE.md §11.
 pdf-extract = "0.7"
 
+# Skill-Frontmatter-Parsing (Phase 6c-1). Lädt YAML aus den `SKILL.md`-
+# Dateien unter `backend/skills_builtin/`; reines Bibliotheks-Crate.
+serde_yaml = "0.9"
+
 [dev-dependencies]
 # HTTP/DB-Integrationstests (Härtung): Axum-Handler via `tower::oneshot`
 # gegen eine pro Test frische Postgres-DB (`#[sqlx::test]`).

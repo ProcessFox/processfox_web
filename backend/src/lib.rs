@@ -15,6 +15,7 @@ pub mod preview;
 pub mod ratelimit;
 pub mod routes;
 pub mod sandbox;
+pub mod skills;
 pub mod storage;
 pub mod tools;
 pub mod ws;

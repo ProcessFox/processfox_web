@@ -1113,6 +1113,407 @@ ist die Datei überschrieben (oder neu angelegt), `workspace_files`
 ist aktualisiert, ein `fs-changed`-Broadcast erreicht alle Workspace-
 Mitglieder live; nach Reject bleibt die Datei unberührt.
 
+## Phase 6c — Skill-Registry + Progressive Tool-Disclosure
+
+Ziel: Den hartkodierten `"files"`-Catch-all-Skill durch eine echte
+Skill-Registry mit `SKILL.md`-Frontmatter-Parsing ersetzen und das LLM
+vor Tool-Choice-Verwirrung schützen. Im Vergleich zu Local
+**strikter:** dort sind alle Skill-Tool-Schemas immer an den Provider
+deklariert (`processfox_local/.../chat/run.rs:948
+collect_tool_schemas`); Progressive Disclosure passiert nur am
+Skill-Body-Layer. Hier wollen wir Progressive Disclosure **bis auf
+den Tool-Schema-Layer** — das LLM sieht initial nur eine Skill-Liste
+(Titel + Description + Tool-Namen) und kann durch `read_skill` die
+volle Anleitung **und** die Provider-Tool-Schemas freischalten. So
+wird das Modell nicht durch unpassende `update_cells`/`delegate_…`-
+Schemas gestört, wenn es nur lesen will.
+
+---
+
+### Entscheidungen vorab (gilt für 6c-1 … 6c-3)
+
+| Thema | Entscheidung |
+|---|---|
+| Variante | **Tool-Schema-Disclosure** (strikter als Local). `read_skill` ist immer deklariert; jedes andere Tool-Schema kommt erst in den Provider-Calls nach einem erfolgreichen `read_skill`-Aufruf für seinen Skill. |
+| Skill-Quelle | Built-in im Docker-Image (`backend/skills_builtin/`). User-Skills pro Org sind 6c-4, kein v1-Muss. |
+| Skill-Schnitt | Web bekommt **5 Skills statt 11** (Web-Tool-Inventar ist kompakter, kein `document-edit` per Find-Replace, kein `chat-context`). Schnitt unten in 6c-2. |
+| `ask_user` | Bleibt **außerhalb** des Skill-Systems und ist immer deklariert — es ist kein User-fakultatives Tool, sondern Infrastruktur. |
+| Cache-Trade-off | Anthropic-Prompt-Caching wird durch wachsende Tool-Listen pro Skill-Load weniger effektiv (jeder Schema-Wechsel invalidiert den Tools-Cache-Block). Bewusst hingenommen — Tool-Choice-Verwirrung kostet das LLM in der Antwortqualität mehr als ein paar Token-Cents kosten. Mitigation: gleicher Skill-Load-Stand → gleicher Tools-Block → Cache-Hit. |
+| Persistenz | Geladene Skills gelten **pro Run** (also pro User-Turn mit Tool-Loop). Im System-Prompt-Hinweis steht „Skills already loaded earlier in this conversation stay in scope" — wir vermerken den Load-State nicht persistent. |
+| Migration | Bestehende Agents in der DB haben `skills = ["files"]`. Eine SQL-Migration (`0004_skills_resharded.sql`) setzt sie auf das neue 5er-Set um (semantisch äquivalent: gleiche Tool-Menge). Der „files"-Slot fällt aus `skills_json()` raus. |
+
+---
+
+### Phase 6c-1 — SKILL.md-Parser + Registry (Fundament) ✅ ABGESCHLOSSEN (2026-05-20)
+
+**Ergebnis:** Neues Modul `backend/src/skills.rs` mit `Skill`/
+`SkillHitl`-Strukturen (camelCase + `snake_case`-Alias für YAML-
+Autoren), `parse_skill_md(&str) -> ApiResult<Skill>` und
+`SkillRegistry::load_from_dir(&Path) -> ApiResult<Self>` (rekursiv,
+deterministische `list()`-Sortierung). Neue Dependency `serde_yaml`.
+12 Unit-Tests grün — Frontmatter-Parsing (minimal/full), camelCase-
+und snake_case-Aliase, alle vier strukturellen Fehlerfälle (kein
+Frontmatter, unbeendet, kaputtes YAML, leerer `name`/`title`),
+Registry (Listing, doppelte Namen, Parse-Fehler-mit-Pfad, Ignorieren
+von Nicht-SKILL.md-Dateien). Gates grün: `cargo fmt --check`,
+`cargo clippy --all-targets -D warnings`, `cargo test --lib`
+(25 Tests). Reine Library-Schicht, keine Aufrufer im Backend
+geändert — Fundament für 6c-2/6c-3.
+
+**Ziel:** Reine, in-memory-Bibliothek; noch nichts mit Files-on-Disk
+oder LLM-Verdrahtung.
+
+**Neues Modul `backend/src/skills.rs`** (flaches Layout wie der Rest
+des Backends, vgl. §6):
+
+1. Datentypen mit `serde`-camelCase-Bridge:
+   ```rust
+   pub struct Skill {
+       pub name: String,
+       pub title: String,
+       pub description: String,
+       pub icon: Option<String>,
+       pub tools: Vec<String>,
+       pub hitl: SkillHitl,
+       pub accepts_attachments: Vec<String>,
+       pub language: String,
+       pub body: String,
+   }
+   pub struct SkillHitl {
+       pub default: bool,
+       pub per_tool: BTreeMap<String, bool>,
+   }
+   ```
+2. `parse_skill_md(text: &str) -> ApiResult<Skill>`:
+   - Erwartet ein YAML-Frontmatter zwischen `---\n` (Anfang) und
+     `\n---\n` (Ende), Rest = Body.
+   - Frontmatter via `serde_yaml::from_str` in die Struct. Body
+     `.trim_start_matches('\n').to_string()`.
+   - Defaults: `language = "en"`, `hitl.default = false`,
+     `accepts_attachments = []`.
+   - Fehlerfälle: kein `---`-Anfang, kein `---`-Ende, ungültiges
+     YAML, `name` leer → `BadRequest` mit aussagekräftigem Hinweis.
+3. `pub struct SkillRegistry { by_name: HashMap<String, Arc<Skill>> }`:
+   - `SkillRegistry::load_from_dir(path: &Path) -> ApiResult<Self>`:
+     rekursiv alle `SKILL.md` einsammeln, parsen, in die Map
+     einhängen. Doppelter `name` → Fehler (kein „last wins" — das
+     versteckt Bugs).
+   - `get(name) -> Option<Arc<Skill>>`.
+   - `list() -> Vec<Arc<Skill>>` (alphabetisch nach `name`, damit das
+     System-Prompt-Listing deterministisch ist → Cache-Stabilität).
+4. **Neue Dependency:** `serde_yaml = "0.9"`.
+
+**Tests (`backend/src/skills.rs`, `#[cfg(test)] mod tests`):**
+- `parse_minimal_skill_md` — minimales SKILL.md mit nur den
+  Pflichtfeldern wird sauber geparst, Defaults stimmen.
+- `parse_full_skill_md` — alle Felder gesetzt (inkl. `hitl.perTool`,
+  `acceptsAttachments`), Body wird vom Frontmatter sauber abgetrennt.
+- `rejects_missing_frontmatter` — Body ohne `---` → `BadRequest`.
+- `rejects_unclosed_frontmatter` — `---` am Anfang, kein Ende.
+- `rejects_invalid_yaml` — kaputtes YAML im Frontmatter.
+- `registry_rejects_duplicate_names` — zwei `SKILL.md` mit gleichem
+  `name` im selben Verzeichnis → Fehler.
+- `registry_lists_deterministically` — Files in beliebiger
+  Filesystem-Order → `list()` ist alphabetisch.
+
+**Gates:** `cargo fmt`, `cargo clippy -D warnings`, `cargo test --lib`.
+
+**Abnahme:** `skills.rs` ist als Modul aufgebaut und getestet, kein
+Aufrufer im Backend muss sich noch ändern. Reines Fundament.
+
+---
+
+### Phase 6c-2 — Built-in Skills im Image + Registry in AppState
+
+**Ziel:** Fünf neue Web-Skills als Markdown-Dateien im Repo,
+Verzeichnis ins Docker-Image, beim App-Start einlesen, über die
+bestehende Bridge `GET /api/v1/skills` ausliefern. Hartkodierter
+`skills_json()` verschwindet.
+
+**Skill-Schnitt für Web (5 Bundles, 13 Tools + `ask_user` global):**
+
+| Skill | Titel (DE) | Tools |
+|---|---|---|
+| `folder-search` | Ordner durchsuchen | `list_files`, `read_file`, `grep_in_files` |
+| `document-read` | Dokumente lesen | `read_pdf`, `read_docx` |
+| `document-write` | Text-/Word-Dokumente schreiben | `write_docx`, `write_docx_from_template`, `append_to_docx`, `append_to_file`, `rewrite_file` |
+| `table-read` | Tabellen lesen | `read_xlsx_range` |
+| `table-write` | Tabellen schreiben | `write_xlsx`, `update_cells`, `delegate_into_xlsx_column` |
+
+Begründung der Aufteilung:
+- **Lesen ↔ Schreiben getrennt** (am wichtigsten für Tool-Choice-
+  Verwirrung — ein Agent, der nur lesen soll, sieht keine `write_*`-
+  Schemas).
+- **Text/Word ↔ Tabellen getrennt** (XLSX-Semantik unterscheidet sich
+  deutlich von Markdown/Word).
+- **`folder-search` als Startpunkt-Skill** (das LLM lädt diesen zuerst,
+  wenn es nicht weiß was im Workspace liegt).
+- `delegate_into_xlsx_column` bleibt im `table-write`-Bundle (LLM
+  versteht „Spalten füllen" als Sub-Variante von „Tabellen schreiben").
+
+**Verzeichnis `backend/skills_builtin/<skill>/SKILL.md`** (5 Dateien).
+Pro Datei: YAML-Frontmatter wie Local + Markdown-Body mit Choose-the-
+right-tool-Guidance. Bodies werden **selbst geschrieben**, nicht
+1:1 aus Local übernommen — Web-Tool-Namen weichen ab (`list_files`
+statt `list_folder`, `read_xlsx_range`-CSV → -JSON, Default-Range,
+HITL-Defaults usw.). HITL-Defaults pro Skill:
+- `folder-search`/`document-read`/`table-read`: `hitl.default: false`
+- `document-write`/`table-write`: `hitl.default: true`
+
+**Backend:**
+1. `config.rs`: neue Env-Var `SKILLS_DIR` (Default `/app/skills_builtin`).
+2. `lib.rs`: `AppState` bekommt `pub skills: Arc<SkillRegistry>`.
+   In `main.rs` beim Bootstrap aus `config.skills_dir` laden; harter
+   Fehler bei Parse-Problem (built-ins sind unter unserer Kontrolle).
+3. `routes/mod.rs`: `GET /api/v1/skills` antwortet aus der Registry
+   statt aus `tools::skills_json()` — gleiche JSON-Shape (das
+   Frontend bleibt unverändert). `tools::skills_json()` wird gelöscht.
+4. **Migration `0004_skills_resharded.sql`:** alle Agents mit
+   `skills = ["files"]` → setzen auf
+   `["folder-search","document-read","document-write","table-read","table-write"]`.
+   Idempotent geschrieben (`WHERE skills = '["files"]'::jsonb`).
+5. **Dockerfile-Patch:** `COPY backend/skills_builtin /app/skills_builtin`
+   in der Runtime-Stage. `.dockerignore` so anpassen, dass
+   `backend/skills_builtin` mitkopiert wird.
+
+**Tests (`backend/tests/integration.rs`):**
+- `skills_endpoint_returns_built_in_set`: nach `build_app(state)` mit
+  in-Tests geladener Registry liefert `GET /api/v1/skills` ein Array
+  mit den 5 erwarteten `name`-Strings, deterministisch sortiert.
+- `migration_resharded_existing_agents`: vor der Migration einen
+  Agent mit `skills = ["files"]` seeden, dann den `0004`-Schritt
+  einzeln laufen lassen (manuell per `sqlx::query`, weil
+  `#[sqlx::test]` alle Migrationen vorab anwendet) — oder
+  alternativ verifizieren, dass nach dem Test-Setup ein
+  vor-existierender Agent mit `["files"]` auf das neue Set steht.
+  Pragmatisch: einen post-migration State seeden und prüfen, dass
+  beide Patterns (Legacy + neu) durch `available_tools` (siehe 6c-3)
+  die richtigen Tool-Schemas ergeben.
+
+**Doku-Patch:**
+- `CLAUDE.md` §6 (Verzeichnis-Layout) um `backend/skills_builtin/`
+  ergänzen.
+- `CLAUDE.md` §12 (Deployment): `SKILLS_DIR` zur Env-Var-Tabelle.
+
+**Gates:** wie üblich.
+
+**Abnahme:** `GET /api/v1/skills` liefert die 5 Skills aus den
+SKILL.md-Dateien; bestehende Agents zeigen im UI die richtigen
+Skill-Toggles; `tools::skills_json` ist gelöscht; Docker-Image
+enthält die `skills_builtin/`.
+
+---
+
+### Phase 6c-3 — `compose_system_prompt` + `read_skill` + Progressive Tool-Disclosure (das Herzstück)
+
+**Ziel:** Das LLM sieht im System-Prompt eine kompakte Skill-Liste
+(Titel + Description + Tool-Namen, **keine** Schemas). Initial sind
+auf Provider-Ebene nur `read_skill` und `ask_user` deklariert. Jeder
+erfolgreiche `read_skill(id)` schaltet den Body **und** die Tool-
+Schemas dieses Skills für die folgenden Provider-Calls frei.
+
+**Neuer Tool-Eintrag `read_skill`** (in `tools.rs`):
+- Konstante `READ_SKILL_TOOL: &str = "read_skill"`.
+- Schema: `{ skillId: string }`.
+- Beschreibung: „Lädt die volle Anleitung für einen Skill. Lies einen
+  Skill, bevor du seine Tools nutzt — der Skill-Body erklärt wann
+  und wie. Nicht für Skills, die du schon geladen hast."
+- Implementierung als **Read-Tool ohne HITL** in einem neuen
+  Sub-Modul (es ist semantisch anders als die Workspace-Read-Tools —
+  liefert Skill-Body statt Workspace-Bytes). Dispatch in `chat.rs`
+  läuft über einen separaten Zweig (siehe unten), nicht über
+  `execute_read_tool` — wir brauchen den Side-Effect „Skill als
+  geladen markieren" pro Run.
+- `is_read_skill_tool(name)` Helfer.
+
+**Neuer System-Prompt-Composer (`backend/src/prompt.rs`)**:
+```rust
+pub fn compose_system_prompt(
+    agent_prompt: &str,
+    skills: &SkillRegistry,
+    agent_skills: &[String],
+    workspace_summary: &str,
+    loaded_skills: &[String], // Bodies, die im aktuellen Run schon geladen wurden
+) -> String { ... }
+```
+Zusammensetzung in dieser Reihenfolge:
+1. Datum-Anker (`Today is YYYY-MM-DD (Weekday).`).
+2. `agent_prompt` (DB-Spalte, falls nicht leer).
+3. **Workspace-Übersicht** (kompakt): erste 30 Dateinamen + Größe
+   aus `workspace_files`, mehr → `[… N weitere Dateien]`. Stützt
+   die „erst orientieren"-Disziplin ohne `read_file`-Spam.
+4. **Available skills** als bulleted list — pro Skill: Titel,
+   `(id: <name>)`, Description, plus eine Zeile
+   `tools: tool_a, tool_b, …`. Erklärt-Block oben dass die
+   Anleitung erst nach `read_skill` sichtbar wird und dass `ask_user`
+   immer erlaubt ist.
+5. **Geladene Skill-Bodies** (die seit dem letzten User-Turn schon
+   via `read_skill` reinkamen, falls dieser Schritt im Run-Lifecycle
+   nochmal komponiert wird). Wird im einfachsten Fall leer sein,
+   weil der Composer pro Provider-Call ohnehin neu läuft und Bodies
+   im History als Tool-Results stehen.
+6. Globale Thoroughness-Policy (aus Local übernommen).
+7. Sprach-Direktive (sprich die Sprache der Nutzer:in).
+
+**Workspace-Übersicht** baut eine kleine Funktion
+`workspace_summary(state, wid) -> String` direkt aus `workspace_files`
+(DB ist die Wahrheit). Kein FS-Walk.
+
+**Tool-Loop-Anpassung (`backend/src/routes/chat.rs`)**:
+Bisher (Phase 6a/6b):
+```
+tools = available_tools(skills)   // einmal pro Run
+loop: provider call → tool calls → tool results → repeat
+```
+Neu:
+```
+loaded: HashSet<String> = ∅
+provider_tools = base_tools()  // = [read_skill, ask_user]
+loop:
+  provider call mit (system_prompt(...,loaded), provider_tools, history)
+  für jedes tool_call:
+    wenn name == read_skill:
+       body = registry.get(skillId).body
+       loaded.insert(skillId)
+       provider_tools = base_tools() + ⋃{skill.tools | skill ∈ loaded}
+       tool_result = body
+    sonst wenn name in provider_tools.names():
+       ... wie bisher (HITL für write, etc.)
+    sonst:
+       tool_result = "Tool nicht verfügbar — lies erst den passenden Skill"
+  history.append(tool_results)
+```
+
+Dafür neu in `tools.rs`:
+- `pub fn base_tool_schemas() -> Vec<ToolSpec>` — `read_skill` + `ask_user`.
+- `pub fn schemas_for_skills(registry, skill_names) -> Vec<ToolSpec>` —
+  alle Tool-Schemas der gelisteten Skills, dedupliziert.
+- `available_tools(skills)`-Funktion in der jetzigen Form wird durch
+  diese zwei ersetzt; `chat.rs` ruft sie pro Provider-Call neu auf.
+
+**HITL `perTool`-Override:**
+- Heute kennt `is_write_tool` nur globale Tool-Klassen. Mit Skill-
+  Frontmatter `hitl.perTool` kann ein Skill-Author sagen
+  „rewrite_file für diesen Workflow ohne HITL". Neue Funktion
+  `effective_hitl(skill_registry, loaded_skills, tool_name) -> bool`:
+  startet bei `is_write_tool(tool_name)`, läuft dann durch alle
+  geladenen Skills, schaut nach `hitl.perTool[tool_name]`. Bei
+  Override `false` → kein HITL. Mehrere Skills setzen Konflikt →
+  „strenger gewinnt" (HITL bleibt an, sicher ist sicher).
+- In `chat.rs:635` ersetzen `is_write_tool(call.name)` durch
+  `effective_hitl(&st.skills, &loaded, &call.name)`.
+
+**Caching-Hinweis** (Anthropic):
+- Tools-Block bekommt `cache_control: ephemeral` am letzten Element.
+  Bei gleichem Skill-Load-Stand identischer Block → Cache-Hit. Bei
+  Wachsen invalidiert. Akzeptabel.
+- System-Prompt-Block ebenfalls cacheable, wobei der Workspace-
+  Summary-Teil pro Workspace bei jedem Send neu kommt — der wird
+  bewusst **nach** dem statischen Skill-Listing positioniert, damit
+  zumindest die Skill-Liste cacheable bleibt.
+
+**Tests (`backend/tests/integration.rs`):**
+- `prompt_lists_skills_with_tool_names_not_schemas`: composer-Output
+  enthält für jeden Skill die Tool-Namen, aber **nicht** die
+  Tool-Beschreibung (Heuristik: keine Substrings aus den ToolSpec-
+  `description`s).
+- `read_skill_returns_body_and_unlocks_tools`: zwei-Step-Test, der
+  den Tool-Loop direkt fährt — erst `read_skill("folder-search")`,
+  dann Provider-Call mit dem erweiterten Tools-Block. Wir prüfen
+  die zurückgegebenen Tool-Schemas im zweiten Schritt (über eine
+  testbare `next_provider_tools(loaded, registry)`-Funktion, nicht
+  über echten Provider-Call).
+- `tool_call_for_not_loaded_skill_is_rejected_gracefully`: das LLM
+  „versucht" `grep_in_files` ohne `folder-search` geladen zu haben.
+  Tool-Result ist die freundliche „lies erst den Skill"-Meldung,
+  kein 500.
+- `effective_hitl_respects_per_tool_override`: ein SKILL.md mit
+  `hitl.perTool: { rewrite_file: false }` ist geladen →
+  `effective_hitl(…, "rewrite_file")` = false. Ohne Skill geladen →
+  Fallback auf `is_write_tool` = true.
+- `system_prompt_includes_workspace_summary`: nach Seedten dreier
+  Dateien enthält der Composer-Output ihre Namen.
+- `workspace_summary_truncates_at_30`: bei 50 Files → erste 30 +
+  „… 20 weitere".
+
+DB-freie Unit-Tests in `prompt.rs` ergänzen für die rein
+funktionalen Teile (Composer-Layout, Skill-Listing-Format), damit
+sie ohne Postgres laufen.
+
+**Doku-Patches:**
+- `CLAUDE.md` §1a-Backend-Bullet: Skill-Registry + Progressive
+  Disclosure (read_skill).
+- `CLAUDE.md` §4 (Mehrbenutzer-Modell) ist unverändert; aber §10
+  (LLM-Provider-Strategie) bekommt einen Satz zur Cache-Wirkung
+  der dynamischen Tools-Liste.
+- Neuer Abschnitt §6a „Skill-System" im CLAUDE.md mit kurzem
+  Architekturbild (Composer → System-Prompt + Tools-Block;
+  read_skill als Disclosure-Tor).
+- `DEPLOY.md` §8: Hinweis dass das LLM jetzt zwei Schritte braucht
+  (Skill lesen → Tool nutzen).
+
+**Gates:** wie üblich.
+
+**Abnahme:**
+- Frischer Run: nur `read_skill` + `ask_user` an Anthropic
+  deklariert; System-Prompt enthält die Skill-Liste.
+- Nach `read_skill("folder-search")`: der Body kommt als
+  Tool-Result; im nächsten Provider-Call sind zusätzlich
+  `list_files`/`read_file`/`grep_in_files` deklariert.
+- Bestehende Use-Cases („User stellt einfache Frage zu einer Datei")
+  laufen mit einem zusätzlichen `read_skill`-Step, aber stabil.
+- Tool-Choice-Verwirrung sichtbar reduziert in einem A/B-Vergleich
+  mit dem Pre-6c-Verhalten — qualitatives Abnahmekriterium, kein
+  automatisierter Test (würde Provider-Call-Vergleich brauchen).
+
+---
+
+### Phase 6c-4 (optional, kein v1-Muss) — User-Skills pro Org
+
+**Ziel:** Org-Owner können eigene `SKILL.md` hochladen, die nur
+innerhalb der Org sichtbar sind. Built-ins bleiben global.
+
+**Datenmodell:** Storage-Pfad `STORAGE_DIR/orgs/<org_id>/skills/
+<skill_name>/SKILL.md`. Keine eigene DB-Tabelle — die Markdown-Datei
+ist die Wahrheit, gleiches Muster wie Workspace-Files.
+
+**Routes:**
+- `POST /api/v1/orgs/{id}/skills` (Multipart, Owner-Only) —
+  Upload + Parse + Konflikt-Check (kein Built-in-Name, kein
+  duplizierter User-Name in derselben Org).
+- `DELETE /api/v1/orgs/{id}/skills/{name}` (Owner-Only).
+- `GET /api/v1/skills` erweitert: liefert built-ins ∪ user-skills
+  der eigenen Org.
+
+**Registry-Lookup:** `effective_registry(org_id) ->
+SkillRegistry`-Funktion baut on-demand die Vereinigung (built-ins
+sind Arc-cached; User-Skills werden bei jedem Lookup neu aus dem
+Volume gelesen — kein Cache-Invalidation-Problem für v1).
+
+**Sandbox:** User-Skill-Body ist **Markdown** — kein
+Code-Ausführungs-Vektor. Trotzdem `tools`-Liste eines User-Skills
+darf nur **bereits existierende Tool-Namen** referenzieren; ein
+hochgeladener Skill kann keine neuen Tools deklarieren. Validierung
+beim Upload.
+
+**Tests:** Upload-Roundtrip, Cross-Org-No-Leak, Built-in-Override-
+Schutz, Validation gegen unbekannte Tool-Namen.
+
+**Abnahme:** Org-A-Owner lädt einen Skill hoch; Org-A-Member sieht
+ihn im Skill-Picker; Org-B-Member sieht ihn nicht.
+
+---
+
+### Reihenfolge & Abhängigkeiten
+
+- 6c-1 ist eigenständig (reine Library + Tests).
+- 6c-2 baut auf 6c-1 auf (nutzt die Registry).
+- 6c-3 baut auf 6c-1 + 6c-2 auf (Composer + Tool-Loop).
+- 6c-4 baut auf 6c-1/-2/-3 auf, ist aber bewusst nach v1 verschoben.
+
+Jede Sub-Phase ist eigenständig deploybar — das Backend bleibt
+zwischen den Etappen funktionsfähig.
+
 ## Querschnitt — Härtung ✅ ABGESCHLOSSEN (2026-05-19)
 
 - HTTP/DB-Integrationstests `backend/tests/integration.rs`: echte Axum-
