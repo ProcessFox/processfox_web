@@ -27,7 +27,7 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 ---
 
-## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + `grep_in_files` + `read_pdf` + `read_docx`)
+## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + Read-Tools `grep_in_files`/`read_pdf`/`read_docx`/`read_xlsx_range`)
 
 > **Wichtig:** Der Rest dieses Dokuments (§2–§16) beschreibt Architektur &
 > Konventionen. Dieser Abschnitt beschreibt den **realen Umsetzungsstand**.
@@ -51,9 +51,13 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
   `grep_in_files` (read-only Regex-Suche über die Workspace-Textdateien,
   Caps 300 Dateien/2 MiB/100 Hits, Endungs-Whitelist), `read_pdf`
   (Text-Extraktion aus PDFs via `pdf-extract` auf dem Blocking-Pool,
-  Caps 20 MB Eingabe / 200 KB Ausgabe) und `read_docx` (Lauftext aus
+  Caps 20 MB Eingabe / 200 KB Ausgabe), `read_docx` (Lauftext aus
   Word-Dateien via `quick_xml` auf dem Blocking-Pool, gleiche Caps;
-  teilt den Extraktor mit der HITL-Tail-Vorschau bei `append_to_docx`).
+  teilt den Extraktor mit der HITL-Tail-Vorschau bei `append_to_docx`)
+  und `read_xlsx_range` (rechteckiger Bereichs-Read aus Excel via
+  `calamine`, **JSON-Output** `{file, sheet, range, headers, rows}` mit
+  erster Range-Zeile als `headers`; Cap 500 Zellen pro Aufruf,
+  Default-Fenster 25×12 ab `A1`).
 - **CI/Deploy:** GitHub Actions baut das Multi-Stage-Image → GHCR;
   Coolify zieht das Image (Docker-Image-Resource, kein VPS-Build),
   Postgres + lokales Persistent Volume `/data`, Domain in Coolify.

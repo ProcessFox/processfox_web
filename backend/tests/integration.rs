@@ -1216,6 +1216,268 @@ async fn read_docx_broken_bytes_yield_friendly_result(pool: PgPool) {
     std::fs::remove_dir_all(&root).ok();
 }
 
+// --- Tests: read_xlsx_range (Phase 6b-2k) ---------------------------------
+
+/// Baut eine kleine .xlsx aus String-Reihen via `rust_xlsxwriter` — gleiche
+/// Bibliothek wie der Web-Schreib-Pfad. Keine Backend-Funktion exposed, also
+/// inline.
+fn make_test_xlsx(sheet: &str, rows: &[&[&str]]) -> Vec<u8> {
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.set_name(sheet).unwrap();
+    for (r, row) in rows.iter().enumerate() {
+        for (c, val) in row.iter().enumerate() {
+            if val.is_empty() {
+                continue;
+            }
+            ws.write_string(r as u32, c as u16, *val).unwrap();
+        }
+    }
+    wb.save_to_buffer().unwrap()
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_xlsx_range_returns_headers_and_rows(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_XLSX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    let bytes = make_test_xlsx(
+        "Tabelle1",
+        &[&["Name", "Rolle"], &["Alice", "Owner"], &["Bob", "Editor"]],
+    );
+    seed_file(&pool, &root, ws, user, "team.xlsx", &bytes).await;
+
+    let out = execute_read_tool(
+        &state,
+        ws,
+        READ_XLSX_TOOL,
+        &json!({ "filename": "team.xlsx" }),
+    )
+    .await
+    .unwrap();
+
+    let v: Value = serde_json::from_str(&out).expect("Output muss valides JSON sein");
+    assert_eq!(v["file"], "team.xlsx");
+    assert_eq!(v["sheet"], "Tabelle1");
+    assert_eq!(
+        v["headers"],
+        json!(["Name", "Rolle", "", "", "", "", "", "", "", "", "", ""])
+    );
+    // Default-Range A1:L25 → 24 Datenzeilen (Zeile 2..25); zwei davon sind
+    // gefüllt, der Rest ist leer.
+    let rows = v["rows"].as_array().expect("rows muss Array sein");
+    assert_eq!(rows.len(), 24);
+    assert_eq!(rows[0][0], "Alice");
+    assert_eq!(rows[0][1], "Owner");
+    assert_eq!(rows[1][0], "Bob");
+    assert_eq!(rows[1][1], "Editor");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_xlsx_range_honours_explicit_range(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_XLSX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    let bytes = make_test_xlsx("Tabelle1", &[&["Name", "Rolle"], &["Alice", "Owner"]]);
+    seed_file(&pool, &root, ws, user, "team.xlsx", &bytes).await;
+
+    let out = execute_read_tool(
+        &state,
+        ws,
+        READ_XLSX_TOOL,
+        &json!({ "filename": "team.xlsx", "start": "A1", "end": "B2" }),
+    )
+    .await
+    .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["range"], "A1:B2");
+    assert_eq!(v["headers"], json!(["Name", "Rolle"]));
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], json!(["Alice", "Owner"]));
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_xlsx_range_unknown_sheet_lists_available(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_XLSX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    let bytes = make_test_xlsx("Tabelle1", &[&["Name"], &["Alice"]]);
+    seed_file(&pool, &root, ws, user, "team.xlsx", &bytes).await;
+
+    let err = execute_read_tool(
+        &state,
+        ws,
+        READ_XLSX_TOOL,
+        &json!({ "filename": "team.xlsx", "sheet": "Anderes" }),
+    )
+    .await
+    .unwrap_err();
+    match err {
+        processfox_web::error::ApiError::BadRequest(msg) => {
+            assert!(msg.contains("Anderes"), "Sheet-Name fehlt: {msg}");
+            assert!(msg.contains("Tabelle1"), "Verfügbare Sheets fehlen: {msg}");
+        }
+        other => panic!("falscher Fehlertyp: {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_xlsx_range_rejects_non_xlsx_extension(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_XLSX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, _root) = tool_state(pool.clone());
+
+    let err = execute_read_tool(
+        &state,
+        ws,
+        READ_XLSX_TOOL,
+        &json!({ "filename": "notes.txt" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, processfox_web::error::ApiError::BadRequest(_)),
+        "falsche Endung muss 400 werden: {err:?}"
+    );
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_xlsx_range_missing_file_is_friendly(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_XLSX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, _root) = tool_state(pool.clone());
+
+    let out = execute_read_tool(
+        &state,
+        ws,
+        READ_XLSX_TOOL,
+        &json!({ "filename": "missing.xlsx" }),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("nicht gefunden"), "{out}");
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_xlsx_range_does_not_leak_across_workspaces(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_XLSX_TOOL};
+
+    let org_a = seed_org(&pool, "Acme", "AAAA23").await;
+    let user_a = seed_user(&pool, org_a, "a@acme.test", "owner").await;
+    let ws_a = seed_workspace(&pool, org_a, "A").await;
+
+    let org_b = seed_org(&pool, "Globex", "BBBB23").await;
+    seed_user(&pool, org_b, "b@globex.test", "owner").await;
+    let ws_b = seed_workspace(&pool, org_b, "B").await;
+
+    let (state, root) = tool_state(pool.clone());
+    let bytes = make_test_xlsx("Tabelle1", &[&["Name"], &["AcmeSecret"]]);
+    seed_file(&pool, &root, ws_a, user_a, "secret.xlsx", &bytes).await;
+
+    let probe = execute_read_tool(
+        &state,
+        ws_b,
+        READ_XLSX_TOOL,
+        &json!({ "filename": "secret.xlsx" }),
+    )
+    .await
+    .unwrap();
+    assert!(probe.contains("nicht gefunden"), "{probe}");
+    assert!(!probe.contains("AcmeSecret"), "{probe}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_xlsx_range_cell_cap_rejects_huge_range(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_XLSX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    // Datei muss existieren; Inhalt egal, weil der Cap **vor** dem Lesen
+    // greift.
+    let bytes = make_test_xlsx("Tabelle1", &[&["A"]]);
+    seed_file(&pool, &root, ws, user, "team.xlsx", &bytes).await;
+
+    // 30 Zeilen × 20 Spalten = 600 > 500.
+    let err = execute_read_tool(
+        &state,
+        ws,
+        READ_XLSX_TOOL,
+        &json!({ "filename": "team.xlsx", "start": "A1", "end": "T30" }),
+    )
+    .await
+    .unwrap_err();
+    match err {
+        processfox_web::error::ApiError::BadRequest(msg) => {
+            assert!(msg.contains("600"), "Zell-Zahl fehlt: {msg}");
+            assert!(msg.contains("500"), "Cap fehlt: {msg}");
+        }
+        other => panic!("falscher Fehlertyp: {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_xlsx_range_preserves_tricky_strings(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_XLSX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    // Zellinhalt mit Komma, Anführungszeichen und Newline — JSON-Layer
+    // muss das transparent quoten, das LLM bekommt den exakten String
+    // beim Re-Parsen zurück.
+    let tricky = "a,b\nc\"d";
+    let bytes = make_test_xlsx("Tabelle1", &[&["Spalte"], &[tricky]]);
+    seed_file(&pool, &root, ws, user, "t.xlsx", &bytes).await;
+
+    let out = execute_read_tool(
+        &state,
+        ws,
+        READ_XLSX_TOOL,
+        &json!({ "filename": "t.xlsx", "start": "A1", "end": "A2" }),
+    )
+    .await
+    .unwrap();
+    let v: Value = serde_json::from_str(&out).expect("muss JSON sein");
+    assert_eq!(v["headers"], json!(["Spalte"]));
+    assert_eq!(v["rows"][0][0], tricky);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[sqlx::test(migrations = "./src/db/migrations")]
 async fn grep_caps_hits_at_one_hundred(pool: PgPool) {
     use processfox_web::tools::{execute_read_tool, GREP_TOOL};

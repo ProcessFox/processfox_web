@@ -738,6 +738,199 @@ Tokio-Runtime nicht und bleibt bei kaputten DOCX stabil (freundlicher
 Tool-Result statt 500). Tool **und** HITL-Tail-Vorschau bei
 `append_to_docx` nutzen denselben Extraktor.
 
+## Phase 6b-2k — read_xlsx_range (Excel-Bereichs-Read) ✅ ABGESCHLOSSEN (2026-05-20)
+
+**Ergebnis:** Tool registriert (`backend/src/tools.rs`,
+`READ_XLSX_TOOL = "read_xlsx_range"`), Eintrag im `files`-Skill
+(`skills_json()`), Dispatch in `execute_read_tool` ohne HITL/Broadcast.
+Lesepfad: `sanitize_filename` + `.xlsx`-Endung → Range-Parse via
+`parse_cell_ref` (mit Default-Fenster 25×12 ab `start = A1`) →
+500-Zellen-Cap **vor** dem DB-Lookup (billig auszuwerten und gibt dem
+LLM schnelles Feedback) → DB-Existenz-Check → `ensure_in_workspace` →
+`tokio::task::spawn_blocking` für `calamine::open_workbook_from_rs` +
+Range-Extraktion (gleiche §11-Ausnahme wie bei `read_pdf`/`read_docx`).
+Output ist **JSON** (entschieden 2026-05-20, Abweichung von Local-CSV)
+`{file, sheet, range, headers, rows}` mit erster Range-Zeile als
+`headers`, restlichen als `rows`, alle Werte als Strings (kein
+Type-Drift bei Mixed-Type-Columns / Excel-Datums-Serials). Cell-
+Formatter `format_xlsx_cell` (Floats ganzzahlig kompakt, ISO-Strings
+unverändert, `#err:`-Marker für Excel-Errors).
+
+Wiederverwendete Helfer ohne Duplikate: `parse_cell_ref` und
+`col_letter` (beide aus dem `update_cells`/`delegate`-Pfad). Keine
+neue Cargo-Dependency — `calamine` ist seit der Office-Vorschau drin.
+
+Tests: 8 Integrationstests in `backend/tests/integration.rs`
+(Default-Range mit Header+Rows, explizite Range-Eingrenzung,
+unbekanntes Sheet → 400 mit Liste verfügbarer Namen, falsche Endung
+→ 400, fehlende Datei → freundlich, Cross-Workspace-No-Leak,
+500-Zellen-Cap, JSON-Quoting für Komma/Anführungszeichen/Newline-
+Zellinhalt) plus zwei DB-freie Unit-Tests
+`tools::xlsx_range_fixture_tests::roundtrips_known_cells` und
+`parse_cell_ref_roundtrips`, die `build_xlsx_bytes` gegen den
+Cell-Formatter round-trippen.
+
+Gates grün: `cargo fmt --check`, `cargo clippy --all-targets
+-D warnings`, `cargo test --lib` (13 Tests), `cargo test --no-run`
+(Integration kompiliert), `npm run build`. Doku-Patches: CLAUDE.md
+§1a-Header + Backend-Bullet (Tool-Inventar mit JSON-Format-Hinweis),
+DEPLOY.md §8 (neue Grenzen + JSON-Output-Notiz).
+
+Ziel: Read-only-Tool, das einem Agent einen rechteckigen Zellbereich
+einer Workspace-`.xlsx` (inkl. der Header-Zeile, wenn der Bereich mit
+`A1` startet) als CSV liefert. Pendant zu `read_xlsx_range` aus
+ProcessFox Local (`processfox_local/src-tauri/src/core/tool/tools/
+read_xlsx_range.rs`). Aktueller Web-Stand: nur ein interner
+`read_xlsx_grid`-Helfer für `update_cells` und Delegation; der lädt
+immer das ganze Sheet und ist über die Tool-API nicht erreichbar.
+Frontend-Icon (`src/lib/toolIcons.ts:21`, `read_xlsx_range:
+FileSpreadsheet`) ist da.
+
+**Aufruf-Vertrag (Tool-Input):**
+- `filename: string` — Workspace-Datei, muss auf `.xlsx` enden.
+- `sheet?: string` — Name; Default = erstes Sheet des Workbooks.
+- `start?: string` — Top-Left, z. B. `"A1"` (Default `"A1"`).
+- `end?: string` — Bottom-Right, z. B. `"F40"` (Default: 25×12-
+  Fenster von `start` aus, also bei `A1`-Default die Range `A1:L25`).
+
+**Output-Format:** **JSON** (entschieden 2026-05-20 — Abweichung von
+Local-CSV, weil JSON die Header-/Daten-Trennung explizit macht und das
+LLM die Struktur ohne erneutes Parsen versteht). Pretty-printed, alle
+Zell-Werte als **Strings** (verhindert Type-Drift bei Mixed-Type-
+Columns, Excel-Datums-Serials etc.):
+
+```json
+{
+  "file": "report.xlsx",
+  "sheet": "Tabelle1",
+  "range": "A1:L25",
+  "headers": ["Name", "Rolle"],
+  "rows": [
+    ["Alice", "Owner"],
+    ["Bob", "Editor"]
+  ]
+}
+```
+
+Konvention: erste Zeile der Range → `headers`, restliche Zeilen →
+`rows`. Range mit nur einer Zeile → `headers` gesetzt, `rows: []`.
+Wer reine Daten ohne Header-Konnotation braucht, setzt z. B.
+`start: "A2"` — dann ist die A2-Zeile syntaktisch der „Header".
+
+Bewusst **kein** `path` (Web-Workspace ist flach). Konsistent mit
+`read_file`/`read_pdf`/`read_docx`/`grep_in_files`.
+
+**Keine neue Dependency:** `calamine` ist bereits eingebunden
+(Office-Vorschau).
+
+**Implementierung in `backend/src/tools.rs`:**
+
+1. Konstante `READ_XLSX_TOOL: &str = "read_xlsx_range"`.
+2. Cap: `READ_XLSX_MAX_CELLS: usize = 500` (analog Local — hält den
+   LLM-Kontext vorhersehbar, größere Ranges → erneuter Aufruf mit
+   engerem Fenster).
+3. `ToolSpec` in `all_tools()` direkt nach `read_docx`. Beschreibung
+   nennt: JSON-Output `{file, sheet, range, headers, rows}` (erste
+   Zeile der Range → `headers`, Rest → `rows`, alle Werte als
+   Strings), 500-Zellen-Cap, Defaults.
+4. `skills_json()` `tools`-Array um `"read_xlsx_range"` erweitern.
+5. Neue Funktion `async fn read_xlsx_range(state, wid, input) ->
+   ApiResult<String>`:
+   - `filename` → `sanitize_filename` → `.xlsx`-Endung erzwingen
+     (sonst `400`).
+   - DB-Vorabcheck `workspace_files` (Existenz). Kein Eingabe-
+     Größen-Cap nötig, weil der 500-Zellen-Cap die LLM-Kontextlast
+     deckelt und `calamine` das ganze Workbook ohnehin in den
+     Speicher liest (bei xlsx > 50 MB greift dafür schon das
+     Upload-Limit).
+   - `ensure_in_workspace` (Defense-in-Depth).
+   - Bytes vom Volume, **`tokio::task::spawn_blocking`** für
+     `calamine::open_workbook_from_rs` + Range-Extraktion (gleiche
+     §11-Ausnahme wie bei den anderen Office-/PDF-Readern). Die
+     Existenz-Prüfung am Volume vor dem Spawn lassen, um den
+     Blocking-Pool nicht für jeden 404-Versuch zu belegen.
+   - Sheet-Name: `params.sheet`, sonst `wb.sheet_names()[0]`.
+     Unbekannter Sheet-Name → `BadRequest` mit Liste der
+     verfügbaren Namen (gibt dem LLM was es zum Korrigieren
+     braucht).
+   - Range parsen via vorhandenes `parse_cell_ref` (tools.rs:832,
+     0-basiert) — `start` Default `A1`, `end` Default
+     `(start_row + 24, start_col + 11)`. End vor Start → `BadRequest`.
+   - Zell-Anzahl prüfen, > 500 → `BadRequest` mit Hinweis „bitte
+     Range einschränken".
+   - **Zell-Formatierung** (alles in Strings — kein JSON-Quoting im
+     Cell-Layer, das übernimmt `serde_json` beim Serialisieren):
+     - `Empty` → leerer String.
+     - `String` → unverändert.
+     - `Float`: ganzzahlig + `|f| < 1e15` → `(*f as i64).to_string()`;
+       sonst `f.to_string()` (Default-Format).
+     - `Int`/`Bool` → `to_string`.
+     - `DateTime` → numerischer Excel-Seriendatum-Wert (`as_f64()`).
+     - `DateTimeIso`/`DurationIso` → ISO-String.
+     - `Error` → `#err:<debug>`.
+   - JSON-Aufbau: erste Range-Zeile → `headers: [String]`, restliche
+     Zeilen → `rows: [[String]]`. Mit `serde_json::to_string_pretty`
+     serialisieren — Lesbarkeit im Chat-Log gewinnt gegen die
+     paar zusätzlichen Tokens.
+6. Dispatcher-Arm in `execute_read_tool` für `READ_XLSX_TOOL` —
+   kein HITL, kein Broadcast.
+
+**Sandbox & Sicherheit:**
+- `sanitize_filename` + `ensure_in_workspace` (Defense-in-Depth).
+- Zell-Cap 500 begrenzt die LLM-Kontextlast und damit auch die
+  Output-Größe.
+- Kein zusätzlicher Größen-Cap auf dem Workbook — der schon
+  bestehende 50-MB-Upload-Limit ist die obere Schranke, und
+  `calamine` ist deutlich weniger DoS-anfällig als
+  `pdf-extract`/Zip-Bomben (xlsx ist ein ZIP, aber wir lesen die
+  ganze Mappe nicht aus, sondern adressieren Zellen über
+  `worksheet_range`).
+- `spawn_blocking` schützt vor Tokio-Runtime-Blockaden bei großen
+  Mappen mit vielen Sheets.
+
+**Frontend:**
+- Icon ist schon da; keine WS-Channel-Änderungen.
+
+**Tests (`backend/tests/integration.rs`):**
+- **Happy-Path:** `build_xlsx_bytes("Tabelle1", &[["Name", "Rolle"],
+  ["Alice", "Owner"], ["Bob", "Editor"]])` (vorhandener Helfer aus
+  Phase 6b-2b) → seeden → `read_xlsx_range` ohne `start`/`end`
+  → CSV enthält die Header-Zeile + beide Datenzeilen.
+- **Range-Eingrenzung:** `start: "A1", end: "B2"` → `headers` mit
+  2 Spalten, `rows` mit 1 Zeile à 2 Spalten.
+- **Sheet-Auswahl + Fehler:** Workbook mit Sheet `"Tabelle1"`,
+  Tool mit `sheet: "Anderes"` → `BadRequest`, Liste verfügbarer
+  Namen enthalten.
+- **Falsche Endung:** `filename: "notes.txt"` → `400`.
+- **Fehlende Datei:** → freundliche „nicht gefunden"-Meldung.
+- **Cross-Workspace-No-Leak:** xlsx in `ws_a`, Abfrage aus `ws_b`
+  → „nicht gefunden", keine Bytes geleakt.
+- **Zellen-Cap:** `start: "A1", end: "T30"` (20 × 30 = 600 Zellen)
+  → `BadRequest` mit Cap-Hinweis.
+- **JSON-Quoting:** Zelle mit Komma, Anführungszeichen und Newline
+  → `serde_json` quotet das automatisch korrekt; Test parsed das
+  Tool-Result-JSON wieder und prüft den genauen String-Wert.
+- **DB-freier Roundtrip-Unit-Test** `tools::xlsx_range_fixture_tests::
+  roundtrips_known_cells`: `build_xlsx_bytes` → durch den Cell-
+  Formatter → erwartete JSON-Struktur. Hält Schreib- und Lese-Pfad
+  ohne Postgres geeicht.
+
+**Doku-Patches:**
+- `CLAUDE.md` §1a-Backend-Bullet um `read_xlsx_range` ergänzen.
+- `DEPLOY.md` §8: neue Zeile zu den Grenzen
+  (500-Zellen-Cap pro Aufruf, JSON-Output `{file, sheet, range,
+  headers, rows}`, kein extra Größen-Cap).
+
+**Build-Gates:** `cargo fmt`, `cargo clippy --all-targets -- -D
+warnings`, `cargo test --all-targets`, `npm run build`.
+
+**Abnahme:** Agent mit `files`-Skill kann eine Workspace-`.xlsx`
+per `read_xlsx_range` lesen, bekommt strukturiertes JSON mit
+`file`/`sheet`/`range`/`headers`/`rows` zurück, scannt nur den
+eigenen Workspace, respektiert den 500-Zellen-Cap, blockiert den
+Tokio-Runtime nicht und bleibt bei fehlerhaften Sheets/Zellen-
+Adressen mit lesbaren Meldungen stabil.
+
 ## Querschnitt — Härtung ✅ ABGESCHLOSSEN (2026-05-19)
 
 - HTTP/DB-Integrationstests `backend/tests/integration.rs`: echte Axum-

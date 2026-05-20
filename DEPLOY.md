@@ -192,6 +192,13 @@ Der Link ist 15 Minuten gültig und einmalig nutzbar.
   (gleicher Multi-Tenant-Schutz). Extraktion liefert nur Lauftext —
   Tabellen-Zellen-Inhalt bleibt erhalten, Bilder/eingebettete Objekte
   werden gestrippt. Ausgabe-Cap 200 KB Klartext.
+- **Grenze `read_xlsx_range`:** maximal 500 Zellen pro Aufruf
+  (Range eingrenzen, dann erneut lesen). Output ist strukturiertes
+  JSON `{file, sheet, range, headers, rows}` — erste Zeile der Range
+  landet in `headers`, restliche in `rows`; alle Zellwerte sind
+  Strings (kein Type-Drift bei Mixed-Type-Spalten). Kein zusätzlicher
+  Größen-Cap auf dem Workbook — das 50-MB-Upload-Limit ist die obere
+  Schranke.
 - **Härtung erledigt:** HTTP/DB-Integrationstests (`backend/tests/
   integration.rs`) laufen in CI (`.github/workflows/ci.yml`, Postgres-
   Service) — Auth, Refresh-Rotation, Workspace-Berechtigungen.

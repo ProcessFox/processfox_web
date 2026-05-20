@@ -28,6 +28,7 @@ pub const ASK_TOOL: &str = "ask_user";
 pub const GREP_TOOL: &str = "grep_in_files";
 pub const READ_PDF_TOOL: &str = "read_pdf";
 pub const READ_DOCX_TOOL: &str = "read_docx";
+pub const READ_XLSX_TOOL: &str = "read_xlsx_range";
 /// Sicherheits-Obergrenze für Bulk-Delegation (eine Inferenz je Zeile).
 pub const DELEGATE_MAX_ROWS: usize = 200;
 
@@ -47,6 +48,14 @@ const READ_PDF_MAX_OUTPUT_BYTES: usize = 200 * 1024;
 /// Caps für `read_docx` (analog `read_pdf`).
 const READ_DOCX_MAX_INPUT_BYTES: i64 = 20 * 1024 * 1024;
 const READ_DOCX_MAX_OUTPUT_BYTES: usize = 200 * 1024;
+
+/// Cap für `read_xlsx_range` — analog Local. Hält den LLM-Kontext
+/// vorhersehbar; größere Ranges → erneuter Aufruf mit engerem Fenster.
+const READ_XLSX_MAX_CELLS: usize = 500;
+/// Default-Fenster, wenn `end` nicht angegeben wird (25 Zeilen × 12
+/// Spalten, also bei `start = A1` die Range `A1:L25`).
+const READ_XLSX_DEFAULT_ROWS: usize = 25;
+const READ_XLSX_DEFAULT_COLS: usize = 12;
 /// Whitelist textbasierter Endungen — Office-Formate (pdf/docx/xlsx/pptx)
 /// und Bilder werden bewusst ausgeschlossen.
 const GREP_SCAN_EXTENSIONS: &[&str] = &[
@@ -124,6 +133,42 @@ fn all_tools() -> Vec<ToolSpec> {
                     "filename": {
                         "type": "string",
                         "description": "Workspace-Datei, muss auf .docx enden."
+                    }
+                },
+                "required": ["filename"]
+            }),
+        },
+        ToolSpec {
+            name: READ_XLSX_TOOL,
+            description: "Liest einen rechteckigen Zellbereich aus einer \
+                Excel-Datei (.xlsx) im Workspace und liefert ihn als JSON \
+                mit den Feldern { file, sheet, range, headers, rows }. \
+                Die erste Zeile der Range wird als `headers` zurück- \
+                gegeben (z. B. bei start='A1' die übliche Header-Zeile), \
+                die restlichen Zeilen als `rows`. Alle Werte sind Strings. \
+                Defaults: erstes Sheet, start='A1', end = 25×12-Fenster. \
+                Maximal 500 Zellen pro Aufruf — größere Tabellen mit \
+                engerer Range erneut lesen.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Workspace-Datei, muss auf .xlsx enden."
+                    },
+                    "sheet": {
+                        "type": "string",
+                        "description": "Name des Sheets. Default: erstes \
+                            Sheet des Workbooks."
+                    },
+                    "start": {
+                        "type": "string",
+                        "description": "Top-Left-Zelle, z. B. 'A1'. Default 'A1'."
+                    },
+                    "end": {
+                        "type": "string",
+                        "description": "Bottom-Right-Zelle, z. B. 'F40'. \
+                            Default: 25×12-Fenster ab start."
                     }
                 },
                 "required": ["filename"]
@@ -306,9 +351,10 @@ pub fn skills_json() -> Value {
         "description": "Workspace-Dateien lesen und (mit Freigabe) ergänzen.",
         "icon": "Folder",
         "tools": ["list_files", "read_file", GREP_TOOL, READ_PDF_TOOL,
-                  READ_DOCX_TOOL, WRITE_TOOL, WRITE_XLSX_TOOL,
-                  WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL, APPEND_DOCX_TOOL,
-                  UPDATE_CELLS_TOOL, DELEGATE_TOOL, ASK_TOOL],
+                  READ_DOCX_TOOL, READ_XLSX_TOOL, WRITE_TOOL,
+                  WRITE_XLSX_TOOL, WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL,
+                  APPEND_DOCX_TOOL, UPDATE_CELLS_TOOL, DELEGATE_TOOL,
+                  ASK_TOOL],
         "hitl": { "default": true },
         "language": "de",
         "body": "",
@@ -606,6 +652,175 @@ async fn read_docx(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<Stri
     Ok(body)
 }
 
+/// Bereichs-Read aus einer .xlsx (Phase 6b-2k). Liefert JSON
+/// `{file, sheet, range, headers, rows}` (erste Zeile der Range ist
+/// `headers`, Rest sind `rows`; alles String-typisiert). `calamine` ist
+/// CPU-gebunden → Blocking-Pool, gleiche §11-Ausnahme wie die anderen
+/// Office-Reader.
+async fn read_xlsx_range(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<String> {
+    let filename = input
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("filename fehlt".into()))?;
+    let fname = sanitize_filename(filename)?;
+    if !fname.to_lowercase().ends_with(".xlsx") {
+        return Err(ApiError::BadRequest(
+            "Dateiname muss auf .xlsx enden.".into(),
+        ));
+    }
+    let sheet_req = input
+        .get("sheet")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+    let start_spec = input
+        .get("start")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("A1")
+        .to_string();
+    let end_spec = input
+        .get("end")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+
+    let (start_row, start_col) = parse_cell_ref(&start_spec)
+        .ok_or_else(|| ApiError::BadRequest(format!("Ungültige Start-Zelle: {start_spec}")))?;
+    let (end_row, end_col) = if let Some(end) = &end_spec {
+        parse_cell_ref(end)
+            .ok_or_else(|| ApiError::BadRequest(format!("Ungültige End-Zelle: {end}")))?
+    } else {
+        (
+            start_row + READ_XLSX_DEFAULT_ROWS - 1,
+            start_col + READ_XLSX_DEFAULT_COLS - 1,
+        )
+    };
+    if end_row < start_row || end_col < start_col {
+        return Err(ApiError::BadRequest("end-Zelle liegt vor start.".into()));
+    }
+    let cell_count = (end_row - start_row + 1) * (end_col - start_col + 1);
+    if cell_count > READ_XLSX_MAX_CELLS {
+        return Err(ApiError::BadRequest(format!(
+            "Range enthält {cell_count} Zellen (Cap {READ_XLSX_MAX_CELLS}). \
+             Bitte Range einschränken."
+        )));
+    }
+
+    // DB-Vorabcheck (Existenz). Kein zusätzlicher Größen-Cap nötig — das
+    // 50-MB-Upload-Limit ist die obere Schranke, und der Zellen-Cap
+    // deckelt die LLM-Kontextlast.
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT size_bytes FROM workspace_files \
+         WHERE workspace_id = $1 AND filename = $2",
+    )
+    .bind(wid)
+    .bind(&fname)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    if row.is_none() {
+        return Ok(format!("(Datei '{fname}' nicht gefunden)"));
+    }
+
+    let key = workspace_key(wid, &fname);
+    ensure_in_workspace(wid, &key)?;
+    let path = state.storage.path(&key);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(format!("(Datei '{fname}' nicht gefunden)"));
+    };
+
+    // calamine ist CPU-gebunden → Blocking-Pool.
+    let fname_for_blocking = fname.clone();
+    let extract_join = tokio::task::spawn_blocking(move || -> ApiResult<Value> {
+        let mut wb: Xlsx<_> = calamine::open_workbook_from_rs(std::io::Cursor::new(bytes))
+            .map_err(|e| ApiError::BadRequest(format!("Keine xlsx: {e}")))?;
+        let names = wb.sheet_names();
+        if names.is_empty() {
+            return Err(ApiError::BadRequest("Workbook hat keine Sheets.".into()));
+        }
+        let active = match &sheet_req {
+            Some(s) => {
+                if !names.iter().any(|n| n == s) {
+                    return Err(ApiError::BadRequest(format!(
+                        "Sheet '{s}' nicht gefunden. Verfügbar: {}",
+                        names.join(", ")
+                    )));
+                }
+                s.clone()
+            }
+            None => names[0].clone(),
+        };
+        let range = wb
+            .worksheet_range(&active)
+            .map_err(|e| ApiError::BadRequest(format!("Sheet: {e}")))?;
+
+        // Zellen einsammeln als String-Grid.
+        let mut grid: Vec<Vec<String>> = Vec::with_capacity(end_row - start_row + 1);
+        for row in start_row..=end_row {
+            let mut line = Vec::with_capacity(end_col - start_col + 1);
+            for col in start_col..=end_col {
+                line.push(format_xlsx_cell(range.get_value((row as u32, col as u32))));
+            }
+            grid.push(line);
+        }
+        // Erste Zeile → headers, Rest → rows. Bei Single-Row-Range:
+        // headers gesetzt, rows = [].
+        let (headers, rows) = if grid.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let mut iter = grid.into_iter();
+            (iter.next().unwrap(), iter.collect::<Vec<_>>())
+        };
+        let range_label = format!(
+            "{}{}:{}{}",
+            col_letter(start_col),
+            start_row + 1,
+            col_letter(end_col),
+            end_row + 1
+        );
+        Ok(json!({
+            "file": fname_for_blocking,
+            "sheet": active,
+            "range": range_label,
+            "headers": headers,
+            "rows": rows,
+        }))
+    })
+    .await;
+
+    let value = match extract_join {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(e) => {
+            return Ok(format!("XLSX-Lesen abgebrochen ('{fname}'): {e}"));
+        }
+    };
+    serde_json::to_string_pretty(&value).map_err(|e| ApiError::Internal(e.into()))
+}
+
+/// Formatiert eine calamine-`Data`-Zelle als String — saubere Variante
+/// (Floats ganzzahlig kompakt, Excel-Datums-Serials numerisch, ISO-
+/// Strings unverändert). Kein JSON-Escape hier — das macht `serde_json`.
+fn format_xlsx_cell(cell: Option<&Data>) -> String {
+    match cell {
+        None | Some(Data::Empty) => String::new(),
+        Some(Data::String(s)) => s.clone(),
+        Some(Data::Float(f)) => {
+            if f.fract() == 0.0 && f.abs() < 1e15 {
+                format!("{}", *f as i64)
+            } else {
+                format!("{f}")
+            }
+        }
+        Some(Data::Int(i)) => i.to_string(),
+        Some(Data::Bool(b)) => b.to_string(),
+        Some(Data::DateTime(dt)) => format!("{}", dt.as_f64()),
+        Some(Data::DateTimeIso(s)) | Some(Data::DurationIso(s)) => s.clone(),
+        Some(Data::Error(e)) => format!("#err:{e:?}"),
+    }
+}
+
 /// Read-Tools ohne Seiteneffekt (kein HITL nötig).
 pub async fn execute_read_tool(
     state: &AppState,
@@ -625,6 +840,7 @@ pub async fn execute_read_tool(
         GREP_TOOL => grep_in_files(state, wid, input).await,
         READ_PDF_TOOL => read_pdf(state, wid, input).await,
         READ_DOCX_TOOL => read_docx(state, wid, input).await,
+        READ_XLSX_TOOL => read_xlsx_range(state, wid, input).await,
         other => Err(ApiError::BadRequest(format!("Unbekanntes Tool: {other}"))),
     }
 }
@@ -1858,5 +2074,48 @@ mod docx_fixture_tests {
             matches!(err, crate::error::ApiError::BadRequest(_)),
             "kein-ZIP muss BadRequest werden: {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod xlsx_range_fixture_tests {
+    //! DB-freier Roundtrip: das eigene `build_xlsx_bytes` baut eine
+    //! .xlsx → `calamine` liest sie → der Cell-Formatter normalisiert
+    //! die Werte. Hält Schreib- und Lese-Pfad ohne Postgres geeicht.
+
+    use super::{build_xlsx_bytes, format_xlsx_cell};
+    use calamine::{Reader, Xlsx};
+
+    #[test]
+    fn roundtrips_known_cells() {
+        let rows = vec![
+            vec!["Name".to_string(), "Rolle".to_string(), "Score".to_string()],
+            vec!["Alice".to_string(), "Owner".to_string(), "42".to_string()],
+            vec!["Bob".to_string(), "Editor".to_string(), "3.14".to_string()],
+        ];
+        let bytes = build_xlsx_bytes("Tabelle1", &rows).expect("build_xlsx_bytes muss gelingen");
+        let mut wb: Xlsx<_> =
+            calamine::open_workbook_from_rs(std::io::Cursor::new(bytes)).expect("xlsx muss öffnen");
+        let range = wb.worksheet_range("Tabelle1").expect("Sheet muss da sein");
+        // Header-Zeile.
+        assert_eq!(format_xlsx_cell(range.get_value((0, 0))), "Name");
+        assert_eq!(format_xlsx_cell(range.get_value((0, 1))), "Rolle");
+        assert_eq!(format_xlsx_cell(range.get_value((0, 2))), "Score");
+        // Datenzeilen — Strings bleiben Strings, `build_xlsx_bytes`
+        // schreibt sie als String-Zellen.
+        assert_eq!(format_xlsx_cell(range.get_value((1, 0))), "Alice");
+        assert_eq!(format_xlsx_cell(range.get_value((1, 2))), "42");
+        assert_eq!(format_xlsx_cell(range.get_value((2, 2))), "3.14");
+        // Außerhalb des Schreib-Bereichs: Empty.
+        assert_eq!(format_xlsx_cell(range.get_value((9, 9))), "");
+    }
+
+    #[test]
+    fn parse_cell_ref_roundtrips() {
+        use super::{col_letter, parse_cell_ref};
+        let (row, col) = parse_cell_ref("AA10").expect("AA10 parst");
+        assert_eq!(row, 9);
+        assert_eq!(col, 26);
+        assert_eq!(col_letter(col), "AA");
     }
 }
