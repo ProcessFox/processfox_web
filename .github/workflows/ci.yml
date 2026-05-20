@@ -1,8 +1,14 @@
-name: CI
+name: CI & Deploy
 
-# Backend-Härtung: fmt + clippy + Unit-Tests + HTTP/DB-Integrationstests
-# (CLAUDE.md §13). Die Integrationstests laufen gegen einen Postgres-
-# Service-Container; `#[sqlx::test]` legt pro Test eine frische Wegwerf-DB an.
+# Eine Pipeline pro Commit: erst Backend-Härtung (fmt + clippy + Tests
+# gegen Postgres-Service, siehe CLAUDE.md §13), dann — nur auf push:main
+# und nur wenn die Tests grün sind — Multi-Stage-Docker-Image bauen und
+# nach GHCR pushen. Coolify zieht das fertige `:latest`.
+#
+# Frühere Aufteilung in zwei Workflows (ci.yml + docker.yml) hatte den
+# Defekt, dass kaputte Tests den Image-Build nicht blockierten. Mit dem
+# `needs: backend`-Gate kommt nichts mehr nach Produktion, das nicht
+# vorher CI bestanden hat.
 
 on:
   push:
@@ -11,11 +17,12 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: pipeline-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   backend:
+    name: Backend (fmt + clippy + tests)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -59,3 +66,55 @@ jobs:
 
       - name: tests (unit + HTTP/DB-Integration)
         run: cargo test --all-targets
+
+  image:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: backend
+    # Nur push auf main (oder manueller Dispatch von main) löst einen
+    # Image-Build aus — PRs sollen keine GHCR-Tags schreiben.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Image-Name (lowercase — GHCR verlangt Kleinschreibung)
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Stößt Coolify nach erfolgreichem Push an, das neue :latest zu ziehen.
+      # No-op, solange das Secret COOLIFY_DEPLOY_WEBHOOK nicht gesetzt ist —
+      # dann bleibt es beim manuellen Redeploy.
+      - name: Trigger Coolify redeploy
+        env:
+          HOOK: ${{ secrets.COOLIFY_DEPLOY_WEBHOOK }}
+          TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+        if: ${{ env.HOOK != '' }}
+        run: |
+          curl -fsS -X POST \
+            ${TOKEN:+-H "Authorization: Bearer $TOKEN"} \
+            "$HOOK"

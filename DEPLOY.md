@@ -37,9 +37,14 @@ Persistent Volume** (Single-Instance, self-hosted — kein Objektspeicher).
 > Deshalb baut **GitHub Actions** das Image und pusht es nach GHCR; Coolify
 > **zieht** nur das fertige Image (Pull = Sekunden, VPS baut nichts).
 
-1. Workflow `.github/workflows/docker.yml` ist im Repo. Bei jedem Push auf
-   `main` (oder manuell via „Run workflow") baut er das Multi-Stage-Image
-   und pusht nach `ghcr.io/<owner>/<repo>` (Tags `latest` + Commit-SHA).
+1. Konsolidierte Pipeline `.github/workflows/ci.yml` (Workflow-Name
+   **„CI & Deploy"**, Stand 2026-05-20 — frühere Aufteilung in `ci.yml`
+   + `docker.yml` zusammengeführt). Bei jedem Push auf `main` (oder
+   manuell via „Run workflow") läuft erst Job **`backend`** (fmt +
+   clippy + Tests gegen Postgres-Service), danach — **nur bei grünen
+   Tests** (`needs: backend`) — Job **`image`**: Multi-Stage-Image bauen
+   und nach `ghcr.io/<owner>/<repo>` pushen (Tags `latest` + Commit-SHA).
+   Auf PRs läuft nur `backend` — keine GHCR-Tags von PR-Branches.
 2. **Package auf öffentlich stellen** (einmalig, nach dem ersten erfolg-
    reichen Run): GitHub → Repo/Org → **Packages** → `processfox_web` →
    **Package settings → Change visibility → Public**. Danach kann Coolify
@@ -57,8 +62,9 @@ Persistent Volume** (Single-Instance, self-hosted — kein Objektspeicher).
   (Dockerfile). Ohne curl/wget meldet Coolify „unhealthy" und rollt zurück
   → Traefik „no available server".
 - Redeploy nach neuem Image: in Coolify **Redeploy** drücken, sobald der
-  GitHub-Action-Run grün ist (optional später per Coolify-Deploy-Webhook
-  am Ende des Workflows automatisieren).
+  `image`-Job der CI-&-Deploy-Pipeline grün ist (optional via
+  Coolify-Deploy-Webhook am Ende des Workflows automatisieren — siehe
+  Secrets `COOLIFY_DEPLOY_WEBHOOK` / `COOLIFY_API_TOKEN` im Workflow).
 
 > Eine bereits als „Dockerfile-Build aus Repository" angelegte Application
 > kann nicht zuverlässig auf Image-Pull umgestellt werden — sauberer ist
@@ -94,8 +100,10 @@ Vorlage siehe `.env.example`. Konkret:
 
 ## 5. Deploy & Verifikation
 
-1. Push auf `main` → **GitHub-Action** „Build & Push Image" abwarten
-   (Actions-Tab; erster Run lädt/baut alles, danach via Cache schnell).
+1. Push auf `main` → **GitHub-Actions-Pipeline „CI & Deploy"** abwarten
+   (Actions-Tab). Erst läuft Job `backend` (Tests müssen grün sein),
+   dann Job `image` (baut & pusht). Erster Run lädt/baut alles, danach
+   via Cache schnell.
 2. In Coolify **Redeploy** der Docker-Image-Resource auslösen (zieht das
    frische `:latest`).
 3. Nach „Healthy":
@@ -222,7 +230,10 @@ Der Link ist 15 Minuten gültig und einmalig nutzbar.
   deklariert und der Aufruf scheitert mit einer freundlichen
   „lies zuerst den Skill"-Meldung. `ask_user` ist immer verfügbar.
 - **Härtung erledigt:** HTTP/DB-Integrationstests (`backend/tests/
-  integration.rs`) laufen in CI (`.github/workflows/ci.yml`, Postgres-
-  Service) — Auth, Refresh-Rotation, Workspace-Berechtigungen.
+  integration.rs`) laufen im konsolidierten CI-&-Deploy-Workflow
+  (`.github/workflows/ci.yml`, Job `backend`, Postgres-Service) — Auth,
+  Refresh-Rotation, Admin/Nutzer-Berechtigungen (inkl. Agent-Delete-Gate
+  ab Phase 6e). Der `image`-Job hängt per `needs:` an `backend`, sodass
+  nichts nach GHCR landet, ohne dass die Tests grün waren.
 - **Optional offen (klein):** `delegationProfile`-Override (eigenes
   Worker-Modell je Agent), Vorlage via Agent-Attachment.

@@ -120,7 +120,14 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
   `reasoningDelta`-WS-Events live; Persistenz erfolgt im
   `assistant.content.reasoning`-Feld dank Phase 6d-1. Anthropic-Body
   wird für Claude-3-* defensiv gar nicht gesendet (lehnt es ab).
-- **CI/Deploy:** GitHub Actions baut das Multi-Stage-Image → GHCR;
+- **CI/Deploy:** Eine konsolidierte GitHub-Actions-Pipeline
+  (`.github/workflows/ci.yml`, Stand 2026-05-20): Job `backend` läuft auf
+  jedem PR und auf `push:main` (fmt + clippy + Tests gegen Postgres-Service);
+  Job `image` läuft nur auf `push:main` **nach grünem `backend`-Job**
+  (`needs: backend`), baut das Multi-Stage-Image → GHCR und pingt
+  optional den Coolify-Webhook. Frühere Aufteilung in zwei Workflows
+  (`ci.yml` + `docker.yml`, parallel und ungetrennt) hatte den Defekt,
+  dass kaputte Tests den Image-Build nicht blockierten — jetzt gegated.
   Coolify zieht das Image (Docker-Image-Resource, kein VPS-Build),
   Postgres + lokales Persistent Volume `/data`, Domain in Coolify.
 
@@ -130,10 +137,13 @@ Worker-Modell je Agent), Vorlage via Agent-Attachment-`templateFileId`.
 **Härtung umgesetzt:** HTTP/DB-Integrationstests (`backend/tests/
 integration.rs`) — echte Axum-Handler via `tower::oneshot` gegen eine pro
 Test frische Postgres-DB (`#[sqlx::test]`). Deckt Magic-Link-`verify`
-(inkl. single-use/expired), Refresh-Token-Rotation und die Workspace-
-Berechtigungen (Owner/Member/Viewer, Cross-Org-No-Leak) ab. Läuft in CI
-(`.github/workflows/ci.yml`, Postgres-Service) zusammen mit fmt+clippy;
-lokal mit erreichbarer `DATABASE_URL`.
+(inkl. single-use/expired), Refresh-Token-Rotation, die Admin/Nutzer-
+Berechtigungen (Workspace-Mgmt, Mitglieder, Agent-Delete) und
+Cross-Org-No-Leak ab. Läuft im konsolidierten CI/Deploy-Workflow
+(`.github/workflows/ci.yml` → Job `backend`, Postgres-Service) zusammen
+mit fmt+clippy; lokal mit erreichbarer `DATABASE_URL`. Der `image`-Job
+hängt per `needs:` an `backend`, sodass kein Image nach GHCR landet,
+ohne dass die Tests grün waren.
 
 **Bekannte funktionale Grenzen:** siehe `DEPLOY.md` §8 (Word-Platzhalter
 müssen run-zusammenhängend sein; Zell-Edits/Delegation schreiben das
@@ -544,8 +554,10 @@ Eckpunkte:
 
 ### Coolify-Workflow (Details: `DEPLOY.md`)
 
-1. Push auf `main` → GitHub Action baut & pusht
+1. Push auf `main` → GitHub-Actions-Pipeline (`ci.yml`): erst Tests
+   (Job `backend`), dann **bei grünen Tests** baut und pusht Job `image`
    `ghcr.io/<owner>/processfox_web:latest` (Package public stellen).
+   Auf PRs läuft nur `backend` — keine GHCR-Tags von PR-Branches.
 2. Coolify-Resource als **Docker Image** (kein Dockerfile-Build), Port 3000,
    Healthcheck `/api/v1/health`.
 3. PostgreSQL-Service + Persistent Volume (Mount `/data`) in Coolify anlegen.
