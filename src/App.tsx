@@ -56,14 +56,29 @@ function AuthGate() {
       />
     );
   }
-  return <AppShell onLogout={auth.logout} isAdmin={auth.user!.orgRole === "owner"} />;
+  return (
+    <AppShell
+      onLogout={auth.logout}
+      userId={auth.user!.id}
+      isAdmin={auth.user!.orgRole === "owner"}
+    />
+  );
+}
+
+/** localStorage-Key für die zuletzt aktive Workspace-ID. Per User scoped,
+ *  damit ein Account-Switch im selben Browser nicht versehentlich die
+ *  Auswahl des Vorgängers reaktiviert. */
+function activeWorkspaceStorageKey(userId: string) {
+  return `pfx:active-workspace:${userId}`;
 }
 
 function AppShell({
   onLogout,
+  userId,
   isAdmin,
 }: {
   onLogout: () => void;
+  userId: string;
   isAdmin: boolean;
 }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -150,14 +165,20 @@ function AppShell({
     skillsApi.list().then(setSkills).catch(console.error);
   }, []);
 
-  // Workspace-Liste laden; optional einen bestimmten (neuen) auswählen,
-  // sonst Auswahl beibehalten bzw. auf den ersten fallen.
+  // Workspace-Liste laden. `selectId` ist eine *bevorzugte* Auswahl
+  // (frisch erstellter Workspace nach Create, gespeicherte ID nach Reload);
+  // ist sie nicht mehr in der Liste — z.B. weil der Workspace gelöscht
+  // wurde oder der User aus der Mitgliedschaft fiel — fallen wir auf den
+  // aktuellen oder den ersten verfügbaren zurück.
   const refreshWorkspaces = useCallback(
     async (selectId?: string) => {
       const ws = await workspaceApi.list();
       setWorkspaces(ws);
       setActiveWorkspace((curr) => {
-        if (selectId) return ws.find((w) => w.id === selectId) ?? curr;
+        if (selectId) {
+          const preferred = ws.find((w) => w.id === selectId);
+          if (preferred) return preferred;
+        }
         if (curr) return ws.find((w) => w.id === curr.id) ?? ws[0] ?? null;
         return ws[0] ?? null;
       });
@@ -168,13 +189,30 @@ function AppShell({
 
   // Initial load. Workspaces und Settings unabhängig — fehlt der (erst ab
   // Phase 4 implementierte) Settings-Endpunkt, blockiert das die
-  // Workspace-Liste nicht.
+  // Workspace-Liste nicht. Beim Reload greifen wir auf die zuletzt aktive
+  // Workspace-ID aus dem localStorage zurück, damit der User dort landet,
+  // wo er war — und nicht im ältesten Workspace (Default-Sortierung der
+  // Server-Liste ist nach `created_at`).
   useEffect(() => {
-    refreshWorkspaces().catch((e) =>
+    const storedId = window.localStorage.getItem(
+      activeWorkspaceStorageKey(userId),
+    );
+    refreshWorkspaces(storedId ?? undefined).catch((e) =>
       console.error("workspace load failed", e),
     );
     refreshSettings().catch((e) => console.warn("settings load failed", e));
-  }, [refreshWorkspaces, refreshSettings]);
+  }, [refreshWorkspaces, refreshSettings, userId]);
+
+  // Aktiven Workspace persistent halten — die nächste Sitzung soll dort
+  // weiter machen, wo wir gerade sind.
+  useEffect(() => {
+    const key = activeWorkspaceStorageKey(userId);
+    if (activeWorkspace) {
+      window.localStorage.setItem(key, activeWorkspace.id);
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  }, [activeWorkspace, userId]);
 
   // Load agents whenever the active workspace changes.
   useEffect(() => {
