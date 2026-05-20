@@ -206,6 +206,13 @@ Der Link ist 15 Minuten gültig und einmalig nutzbar.
   append-Workflow. Bestand muss UTF-8 sein (sonst BadRequest). HITL
   ist Pflicht; der Nutzer sieht einen Zeilen-Diff (`DiffSection` im
   Frontend) bevor er freigibt.
+- **Progressive Skill-Disclosure (Phase 6c-3):** Das LLM braucht
+  jetzt **zwei Schritte**, bevor es ein domain-spezifisches Tool
+  aufruft: erst `read_skill({ skillId: "<id>" })` mit der `id` aus
+  der Skill-Liste im System-Prompt, dann das eigentliche Tool. Ohne
+  vorher geladenen Skill ist das Tool-Schema beim Provider gar nicht
+  deklariert und der Aufruf scheitert mit einer freundlichen
+  „lies zuerst den Skill"-Meldung. `ask_user` ist immer verfügbar.
 - **Härtung erledigt:** HTTP/DB-Integrationstests (`backend/tests/
   integration.rs`) laufen in CI (`.github/workflows/ci.yml`, Postgres-
   Service) — Auth, Refresh-Rotation, Workspace-Berechtigungen.

@@ -12,6 +12,7 @@ pub mod error;
 pub mod llm;
 pub mod perm;
 pub mod preview;
+pub mod prompt;
 pub mod ratelimit;
 pub mod routes;
 pub mod sandbox;

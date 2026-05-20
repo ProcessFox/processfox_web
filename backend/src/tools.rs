@@ -30,6 +30,7 @@ pub const READ_PDF_TOOL: &str = "read_pdf";
 pub const READ_DOCX_TOOL: &str = "read_docx";
 pub const READ_XLSX_TOOL: &str = "read_xlsx_range";
 pub const REWRITE_TOOL: &str = "rewrite_file";
+pub const READ_SKILL_TOOL: &str = "read_skill";
 /// Sicherheits-Obergrenze für Bulk-Delegation (eine Inferenz je Zeile).
 pub const DELEGATE_MAX_ROWS: usize = 200;
 
@@ -350,28 +351,47 @@ fn all_tools() -> Vec<ToolSpec> {
                 "required": ["question"]
             }),
         },
+        ToolSpec {
+            name: READ_SKILL_TOOL,
+            description: "Lädt die volle Anleitung für einen Skill als \
+                Tool-Result. Lies einen Skill, bevor du seine Tools \
+                nutzt — der Skill-Body erklärt wann und wie. Lade \
+                keinen Skill, den du in dieser Konversation schon \
+                geladen hast.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "skillId": {
+                        "type": "string",
+                        "description": "Die `id` eines Skills aus der \
+                            Available-skills-Liste im System-Prompt."
+                    }
+                },
+                "required": ["skillId"]
+            }),
+        },
     ]
 }
 
-/// Tools, die der Agent gemäß seiner aktivierten Skills nutzen darf.
-/// Tool-Schemas, die der Agent gemäß seiner aktivierten Skills nutzen
-/// darf (Phase 6c-2). Die Registry definiert pro Skill, welche Tools
-/// reingehören; `available_tools` baut die Vereinigung. `ask_user` ist
-/// immer mit dabei — es ist Infrastruktur, kein User-fakultatives Tool
-/// (vgl. PLAN.md Phase 6c, Entscheidungen vorab).
-///
-/// Legacy-Slot `"files"` (Vor-6c-2-Agents) wird als Catch-all behandelt
-/// und liefert alle Tools — die DB-Migration `0004` stellt zwar auf die
-/// neuen Skill-Namen um, aber Defense-in-Depth schadet hier nicht.
-pub fn available_tools(
+/// Tool-Schemas, die in **jedem** Tool-Loop-Schritt deklariert sind
+/// (Phase 6c-3 Progressive Disclosure). `read_skill` ist das Disclosure-
+/// Tor; `ask_user` ist Infrastruktur und nicht User-fakultativ.
+pub fn base_tool_schemas() -> Vec<ToolSpec> {
+    all_tools()
+        .into_iter()
+        .filter(|spec| spec.name == READ_SKILL_TOOL || spec.name == ASK_TOOL)
+        .collect()
+}
+
+/// Tool-Schemas der **geladenen** Skills (Phase 6c-3). Wird in jedem
+/// Tool-Loop-Schritt mit `base_tool_schemas` zusammengeführt; vor dem
+/// ersten `read_skill`-Aufruf ist das hier leer.
+pub fn schemas_for_loaded(
     registry: &crate::skills::SkillRegistry,
-    skills: &[String],
+    loaded: &[String],
 ) -> Vec<ToolSpec> {
-    if skills.iter().any(|s| s == "files") {
-        return all_tools();
-    }
     let mut wanted: Vec<String> = Vec::new();
-    for skill_name in skills {
+    for skill_name in loaded {
         let Some(skill) = registry.get(skill_name) else {
             continue;
         };
@@ -381,14 +401,34 @@ pub fn available_tools(
             }
         }
     }
-    // ask_user immer mit dabei.
-    if !wanted.iter().any(|t| t == ASK_TOOL) {
-        wanted.push(ASK_TOOL.to_string());
-    }
     all_tools()
         .into_iter()
-        .filter(|spec| wanted.iter().any(|t| t == spec.name))
+        .filter(|spec| {
+            // base_tool_schemas decken `read_skill`/`ask_user` separat ab —
+            // hier nicht doppelt liefern.
+            spec.name != READ_SKILL_TOOL
+                && spec.name != ASK_TOOL
+                && wanted.iter().any(|t| t == spec.name)
+        })
         .collect()
+}
+
+/// Volle Tool-Schema-Liste für einen Tool-Loop-Schritt: `base` + die
+/// Tools der bereits geladenen Skills. Deterministisch sortiert nach
+/// dem `all_tools()`-Order — gleicher Loaded-Stand → identischer
+/// Tools-Block (Cache-stabilität).
+pub fn tools_for_step(registry: &crate::skills::SkillRegistry, loaded: &[String]) -> Vec<ToolSpec> {
+    let mut out = base_tool_schemas();
+    out.extend(schemas_for_loaded(registry, loaded));
+    out
+}
+
+/// Legacy-Catch-all für Vor-6c-Agents mit `skills = ["files"]`: liefert
+/// **alle** Tool-Schemas. Wird beim `available_tools`-Fallback genutzt,
+/// damit Agents nach der `0004`-Migration auch dann weiterlaufen, wenn
+/// jemand den Legacy-Slot manuell wieder einträgt.
+pub fn all_tool_schemas() -> Vec<ToolSpec> {
+    all_tools()
 }
 
 pub fn is_write_tool(name: &str) -> bool {
@@ -405,10 +445,40 @@ pub fn is_ask_tool(name: &str) -> bool {
     name == ASK_TOOL
 }
 
+pub fn is_read_skill_tool(name: &str) -> bool {
+    name == READ_SKILL_TOOL
+}
+
 /// Delegation läuft nicht über den Write-Dispatcher, sondern als
 /// Sonderzweig in `chat.rs` (Worker-LLM + Fortschrittsevents).
 pub fn is_delegate_tool(name: &str) -> bool {
     name == DELEGATE_TOOL
+}
+
+/// Effektive HITL-Entscheidung für einen Tool-Aufruf (Phase 6c-3).
+/// Startet bei der globalen Write-Klassifizierung; geladene Skills
+/// können das pro Tool **strenger** machen (`perTool: true`), aber das
+/// Sicherheitsnetz von `is_write_tool` bleibt — kein Skill kann HITL
+/// pauschal abschalten. Bei Konflikt zwischen Skills gewinnt strenger
+/// (HITL bleibt an).
+pub fn effective_hitl(
+    registry: &crate::skills::SkillRegistry,
+    loaded: &[String],
+    tool_name: &str,
+) -> bool {
+    let mut hitl = is_write_tool(tool_name);
+    for skill_name in loaded {
+        let Some(skill) = registry.get(skill_name) else {
+            continue;
+        };
+        if let Some(&v) = skill.hitl.per_tool.get(tool_name) {
+            // Skill-Override darf nur **strenger** machen.
+            if v {
+                hitl = true;
+            }
+        }
+    }
+    hitl
 }
 
 // `skills_json` (Phase 6b-1) entfernt — das `GET /skills`-Payload kommt
@@ -2320,5 +2390,167 @@ mod xlsx_range_fixture_tests {
         assert_eq!(row, 9);
         assert_eq!(col, 26);
         assert_eq!(col_letter(col), "AA");
+    }
+}
+
+#[cfg(test)]
+mod progressive_disclosure_tests {
+    //! Phase 6c-3: das Tor zur Progressive Disclosure. Diese Tests
+    //! halten den Tool-Schema-Anstieg pro `read_skill` und die HITL-
+    //! Override-Semantik ehrlich — ohne DB/Postgres.
+
+    use super::*;
+    use crate::skills::SkillRegistry;
+    use std::path::PathBuf;
+
+    fn reg_with(skills: &[(&str, &str)]) -> SkillRegistry {
+        let root: PathBuf = std::env::temp_dir().join(format!("pfx-pd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, content) in skills {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), content).unwrap();
+        }
+        let reg = SkillRegistry::load_from_dir(&root).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        reg
+    }
+
+    const FS: &str = "\
+---
+name: folder-search
+title: Ordner durchsuchen
+description: d
+tools: [list_files, read_file, grep_in_files]
+---
+body
+";
+
+    const DW: &str = "\
+---
+name: document-write
+title: Schreiben
+description: d
+tools: [append_to_file, rewrite_file]
+hitl:
+  default: true
+  perTool:
+    rewrite_file: true
+---
+body
+";
+
+    #[test]
+    fn base_tools_are_just_read_skill_and_ask_user() {
+        let names: Vec<&str> = base_tool_schemas().iter().map(|t| t.name).collect();
+        assert_eq!(names.len(), 2, "Base-Tools sollen genau 2 sein");
+        assert!(names.contains(&READ_SKILL_TOOL));
+        assert!(names.contains(&ASK_TOOL));
+    }
+
+    #[test]
+    fn nothing_loaded_means_only_base_tools_are_exposed() {
+        let reg = reg_with(&[("folder-search", FS)]);
+        let names: Vec<&str> = tools_for_step(&reg, &[]).iter().map(|t| t.name).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&READ_SKILL_TOOL));
+        assert!(names.contains(&ASK_TOOL));
+        // Skill-Tools sind explizit **nicht** dabei.
+        assert!(!names.contains(&"list_files"));
+        assert!(!names.contains(&"grep_in_files"));
+    }
+
+    #[test]
+    fn reading_a_skill_unlocks_exactly_its_tools() {
+        let reg = reg_with(&[("folder-search", FS), ("document-write", DW)]);
+        let names: Vec<&str> = tools_for_step(&reg, &["folder-search".to_string()])
+            .iter()
+            .map(|t| t.name)
+            .collect();
+        // Base + die drei aus folder-search.
+        assert!(names.contains(&READ_SKILL_TOOL));
+        assert!(names.contains(&ASK_TOOL));
+        assert!(names.contains(&"list_files"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"grep_in_files"));
+        // Aber **keine** Schreib-Tools — document-write nicht geladen.
+        assert!(!names.contains(&REWRITE_TOOL));
+        assert!(!names.contains(&WRITE_TOOL));
+    }
+
+    #[test]
+    fn loaded_set_is_deduplicated_and_deterministic() {
+        let reg = reg_with(&[("folder-search", FS)]);
+        // Wenn ein Skill versehentlich zweimal in `loaded` steht, dürfen
+        // wir das Tool-Schema nicht doppelt liefern (Cache- + LLM-Stabilität).
+        let names_once: Vec<&str> = tools_for_step(&reg, &["folder-search".to_string()])
+            .iter()
+            .map(|t| t.name)
+            .collect();
+        let names_twice: Vec<&str> = tools_for_step(
+            &reg,
+            &["folder-search".to_string(), "folder-search".to_string()],
+        )
+        .iter()
+        .map(|t| t.name)
+        .collect();
+        assert_eq!(names_once, names_twice);
+    }
+
+    #[test]
+    fn effective_hitl_keeps_writes_gated_without_skill() {
+        // Ohne geladene Skills greift `is_write_tool` als Default.
+        let reg = reg_with(&[]);
+        assert!(effective_hitl(&reg, &[], REWRITE_TOOL));
+        assert!(effective_hitl(&reg, &[], WRITE_DOCX_TOOL));
+        assert!(!effective_hitl(&reg, &[], "read_file"));
+        assert!(!effective_hitl(&reg, &[], READ_SKILL_TOOL));
+    }
+
+    #[test]
+    fn effective_hitl_per_tool_override_can_only_tighten() {
+        let dw_loose: &str = "\
+---
+name: document-write
+title: t
+description: d
+tools: [rewrite_file]
+hitl:
+  default: true
+  perTool:
+    rewrite_file: false
+---
+body
+";
+        let reg = reg_with(&[("document-write", dw_loose)]);
+        // Skill versucht HITL für rewrite_file abzuschalten — egal: die
+        // globale Write-Klassifizierung gewinnt.
+        assert!(
+            effective_hitl(&reg, &["document-write".to_string()], REWRITE_TOOL),
+            "perTool: false darf HITL nicht abschalten"
+        );
+    }
+
+    #[test]
+    fn effective_hitl_per_tool_override_can_tighten_a_read_tool() {
+        // Skill kann ein **nicht**-Write-Tool zusätzlich gated machen.
+        let strict: &str = "\
+---
+name: strict
+title: t
+description: d
+tools: [read_file]
+hitl:
+  default: false
+  perTool:
+    read_file: true
+---
+body
+";
+        let reg = reg_with(&[("strict", strict)]);
+        assert!(
+            effective_hitl(&reg, &["strict".to_string()], "read_file"),
+            "perTool: true muss HITL auch für Reads aktivieren können"
+        );
     }
 }

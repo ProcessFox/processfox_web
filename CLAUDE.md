@@ -27,7 +27,7 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 ---
 
-## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + Read-Tools + `rewrite_file` + Skill-Registry 6c-1/-2)
+## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + Read-Tools + `rewrite_file` + Skill-Registry 6c-1/-2/-3)
 
 > **Wichtig:** Der Rest dieses Dokuments (§2–§16) beschreibt Architektur &
 > Konventionen. Dieser Abschnitt beschreibt den **realen Umsetzungsstand**.
@@ -61,13 +61,23 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
   Überschreiben einer Text-Datei mit HITL-Diff-Vorschau via `diffLines`
   im Frontend; Endungen `.md`/`.markdown`/`.txt`/`.text`/`.csv`,
   5-MiB-Bestands-Cap).
-- **Skill-Registry (Phase 6c-1/-2):** `backend/skills_builtin/` enthält
-  fünf `SKILL.md`-Bündel (`folder-search`, `document-read`,
-  `document-write`, `table-read`, `table-write`); beim App-Start in eine
-  `SkillRegistry` (Frontmatter-YAML + Markdown-Body) eingelesen,
+- **Skill-Registry + Progressive Tool-Disclosure (Phase 6c-1/-2/-3):**
+  `backend/skills_builtin/` enthält fünf `SKILL.md`-Bündel
+  (`folder-search`, `document-read`, `document-write`, `table-read`,
+  `table-write`); beim App-Start in eine `SkillRegistry` eingelesen,
   via `GET /api/v1/skills` serviert. Migration `0004` migriert Agents
-  vom Legacy-Slot `["files"]` auf das neue 5er-Set. Progressive Tool-
-  Disclosure (`read_skill` + dynamische Tool-Schemas) kommt in 6c-3.
+  vom Legacy-Slot `["files"]` auf das neue 5er-Set. **Tool-Loop läuft
+  jetzt mit Progressive Disclosure** (`backend/src/prompt.rs` +
+  `tools::tools_for_step`): initial sind nur `read_skill` und
+  `ask_user` an den Provider deklariert; ein erfolgreicher
+  `read_skill({skillId})`-Aufruf liefert den Body als Tool-Result und
+  schaltet ab der nächsten Iteration die Tool-Schemas dieses Skills
+  frei. System-Prompt-Composer rendert pro Iteration neu: Datum,
+  Agent-Vorgabe, Workspace-Übersicht (top 30 aus `workspace_files`),
+  Available-Skills-Block (nur Titel + Description + Tool-Namen, **kein**
+  Body), Thoroughness-Policy, Sprach-Direktive. `effective_hitl(loaded,
+  tool_name)` ersetzt das alte `is_write_tool` — Skill-`perTool`-
+  Override kann HITL **nur strenger machen**, nie abschalten.
 - **CI/Deploy:** GitHub Actions baut das Multi-Stage-Image → GHCR;
   Coolify zieht das Image (Docker-Image-Resource, kein VPS-Build),
   Postgres + lokales Persistent Volume `/data`, Domain in Coolify.
@@ -258,6 +268,7 @@ processfox_web/
         ├── perm.rs              # require_member/_editor/_org_owner
         ├── sandbox.rs           # ensure_in_workspace / sanitize_filename
         ├── skills.rs            # SKILL.md-Parser + SkillRegistry (Phase 6c-1/-2)
+        ├── prompt.rs            # System-Prompt-Composer (Phase 6c-3)
         ├── storage.rs           # lokales Volume (STORAGE_DIR), Pfad-Mapping
         ├── crypto.rs            # AES-256-GCM für API-Keys
         ├── ratelimit.rs         # IP-Rate-Limit für Auth
@@ -403,6 +414,7 @@ Da kein lokales Modell unterstützt wird, vereinfacht sich die Provider-Logik ge
 - **API-Keys:** Werden pro Organisation hinterlegt (nicht pro User). Der Backend-Prozess holt den Key aus der Datenbank und injiziert ihn in den LLM-Request — niemals ans Frontend exponiert.
 - **Streaming:** LLM-Antworten werden per WebSocket live an den Client gestreamt, exakt wie die Tauri-Events in Local.
 - **Tool-Calling:** Nur Provider, die `supports_tools()` zurückgeben, erhalten Tool-Schemas. `openai_compat.rs` und `anthropic.rs` aus Local können mit minimalen Anpassungen (kein `spawn_blocking` nötig, da kein lokales Modell) übernommen werden.
+- **Progressive Disclosure & Cache (Phase 6c-3):** Der Tool-Loop sendet pro Iteration nur die Tool-Schemas der bereits geladenen Skills (`base_tool_schemas` + `schemas_for_loaded`). Anthropic-Prompt-Caching profitiert davon, solange der Load-Stand stabil bleibt; bei jedem `read_skill` wächst der Tools-Block und invalidiert seinen Cache — bewusst hingenommen, weil Tool-Choice-Qualität die paar Token-Cents schlägt. Der System-Prompt ist so geschichtet, dass das statische Skill-Listing **vor** dem volatilen Workspace-Block steht — Cache-Effekt bleibt für den oberen Teil erhalten.
 
 ---
 

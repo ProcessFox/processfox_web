@@ -1343,7 +1343,64 @@ enthält die `skills_builtin/`.
 
 ---
 
-### Phase 6c-3 — `compose_system_prompt` + `read_skill` + Progressive Tool-Disclosure (das Herzstück)
+### Phase 6c-3 — `compose_system_prompt` + `read_skill` + Progressive Tool-Disclosure ✅ ABGESCHLOSSEN (2026-05-20)
+
+**Ergebnis:** Der Tool-Loop in `chat.rs` läuft jetzt mit echter
+Progressive Disclosure auf Tool-Schema-Ebene:
+
+- Neues Modul `backend/src/prompt.rs` mit asynchronem
+  `compose_system_prompt` (zieht Workspace-Übersicht aus
+  `workspace_files`) und der reinen `compose_with_summary`-Funktion
+  (DB-frei testbar). Pro Iteration neu komponiert: Datum-Anker,
+  Agent-Vorgabe (DB-Spalte), Workspace-Übersicht (top 30 Dateien als
+  Bullets, Suffix „… N weitere" bei mehr; `pub workspace_summary`
+  einmal pro Run aus der DB gezogen, dann wiederverwendet),
+  Available-Skills-Block (deterministisch alphabetisch, nur Titel +
+  Description + Tool-Namen — **kein** Body), Thoroughness-Policy,
+  Sprach-Direktive.
+- Neues `read_skill`-Tool (`READ_SKILL_TOOL`), in `all_tools()`
+  registriert, schema `{ skillId: string }`, im Tool-Loop als
+  eigener Branch (kein HITL, kein Broadcast). Auf erfolgreiche
+  Aufrufe wird `loaded` (Vec<String> im Run-Scope) erweitert und
+  beim **nächsten** Provider-Call die Tool-Schemas via
+  `tools_for_step(registry, &loaded)` mitgerechnet.
+- Zwei neue Tool-Schema-Helfer: `base_tool_schemas()` (immer:
+  `read_skill` + `ask_user`) und `schemas_for_loaded(registry,
+  loaded)` (die deduplizierten Tools der geladenen Skills).
+  `tools_for_step` setzt beide zusammen.
+- `effective_hitl(registry, loaded, tool_name)` ersetzt das alte
+  `is_write_tool` als HITL-Schaltstelle: startet bei
+  `is_write_tool`, Skill-`perTool: true` kann **strenger** machen,
+  `perTool: false` darf **nicht** abschalten — das Sicherheitsnetz
+  bleibt.
+- Tool-Loop-Guard: ein vom LLM aufgerufenes Tool, das nicht im
+  aktuellen `tools_for_step`-Output steht, kriegt eine freundliche
+  „lies zuerst den passenden Skill"-Meldung statt 500.
+- Legacy-Defense-in-Depth: ein Agent mit `skills = ["files"]` wird
+  serverseitig auf das 5er-Set gemappt (Migration `0004` macht das
+  global; das hier schützt vor Race-Conditions).
+- Reines Streaming bleibt nur noch der Fall **ohne aktivierte
+  Skills** (= reiner Chat-Agent ohne Tools).
+
+Tests: 7 neue DB-freie Unit-Tests in `tools::progressive_disclosure_tests`
+(`base_tools_are_just_read_skill_and_ask_user`,
+`nothing_loaded_means_only_base_tools_are_exposed`,
+`reading_a_skill_unlocks_exactly_its_tools`,
+`loaded_set_is_deduplicated_and_deterministic`,
+`effective_hitl_keeps_writes_gated_without_skill`,
+`effective_hitl_per_tool_override_can_only_tighten`,
+`effective_hitl_per_tool_override_can_tighten_a_read_tool`) plus 6
+Composer-Tests in `prompt::tests` (Skill-Block-Layout mit Titel/
+Description/Tool-Namen, „schon geladen"-Marker, alphabetische
+Sortierung, kein Body-Leak, Composer-Vollständigkeit, Omit-leere-
+Pieces). `cargo test --lib` summa 39 Tests grün.
+
+Gates: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
+`cargo test --lib`, `cargo test --no-run`, `npm run build`. Doku:
+CLAUDE.md §1a-Header + Backend-Bullet (mit explizitem Verweis auf
+`prompt.rs` + `tools_for_step` + `effective_hitl`), §6 Verzeichnis-
+Layout (prompt.rs), §10 (Progressive-Disclosure-Cache-Trade-off).
+DEPLOY.md §8 (Zwei-Schritte-Hinweis: erst `read_skill`, dann Tool).
 
 **Ziel:** Das LLM sieht im System-Prompt eine kompakte Skill-Liste
 (Titel + Description + Tool-Namen, **keine** Schemas). Initial sind

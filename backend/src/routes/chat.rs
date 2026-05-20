@@ -360,10 +360,35 @@ async fn send_message(
     let model = body.model_id.clone();
     let user_id = user.user_id;
     tokio::spawn(async move {
-        let tools = crate::tools::available_tools(&st.skills, &skills);
+        // Phase 6c-3: bestehende Agents mit Legacy-Skill-Slot `"files"`
+        // werden serverseitig auf die 5 neuen Skill-IDs gemappt. Die
+        // DB-Migration `0004` macht das beim ersten Deploy global; das
+        // hier ist Defense-in-Depth, falls vor dem Migration-Run ein
+        // Agent geschrieben wurde.
+        let agent_skills: Vec<String> = if skills.iter().any(|s| s == "files") {
+            vec![
+                "folder-search".to_string(),
+                "document-read".to_string(),
+                "document-write".to_string(),
+                "table-read".to_string(),
+                "table-write".to_string(),
+            ]
+        } else {
+            skills.clone()
+        };
+        // Workspace-Übersicht einmal pro Run aus der DB ziehen — sie
+        // ändert sich nicht innerhalb eines Tool-Loops.
+        let workspace_overview = match crate::prompt::workspace_summary(&st.pool, wid).await {
+            Ok(s) => s,
+            Err(e) => {
+                error_run(&st, wid, &channel, e.to_string());
+                release_run(&st, agent_id, run_id);
+                return;
+            }
+        };
 
-        // --- Kein Tool → reines Streaming (Phase 6a, beste UX) ----------
-        if tools.is_empty() {
+        // --- Kein Skill aktiviert → reines Streaming (Phase 6a, beste UX) ----
+        if agent_skills.is_empty() {
             let mut acc = String::new();
             let res = stream_chat(
                 &st.http,
@@ -401,7 +426,12 @@ async fn send_message(
             return;
         }
 
-        // --- Tools aktiv → ReAct-Loop mit HITL (Phase 6b-1) -------------
+        // --- Tools aktiv → ReAct-Loop mit Progressive Disclosure (Phase 6c-3) ---
+        // `loaded` ist der Run-Scope: jedes erfolgreiche `read_skill(id)`
+        // hängt eine `id` an und erweitert damit für den **nächsten**
+        // Provider-Call sowohl den System-Prompt-Marker als auch die
+        // an Anthropic/OpenAI deklarierten Tool-Schemas.
+        let mut loaded: Vec<String> = Vec::new();
         let mut turns: Vec<llm::Turn> = history
             .iter()
             .map(|m| {
@@ -423,12 +453,22 @@ async fn send_message(
                 reason = "cancelled";
                 break;
             }
+            // Pro Iteration neu komponieren — Skill-Liste markiert die
+            // bereits geladenen Skills, Tool-Schemas wachsen mit `loaded`.
+            let composed_system = crate::prompt::compose_with_summary(
+                &system_prompt,
+                &workspace_overview,
+                &st.skills,
+                &agent_skills,
+                &loaded,
+            );
+            let tools = crate::tools::tools_for_step(&st.skills, &loaded);
             let step = match llm::tool_step(
                 &st.http,
                 &provider,
                 &api_key,
                 &model,
-                &system_prompt,
+                &composed_system,
                 &turns,
                 &tools,
             )
@@ -457,7 +497,46 @@ async fn send_message(
                         "arguments": call.input
                     }),
                 );
-                let outcome: ApiResult<String> = if crate::tools::is_ask_tool(&call.name) {
+                let outcome: ApiResult<String> = if crate::tools::is_read_skill_tool(&call.name) {
+                    // Progressive Disclosure: liefert den Skill-Body und
+                    // erweitert ab dem nächsten Iteration-Step die Tool-
+                    // Schemas. Kein HITL, kein Broadcast — reines Read.
+                    let id = call
+                        .input
+                        .get("skillId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if id.trim().is_empty() {
+                        Ok("Fehler: `skillId` fehlt im Aufruf von \
+                            `read_skill`. Wähle eine `id` aus der \
+                            Available-skills-Liste."
+                            .to_string())
+                    } else if !agent_skills.iter().any(|s| s == &id) {
+                        // Skill existiert vielleicht in der Registry,
+                        // ist aber für diesen Agent nicht aktiviert.
+                        Ok(format!(
+                            "Skill '{id}' ist für diesen Agent nicht \
+                             aktiviert. Verfügbar: {}.",
+                            agent_skills.join(", ")
+                        ))
+                    } else if let Some(skill) = st.skills.get(&id) {
+                        if !loaded.iter().any(|n| n == &id) {
+                            loaded.push(id.clone());
+                        }
+                        Ok(format!(
+                            "# Skill geladen: {title} (id: {id})\n\n{body}",
+                            title = skill.title,
+                            id = skill.name,
+                            body = skill.body.trim()
+                        ))
+                    } else {
+                        Ok(format!(
+                            "Skill '{id}' ist im Server nicht bekannt. \
+                             Prüfe die `id` in der Available-skills-Liste."
+                        ))
+                    }
+                } else if crate::tools::is_ask_tool(&call.name) {
                     let question = call
                         .input
                         .get("question")
@@ -632,7 +711,7 @@ async fn send_message(
                             }
                         }
                     }
-                } else if crate::tools::is_write_tool(&call.name) {
+                } else if crate::tools::effective_hitl(&st.skills, &loaded, &call.name) {
                     if hitl_disabled {
                         crate::tools::execute_write(&st, wid, user_id, &call.name, &call.input)
                             .await
@@ -691,7 +770,25 @@ async fn send_message(
                         }
                     }
                 } else {
-                    crate::tools::execute_read_tool(&st, wid, &call.name, &call.input).await
+                    // Defense-in-Depth: bei korrekter Tool-Deklaration
+                    // kann das LLM eigentlich kein Tool aufrufen, dessen
+                    // Schema nicht im `tools_for_step`-Output war. Sollte
+                    // es trotzdem passieren (Provider-Quirk o. Ä.),
+                    // melden wir das freundlich zurück statt zu crashen.
+                    let known = crate::tools::tools_for_step(&st.skills, &loaded)
+                        .iter()
+                        .any(|t| t.name == call.name);
+                    if !known {
+                        Ok(format!(
+                            "Tool '{}' ist gerade nicht verfügbar. Lies \
+                             zuerst den passenden Skill aus der \
+                             Available-skills-Liste per \
+                             `read_skill({{ skillId: ... }})`.",
+                            call.name
+                        ))
+                    } else {
+                        crate::tools::execute_read_tool(&st, wid, &call.name, &call.input).await
+                    }
                 };
                 let (content, is_error) = match outcome {
                     Ok(s) => (s, false),
