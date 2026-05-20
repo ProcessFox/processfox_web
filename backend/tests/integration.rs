@@ -1478,6 +1478,203 @@ async fn read_xlsx_range_preserves_tricky_strings(pool: PgPool) {
     std::fs::remove_dir_all(&root).ok();
 }
 
+// --- Tests: rewrite_file (Phase 6b-2l) ------------------------------------
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn rewrite_preview_returns_before_and_after(pool: PgPool) {
+    use processfox_web::tools::rewrite_preview;
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    seed_file(&pool, &root, ws, user, "notes.md", b"# Alt\n\nVersion 1.\n").await;
+
+    let preview = rewrite_preview(&state, ws, "notes.md", "# Neu\n\nVersion 2.\n").unwrap();
+    assert_eq!(preview["kind"], "rewriteFile");
+    assert_eq!(preview["path"], "notes.md");
+    assert_eq!(preview["before"], "# Alt\n\nVersion 1.\n");
+    assert_eq!(preview["after"], "# Neu\n\nVersion 2.\n");
+    assert_eq!(preview["createsFile"], false);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn rewrite_preview_marks_new_file(pool: PgPool) {
+    use processfox_web::tools::rewrite_preview;
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, _root) = tool_state(pool.clone());
+
+    let preview = rewrite_preview(&state, ws, "new.md", "# Neu\n").unwrap();
+    assert_eq!(preview["createsFile"], true);
+    assert_eq!(preview["before"], "");
+    assert_eq!(preview["after"], "# Neu\n");
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn rewrite_preview_rejects_office_extension(pool: PgPool) {
+    use processfox_web::tools::rewrite_preview;
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, _root) = tool_state(pool.clone());
+
+    let err = rewrite_preview(&state, ws, "draft.docx", "ignored").unwrap_err();
+    assert!(
+        matches!(err, processfox_web::error::ApiError::BadRequest(_)),
+        ".docx muss 400 werden: {err:?}"
+    );
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn rewrite_preview_rejects_non_utf8_existing(pool: PgPool) {
+    use processfox_web::tools::rewrite_preview;
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    // Latin-1-Bytes mit `.txt`-Endung — kein gültiges UTF-8.
+    seed_file(&pool, &root, ws, user, "junk.txt", &[0xFF, 0xFE, 0x00]).await;
+
+    let err = rewrite_preview(&state, ws, "junk.txt", "neuer Text").unwrap_err();
+    assert!(
+        matches!(err, processfox_web::error::ApiError::BadRequest(_)),
+        "Nicht-UTF-8-Bestand muss 400 werden: {err:?}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn rewrite_preview_rejects_oversize_existing(pool: PgPool) {
+    use processfox_web::tools::rewrite_preview;
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    // 6 MiB Bestand — über dem 5-MiB-Cap.
+    let huge = "a".repeat(6 * 1024 * 1024);
+    seed_file(&pool, &root, ws, user, "big.md", huge.as_bytes()).await;
+
+    let err = rewrite_preview(&state, ws, "big.md", "kleiner Inhalt").unwrap_err();
+    match err {
+        processfox_web::error::ApiError::BadRequest(msg) => {
+            assert!(msg.contains("zu groß"), "Cap-Hinweis fehlt: {msg}");
+            assert!(msg.contains("5 MB"), "Limit-Hinweis fehlt: {msg}");
+        }
+        other => panic!("falscher Fehlertyp: {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn do_rewrite_replaces_existing_and_updates_db(pool: PgPool) {
+    use processfox_web::tools::do_rewrite;
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    seed_file(&pool, &root, ws, user, "notes.md", b"alt").await;
+
+    let msg = do_rewrite(&state, ws, user, "notes.md", "neuer Inhalt")
+        .await
+        .unwrap();
+    assert!(msg.contains("überschrieben"), "{msg}");
+
+    // Volume-Bytes ersetzt.
+    let bytes_on_disk = std::fs::read(root.join(format!("workspaces/{ws}/notes.md"))).unwrap();
+    assert_eq!(bytes_on_disk, b"neuer Inhalt");
+
+    // DB-Zeile aktualisiert.
+    let row: (i64, String) = sqlx::query_as(
+        "SELECT size_bytes, content_type FROM workspace_files \
+         WHERE workspace_id = $1 AND filename = $2",
+    )
+    .bind(ws)
+    .bind("notes.md")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "neuer Inhalt".len() as i64);
+    assert_eq!(row.1, "text/markdown");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn do_rewrite_creates_new_csv(pool: PgPool) {
+    use processfox_web::tools::do_rewrite;
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    let msg = do_rewrite(&state, ws, user, "data.csv", "name,role\nAlice,Owner\n")
+        .await
+        .unwrap();
+    assert!(msg.contains("angelegt"), "{msg}");
+
+    let row: (String,) = sqlx::query_as(
+        "SELECT content_type FROM workspace_files \
+         WHERE workspace_id = $1 AND filename = $2",
+    )
+    .bind(ws)
+    .bind("data.csv")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "text/csv");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn rewrite_preview_does_not_leak_across_workspaces(pool: PgPool) {
+    use processfox_web::tools::rewrite_preview;
+
+    let org_a = seed_org(&pool, "Acme", "AAAA23").await;
+    let user_a = seed_user(&pool, org_a, "a@acme.test", "owner").await;
+    let ws_a = seed_workspace(&pool, org_a, "A").await;
+
+    let org_b = seed_org(&pool, "Globex", "BBBB23").await;
+    seed_user(&pool, org_b, "b@globex.test", "owner").await;
+    let ws_b = seed_workspace(&pool, org_b, "B").await;
+
+    let (state, root) = tool_state(pool.clone());
+    seed_file(
+        &pool,
+        &root,
+        ws_a,
+        user_a,
+        "secret.md",
+        b"Geheime Acme-Notizen",
+    )
+    .await;
+
+    // ws_b kennt die Datei nicht → createsFile, leerer `before`.
+    let preview = rewrite_preview(&state, ws_b, "secret.md", "neu").unwrap();
+    assert_eq!(preview["createsFile"], true);
+    assert_eq!(preview["before"], "");
+    let s = preview.to_string();
+    assert!(!s.contains("Geheime"), "Bytes geleakt: {s}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[sqlx::test(migrations = "./src/db/migrations")]
 async fn grep_caps_hits_at_one_hundred(pool: PgPool) {
     use processfox_web::tools::{execute_read_tool, GREP_TOOL};

@@ -931,6 +931,188 @@ eigenen Workspace, respektiert den 500-Zellen-Cap, blockiert den
 Tokio-Runtime nicht und bleibt bei fehlerhaften Sheets/Zellen-
 Adressen mit lesbaren Meldungen stabil.
 
+## Phase 6b-2l — rewrite_file (Komplett-Überschreiben mit Diff-HITL) ✅ ABGESCHLOSSEN (2026-05-20)
+
+**Ergebnis:** Tool registriert (`backend/src/tools.rs`,
+`REWRITE_TOOL = "rewrite_file"`), als Eintrag im `files`-Skill
+(`skills_json()`), in `is_write_tool` aufgenommen → der generische
+HITL-Loop in `chat.rs:635` übernimmt Preview/Approval/Execute ohne
+Sonderpfad. Endungs-Whitelist `.md`, `.markdown`, `.txt`, `.text`,
+`.csv` (entschieden 2026-05-20: CSV mit aufgenommen, Web-Erweiterung
+gegenüber Local). 5-MiB-Bestands-Cap (entschieden 2026-05-20: 5 MiB
+statt 1 MiB lässt große Protokolle/Daten-CSVs durch und schützt
+trotzdem den Client-Diff vor pathologischen Größen).
+
+Schreibpfad: `sanitize_filename` → Endungs-Check → `ensure_in_workspace`
+→ Bestand laden + UTF-8-Prüfung + Cap-Check → JSON-Preview mit `kind:
+"rewriteFile"`, `before`, `after`, `createsFile` → HITL-Dialog (das
+Frontend rendert die Zeilen-Diff via vorhandener `DiffSection`/
+`diffLines`-Logik) → nach Approve: `std::fs::write` + `workspace_files`-
+Upsert mit content-type-Ableitung (`text/markdown` / `text/plain` /
+`text/csv`) + `fs-changed`-Broadcast.
+
+Helper `rewrite_extension` und `rewrite_content_type` zentralisieren
+die Endungs-Whitelist-Logik (eine Quelle, zwei Aufrufer: Preview und
+Do). Defense-in-Depth: `do_rewrite` prüft die Endung nochmal, falls
+`execute_write` direkt aufgerufen wird.
+
+Tests: 8 Integrationstests in `backend/tests/integration.rs`:
+Preview-Happy-Path mit `before`/`after`, neue Datei `createsFile`,
+`.docx` → 400, Nicht-UTF-8-Bestand → 400, 6-MiB-Bestand → 400 mit
+Limit-Hinweis, `do_rewrite`-Roundtrip mit Volume+DB-Verifizierung,
+CSV-Anlage mit content-type-Check, Cross-Workspace-No-Leak.
+
+Gates grün: `cargo fmt --check`, `cargo clippy --all-targets
+-D warnings`, `cargo test --lib` (13 Tests — keine neuen Lib-Tests,
+weil die Logik in DB/FS-abhängige Pfade fällt), `cargo test --no-run`
+(Integration kompiliert), `npm run build`. Doku-Patches: CLAUDE.md
+§1a-Header + Backend-Bullet, DEPLOY.md §8 (Whitelist + 5-MiB-Cap +
+HITL-Diff-Hinweis).
+
+Ziel: Schreib-Tool, mit dem ein Agent eine Markdown-/Text-Datei im
+Workspace **komplett ersetzt** — mit Zeilen-Diff (`before`/`after`)
+in der HITL-Vorschau. Pendant zu `rewrite_file` aus ProcessFox Local
+(`processfox_local/src-tauri/src/core/tool/tools/rewrite_file.rs`).
+Aktueller Web-Stand: das **Frontend ist komplett vorbereitet** —
+`types/chat.ts:29` definiert die `rewriteFile`-Preview-Variante,
+`HitlCard.tsx:118` + `:208` rendern Header + `DiffSection` über
+`diffLines(before, after)`, Icon-Mapping da. **Nur das Backend-Tool
+fehlt.**
+
+**Aufruf-Vertrag (Tool-Input):**
+- `filename: string` — Workspace-Datei, muss auf `.md`, `.markdown`,
+  `.txt`, `.text` oder `.csv` enden (entschieden 2026-05-20, Web-
+  Erweiterung gegenüber Local: CSV ist im Web ein reguläres Upload-
+  Format und Text-Editierung sinnvoll). **Bewusst nicht** `.docx`/
+  `.xlsx` (eigene Tools mit eigenen Diff-Modellen) — auch nicht
+  `.pdf` (nicht text-überschreibbar).
+- `content: string` — kompletter neuer Inhalt.
+
+**Implementierung in `backend/src/tools.rs`:**
+
+1. Konstante `REWRITE_TOOL: &str = "rewrite_file"`.
+2. Cap: `REWRITE_MAX_EXISTING_BYTES: i64 = 5 * 1024 * 1024` (5 MiB)
+   auf den **Bestand** (entschieden 2026-05-20). Begründung: der
+   Diff in der HITL-Vorschau rendert client-seitig per `diffLines`;
+   bei mehr als ein paar MiB Vergleichstext wird das spürbar zäh.
+   5 MiB lässt auch große Protokoll-/Daten-Dateien zu und schützt
+   gleichzeitig vor pathologischen Total-Rewrites von 50-MiB-
+   Uploads. Local kannte das Problem nicht (Single-User).
+   Output-Cap auf `after` ist nicht nötig — das LLM-Context-Limit
+   deckelt das natürlich.
+3. Endungs-Whitelist:
+   ```rust
+   const REWRITE_ALLOWED: &[&str] = &["md", "markdown", "txt", "text", "csv"];
+   ```
+4. `ToolSpec` in `all_tools()`. Beschreibung erklärt: nur Text-
+   Formate, **vor** dem Aufruf bestenfalls `read_file` machen damit
+   der `content` den existierenden Inhalt sinnvoll fortführt, für
+   reines Anhängen `append_to_file` (sicherer — keine Risiko-
+   Löschung), für Word/Excel die jeweiligen eigenen Tools.
+5. `skills_json()` `tools`-Array um `"rewrite_file"` erweitern.
+6. `is_write_tool` um `name == REWRITE_TOOL` ergänzen — schaltet
+   den HITL-Pfad in `chat.rs:635` ein.
+7. `rewrite_preview(state, wid, filename, content) -> ApiResult<Value>`:
+   - `sanitize_filename` + Endungs-Check (sonst `400` mit Hinweis
+     auf die Spezial-Tools für docx/xlsx).
+   - `workspace_key` + `ensure_in_workspace`.
+   - Bestand laden: `std::fs::read(path)` → `String::from_utf8`. Wenn
+     nicht UTF-8: `400` mit Hinweis (das Tool ist für Text-Dateien
+     gedacht; binäre Bestände würden im Diff sowieso nicht
+     funktionieren).
+   - Bestands-Cap prüfen: `before.len() > REWRITE_MAX_EXISTING_BYTES`
+     → `400` mit Hinweis „Bestand zu groß für rewrite_file
+     (… Bytes, Limit 1 MB) — bitte append-Tools oder gezielte
+     Edits nutzen".
+   - JSON liefern:
+     ```json
+     {
+       "kind": "rewriteFile",
+       "path": "<sanitized>",
+       "before": "<existing UTF-8 content or empty>",
+       "after": "<content>",
+       "createsFile": <bool>
+     }
+     ```
+8. `do_rewrite(state, wid, uploaded_by, filename, content)
+   -> ApiResult<String>`:
+   - Erneut `sanitize_filename` + Endungs-Check (Defense-in-Depth —
+     `write_preview` und `execute_write` werden über die WS sicher
+     mit derselben Input-JSON aufgerufen, aber die Prüfung wiegt
+     nichts und schließt jede Race-Lücke).
+   - `workspace_key` + `ensure_in_workspace`.
+   - `std::fs::write(path, content.as_bytes())` — überschreibt
+     komplett, legt bei Bedarf an.
+   - `content_type` aus Endung ableiten:
+     `.md`/`.markdown` → `text/markdown`,
+     `.txt`/`.text` → `text/plain`,
+     `.csv` → `text/csv`.
+   - `workspace_files`-Upsert mit `ON CONFLICT (workspace_id,
+     filename) DO UPDATE SET size_bytes, content_type, uploaded_by,
+     uploaded_at` — dasselbe Muster wie `do_append`.
+   - `state.ws.publish(Some(wid), "fs-changed", Null)`.
+   - Result-String: `"Datei '{fname}' überschrieben (N Bytes)."`
+     bzw. `"… angelegt (N Bytes)."` je nach `created`.
+9. `write_preview`-Match-Arm und `execute_write`-Match-Arm
+   ergänzen (analog zu den anderen sechs Schreib-Tools).
+
+**Sandbox & Sicherheit:**
+- `sanitize_filename` + `ensure_in_workspace` (Defense-in-Depth).
+- Endungs-Whitelist erzwingt Text-Modell.
+- Bestands-Cap (1 MiB) deckt UX-Risiko (großer Diff im Browser) und
+  DoS-Risiko (Bestand komplett in Speicher gezogen) gleichzeitig.
+- HITL ist **Pflicht** — wie alle Write-Tools. `hitl_disabled`-Pfad
+  (für Org-weite Auto-Approve-Settings) verhält sich wie bei den
+  anderen Schreib-Tools.
+
+**Frontend:**
+- Komplett vorbereitet. Keine Änderungen.
+
+**Tests (`backend/tests/integration.rs`):**
+Da der HITL-Loop in `chat.rs` läuft (nicht in `tools.rs`), testen
+wir die beiden öffentlichen Funktionen direkt:
+
+- **Preview Happy-Path:** `notes.md` mit Inhalt seedten →
+  `write_preview` → JSON enthält `kind: "rewriteFile"`, `before`
+  exakt der Seed-Inhalt, `after` der neue Content, `createsFile:
+  false`.
+- **Preview neue Datei:** `new.md` (nicht existent) → `before: ""`,
+  `createsFile: true`.
+- **Preview falsche Endung:** `notes.docx` → `BadRequest` mit
+  Hinweis auf docx-Tools.
+- **Preview UTF-8-Bruch:** Datei mit Bytes `0xFF 0xFE …` mit
+  `.txt`-Endung → `BadRequest` (binär).
+- **Preview Bestands-Cap:** Datei mit 6 MiB Inhalt seedten →
+  `BadRequest` mit „zu groß" + Limit-Hinweis.
+- **Execute-Roundtrip:** `do_rewrite` aufrufen → Volume-Bytes
+  passen, `workspace_files`-Zeile auf neue `size_bytes`/`content_type`/
+  `uploaded_by` aktualisiert.
+- **Execute neue Datei:** `do_rewrite` auf nicht-existente
+  `new.md` → Volume hat die Datei, DB-Zeile angelegt.
+- **Cross-Workspace-No-Leak (Preview):** Datei in `ws_a`, Preview-
+  Aufruf aus `ws_b` mit gleichem `filename` → `createsFile: true`,
+  `before: ""` — keine Bytes geleakt.
+
+`is_write_tool`-Erweiterung wird durch das schon vorhandene HITL-
+Integrationsmuster im Chat-Loop abgedeckt; ein zusätzlicher
+HITL-E2E-Test ist nicht nötig (gleiche Verdrahtung wie die sechs
+anderen Schreib-Tools).
+
+**Doku-Patches:**
+- `CLAUDE.md` §1a-Backend-Bullet um `rewrite_file` ergänzen.
+- `DEPLOY.md` §8: neue Zeile zu Endungs-Whitelist (`.md`,
+  `.markdown`, `.txt`, `.text`, `.csv`) + 5-MiB-Bestands-Cap.
+
+**Build-Gates:** `cargo fmt`, `cargo clippy --all-targets -- -D
+warnings`, `cargo test --all-targets`, `npm run build`.
+
+**Abnahme:** Agent mit `files`-Skill kann eine `.md`/`.markdown`/
+`.txt`/`.text`/`.csv`-Datei im Workspace komplett ersetzen; der User sieht
+vor der Freigabe einen Zeilen-Diff in der HITL-Card; nach Freigabe
+ist die Datei überschrieben (oder neu angelegt), `workspace_files`
+ist aktualisiert, ein `fs-changed`-Broadcast erreicht alle Workspace-
+Mitglieder live; nach Reject bleibt die Datei unberührt.
+
 ## Querschnitt — Härtung ✅ ABGESCHLOSSEN (2026-05-19)
 
 - HTTP/DB-Integrationstests `backend/tests/integration.rs`: echte Axum-

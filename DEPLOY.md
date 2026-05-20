@@ -199,6 +199,13 @@ Der Link ist 15 Minuten gültig und einmalig nutzbar.
   Strings (kein Type-Drift bei Mixed-Type-Spalten). Kein zusätzlicher
   Größen-Cap auf dem Workbook — das 50-MB-Upload-Limit ist die obere
   Schranke.
+- **Grenze `rewrite_file`:** überschreibt nur Text-Dateien mit den
+  Endungen `.md`, `.markdown`, `.txt`, `.text`, `.csv` (Word/Excel
+  haben eigene Schreib-Tools, PDFs sind nicht text-überschreibbar).
+  Bestand max. 5 MB — sonst BadRequest mit Hinweis auf
+  append-Workflow. Bestand muss UTF-8 sein (sonst BadRequest). HITL
+  ist Pflicht; der Nutzer sieht einen Zeilen-Diff (`DiffSection` im
+  Frontend) bevor er freigibt.
 - **Härtung erledigt:** HTTP/DB-Integrationstests (`backend/tests/
   integration.rs`) laufen in CI (`.github/workflows/ci.yml`, Postgres-
   Service) — Auth, Refresh-Rotation, Workspace-Berechtigungen.

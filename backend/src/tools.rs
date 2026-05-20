@@ -29,6 +29,7 @@ pub const GREP_TOOL: &str = "grep_in_files";
 pub const READ_PDF_TOOL: &str = "read_pdf";
 pub const READ_DOCX_TOOL: &str = "read_docx";
 pub const READ_XLSX_TOOL: &str = "read_xlsx_range";
+pub const REWRITE_TOOL: &str = "rewrite_file";
 /// Sicherheits-Obergrenze für Bulk-Delegation (eine Inferenz je Zeile).
 pub const DELEGATE_MAX_ROWS: usize = 200;
 
@@ -56,6 +57,16 @@ const READ_XLSX_MAX_CELLS: usize = 500;
 /// Spalten, also bei `start = A1` die Range `A1:L25`).
 const READ_XLSX_DEFAULT_ROWS: usize = 25;
 const READ_XLSX_DEFAULT_COLS: usize = 12;
+
+/// Cap auf den Bestand bei `rewrite_file` — schützt den client-seitigen
+/// Diff-Renderer (`diffLines`) vor Multi-MiB-Vergleichen und drückt
+/// pathologische Total-Rewrites in den append-/edit-Pfad. 5 MiB lässt
+/// noch große Markdown-Protokolle und Daten-CSV durch.
+const REWRITE_MAX_EXISTING_BYTES: i64 = 5 * 1024 * 1024;
+/// Endungen, die `rewrite_file` zulässt. Office-Dokumente bewusst nicht
+/// (eigene Tools mit eigenen Diff-Modellen), PDFs nicht (nicht
+/// text-überschreibbar).
+const REWRITE_ALLOWED_EXTENSIONS: &[&str] = &["md", "markdown", "txt", "text", "csv"];
 /// Whitelist textbasierter Endungen — Office-Formate (pdf/docx/xlsx/pptx)
 /// und Bilder werden bewusst ausgeschlossen.
 const GREP_SCAN_EXTENSIONS: &[&str] = &[
@@ -281,6 +292,33 @@ fn all_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: REWRITE_TOOL,
+            description: "Ersetzt den **gesamten** Inhalt einer Text- \
+                Datei im Workspace (.md, .markdown, .txt, .text, .csv) \
+                durch neuen Inhalt. Der Nutzer sieht vor der Freigabe \
+                einen Zeilen-Diff. Vor dem Aufruf am besten `read_file` \
+                machen, damit der neue Content den Bestand sinnvoll \
+                fortführt — bestehender Inhalt geht sonst verloren. Für \
+                reines Anhängen `append_to_file` (sicherer). Word/Excel \
+                haben eigene Tools. Maximaler Bestand 5 MB.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Workspace-Datei, muss auf \
+                            .md/.markdown/.txt/.text/.csv enden."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Kompletter neuer Inhalt; der \
+                            bisherige Inhalt wird vollständig ersetzt."
+                    }
+                },
+                "required": ["filename", "content"]
+            }),
+        },
+        ToolSpec {
             name: DELEGATE_TOOL,
             description: "Verarbeitet eine .xlsx Zeile für Zeile mit je \
                 einer fokussierten KI-Inferenz und schreibt das Ergebnis \
@@ -331,6 +369,7 @@ pub fn is_write_tool(name: &str) -> bool {
         || name == WRITE_DOCX_TPL_TOOL
         || name == APPEND_DOCX_TOOL
         || name == UPDATE_CELLS_TOOL
+        || name == REWRITE_TOOL
 }
 
 pub fn is_ask_tool(name: &str) -> bool {
@@ -353,8 +392,8 @@ pub fn skills_json() -> Value {
         "tools": ["list_files", "read_file", GREP_TOOL, READ_PDF_TOOL,
                   READ_DOCX_TOOL, READ_XLSX_TOOL, WRITE_TOOL,
                   WRITE_XLSX_TOOL, WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL,
-                  APPEND_DOCX_TOOL, UPDATE_CELLS_TOOL, DELEGATE_TOOL,
-                  ASK_TOOL],
+                  APPEND_DOCX_TOOL, UPDATE_CELLS_TOOL, REWRITE_TOOL,
+                  DELEGATE_TOOL, ASK_TOOL],
         "hitl": { "default": true },
         "language": "de",
         "body": "",
@@ -913,6 +952,141 @@ pub async fn do_append(
         .ws
         .publish(Some(wid), "fs-changed", serde_json::Value::Null);
     Ok(format!("An '{fname}' angehängt ({} Bytes gesamt).", size))
+}
+
+// --- rewrite_file (Phase 6b-2l) -------------------------------------------
+
+/// Prüft die Endung gegen die Whitelist und gibt den (lower-case)
+/// Match zurück. Benutzt für Preview-Validierung und Content-Type-
+/// Ableitung.
+fn rewrite_extension(filename: &str) -> Option<&'static str> {
+    let lower = filename.to_lowercase();
+    for ext in REWRITE_ALLOWED_EXTENSIONS {
+        if lower.ends_with(&format!(".{ext}")) {
+            return Some(ext);
+        }
+    }
+    None
+}
+
+fn rewrite_content_type(ext: &str) -> &'static str {
+    match ext {
+        "md" | "markdown" => "text/markdown",
+        "csv" => "text/csv",
+        _ => "text/plain",
+    }
+}
+
+/// HITL-Vorschau für `rewrite_file`: lädt den Bestand, baut die
+/// `before`/`after`-JSON-Struktur, die der `DiffSection`-Renderer im
+/// Frontend erwartet.
+pub fn rewrite_preview(
+    state: &AppState,
+    wid: Uuid,
+    filename: &str,
+    content: &str,
+) -> ApiResult<Value> {
+    let fname = sanitize_filename(filename)?;
+    if rewrite_extension(&fname).is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "Endung muss eine von {:?} sein. Für Word/Excel die jeweiligen \
+             Tools nutzen, PDFs sind nicht rewrite-bar.",
+            REWRITE_ALLOWED_EXTENSIONS
+        )));
+    }
+    let key = workspace_key(wid, &fname);
+    ensure_in_workspace(wid, &key)?;
+    let path = state.storage.path(&key);
+    let (before, creates_file) = match std::fs::read(&path) {
+        Ok(bytes) => {
+            if bytes.len() as i64 > REWRITE_MAX_EXISTING_BYTES {
+                return Err(ApiError::BadRequest(format!(
+                    "Bestand zu groß für rewrite_file ({} Bytes, Limit {} MB). \
+                     Bitte append-Tools oder gezielte Edits nutzen.",
+                    bytes.len(),
+                    REWRITE_MAX_EXISTING_BYTES / (1024 * 1024)
+                )));
+            }
+            match String::from_utf8(bytes) {
+                Ok(s) => (s, false),
+                Err(_) => {
+                    return Err(ApiError::BadRequest(
+                        "Bestand ist nicht UTF-8 — rewrite_file ist nur für \
+                         Text-Dateien."
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Err(_) => (String::new(), true),
+    };
+    Ok(json!({
+        "kind": "rewriteFile",
+        "path": fname,
+        "before": before,
+        "after": content,
+        "createsFile": creates_file,
+    }))
+}
+
+/// Führt das Rewrite **nach** HITL-Freigabe aus: überschreibt die Datei
+/// komplett (legt sie bei Bedarf an), upsertet `workspace_files`,
+/// broadcastet `fs-changed`.
+pub async fn do_rewrite(
+    state: &AppState,
+    wid: Uuid,
+    uploaded_by: Uuid,
+    filename: &str,
+    content: &str,
+) -> ApiResult<String> {
+    let fname = sanitize_filename(filename)?;
+    // Defense-in-Depth: Endung erneut prüfen, falls jemand `execute_write`
+    // direkt mit anderem Input aufruft.
+    let ext = rewrite_extension(&fname).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "Endung muss eine von {:?} sein.",
+            REWRITE_ALLOWED_EXTENSIONS
+        ))
+    })?;
+    let key = workspace_key(wid, &fname);
+    ensure_in_workspace(wid, &key)?;
+    let path = state.storage.path(&key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+    }
+    let was_file = path.is_file();
+    std::fs::write(&path, content.as_bytes())
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+
+    let ctype = rewrite_content_type(ext);
+    sqlx::query(
+        "INSERT INTO workspace_files \
+         (workspace_id, filename, s3_key, size_bytes, content_type, uploaded_by) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (workspace_id, filename) DO UPDATE SET \
+           size_bytes = EXCLUDED.size_bytes, \
+           content_type = EXCLUDED.content_type, \
+           uploaded_by = EXCLUDED.uploaded_by, \
+           uploaded_at = now()",
+    )
+    .bind(wid)
+    .bind(&fname)
+    .bind(&key)
+    .bind(content.len() as i64)
+    .bind(ctype)
+    .bind(uploaded_by)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+
+    state
+        .ws
+        .publish(Some(wid), "fs-changed", serde_json::Value::Null);
+    Ok(if was_file {
+        format!("Datei '{fname}' überschrieben ({} Bytes).", content.len())
+    } else {
+        format!("Datei '{fname}' angelegt ({} Bytes).", content.len())
+    })
 }
 
 // --- xlsx schreiben (Phase 6b-2b) -----------------------------------------
@@ -1931,6 +2105,12 @@ pub fn write_preview(state: &AppState, wid: Uuid, name: &str, input: &Value) -> 
             &paras_from_input(input),
         ),
         UPDATE_CELLS_TOOL => updatecells_preview(state, wid, input),
+        REWRITE_TOOL => rewrite_preview(
+            state,
+            wid,
+            &str_in(input, "filename"),
+            &str_in(input, "content"),
+        ),
         other => Err(ApiError::BadRequest(format!("Kein Write-Tool: {other}"))),
     }
 }
@@ -1992,6 +2172,16 @@ pub async fn execute_write(
             .await
         }
         UPDATE_CELLS_TOOL => do_update_cells(state, wid, uploaded_by, input).await,
+        REWRITE_TOOL => {
+            do_rewrite(
+                state,
+                wid,
+                uploaded_by,
+                &str_in(input, "filename"),
+                &str_in(input, "content"),
+            )
+            .await
+        }
         other => Err(ApiError::BadRequest(format!("Kein Write-Tool: {other}"))),
     }
 }
