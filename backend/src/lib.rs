@@ -32,6 +32,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
 use crate::ratelimit::RateLimiter;
+use crate::skills::SkillRegistry;
 use crate::storage::Storage;
 use crate::ws::WsHub;
 use uuid::Uuid;
@@ -41,6 +42,9 @@ pub struct AppState {
     pub pool: PgPool,
     pub storage: Storage,
     pub config: Arc<Config>,
+    /// Eingelesene SKILL.md-Registry (Phase 6c-2). Beim App-Start aus
+    /// `config.skills_dir` geladen; harte Errors bei Parse-Problemen.
+    pub skills: Arc<SkillRegistry>,
     /// Brute-Force-Schutz für die Auth-Endpunkte.
     pub ratelimit: Arc<RateLimiter>,
     /// HTTP-Client (Magic-Link-Webhook + LLM-Provider).

@@ -12,6 +12,10 @@ pub struct Config {
     pub database_url: String,
     /// Wurzelverzeichnis für Workspace-Dateien (Coolify-Volume, z. B. `/data`).
     pub storage_dir: String,
+    /// Verzeichnis mit den eingebauten `SKILL.md`-Dateien
+    /// (`backend/skills_builtin/` zur Entwicklungszeit, ins Image kopiert
+    /// als `/app/skills_builtin`). Phase 6c-2.
+    pub skills_dir: String,
     pub jwt_secret: String,
     /// 32 rohe Bytes, aus einem 64-stelligen Hex-String dekodiert.
     pub api_key_encryption_key: [u8; 32],
@@ -64,6 +68,7 @@ impl Config {
         Ok(Self {
             database_url: required("DATABASE_URL")?,
             storage_dir: optional("STORAGE_DIR", "/data"),
+            skills_dir: optional("SKILLS_DIR", "/app/skills_builtin"),
             jwt_secret,
             api_key_encryption_key,
             port,

@@ -1223,7 +1223,46 @@ Aufrufer im Backend muss sich noch ändern. Reines Fundament.
 
 ---
 
-### Phase 6c-2 — Built-in Skills im Image + Registry in AppState
+### Phase 6c-2 — Built-in Skills im Image + Registry in AppState ✅ ABGESCHLOSSEN (2026-05-20)
+
+**Ergebnis:** Fünf `SKILL.md`-Dateien in `backend/skills_builtin/`
+(`folder-search`, `document-read`, `document-write`, `table-read`,
+`table-write`) mit eigenständig formulierten Choose-the-right-tool-
+Bodies auf Web-Tool-Inventar (Caps, JSON-Output von `read_xlsx_range`,
+HITL-Hinweis bei Schreib-Bundles, Verweise zwischen Skills).
+`SKILLS_DIR`-Env-Var im `config.rs` (Default `/app/skills_builtin`).
+`AppState` bekommt `pub skills: Arc<SkillRegistry>`, beim Bootstrap in
+`main.rs` aus dem Verzeichnis geladen (harter Abbruch bei Parse-
+Problemen — built-ins sind unter unserer Kontrolle). `GET /api/v1/skills`
+liest jetzt aus der Registry und serialisiert deterministisch
+alphabetisch; das alte `tools::skills_json()` ist gelöscht.
+`available_tools` ist registry-aware: nimmt `(&SkillRegistry,
+&[skill_names])`, baut die Tool-Schemas als Vereinigung der gelisteten
+Skill-Tools, plus `ask_user` immer dazu. Legacy-Slot `"files"` wird
+weiterhin als Catch-all akzeptiert (Defense-in-Depth gegen Race
+zwischen Migration und Pre-Deploy-Agent-Anlage).
+
+Migration `0004_skills_resharded.sql` setzt alle Agents mit
+`skills = ["files"]` auf
+`["folder-search","document-read","document-write","table-read","table-write"]`
+(semantisch äquivalent — gleiche Tool-Menge). Dockerfile-Patch:
+`COPY backend/skills_builtin /app/skills_builtin` in der Runtime-Stage
++ `ENV SKILLS_DIR=/app/skills_builtin`.
+
+Tests: zwei neue Integrationstests in `backend/tests/integration.rs`:
+`skills_endpoint_returns_built_in_set` (deterministische 5er-Liste +
+Vertrags-Check pro Skill: `title`, `description`, `tools` Array,
+`hitl.default` bool, `language: "de"`) und
+`migration_resharded_existing_agents` (Legacy-Agent mit
+`["files"]` → SQL-Resharding → fünf Skills im Array). `test_state`
+lädt die echten Built-ins aus `CARGO_MANIFEST_DIR/skills_builtin` —
+fehlerhafte SKILL.md würde im Test-Setup panicen.
+
+Gates grün: `cargo fmt --check`, `cargo clippy --all-targets
+-D warnings`, `cargo test --lib` (25 Tests), `cargo test --no-run`
+(Integration kompiliert), `npm run build`. Doku: CLAUDE.md §1a-Header
++ Backend-Bullet (Skill-Registry), §6 (Verzeichnis-Layout) und §12
+(Env-Var-Tabelle: `SKILLS_DIR`).
 
 **Ziel:** Fünf neue Web-Skills als Markdown-Dateien im Repo,
 Verzeichnis ins Docker-Image, beim App-Start einlesen, über die

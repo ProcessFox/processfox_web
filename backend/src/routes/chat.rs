@@ -360,7 +360,7 @@ async fn send_message(
     let model = body.model_id.clone();
     let user_id = user.user_id;
     tokio::spawn(async move {
-        let tools = crate::tools::available_tools(&skills);
+        let tools = crate::tools::available_tools(&st.skills, &skills);
 
         // --- Kein Tool → reines Streaming (Phase 6a, beste UX) ----------
         if tools.is_empty() {

@@ -354,12 +354,41 @@ fn all_tools() -> Vec<ToolSpec> {
 }
 
 /// Tools, die der Agent gemäß seiner aktivierten Skills nutzen darf.
-pub fn available_tools(skills: &[String]) -> Vec<ToolSpec> {
+/// Tool-Schemas, die der Agent gemäß seiner aktivierten Skills nutzen
+/// darf (Phase 6c-2). Die Registry definiert pro Skill, welche Tools
+/// reingehören; `available_tools` baut die Vereinigung. `ask_user` ist
+/// immer mit dabei — es ist Infrastruktur, kein User-fakultatives Tool
+/// (vgl. PLAN.md Phase 6c, Entscheidungen vorab).
+///
+/// Legacy-Slot `"files"` (Vor-6c-2-Agents) wird als Catch-all behandelt
+/// und liefert alle Tools — die DB-Migration `0004` stellt zwar auf die
+/// neuen Skill-Namen um, aber Defense-in-Depth schadet hier nicht.
+pub fn available_tools(
+    registry: &crate::skills::SkillRegistry,
+    skills: &[String],
+) -> Vec<ToolSpec> {
     if skills.iter().any(|s| s == "files") {
-        all_tools()
-    } else {
-        Vec::new()
+        return all_tools();
     }
+    let mut wanted: Vec<String> = Vec::new();
+    for skill_name in skills {
+        let Some(skill) = registry.get(skill_name) else {
+            continue;
+        };
+        for t in &skill.tools {
+            if !wanted.contains(t) {
+                wanted.push(t.clone());
+            }
+        }
+    }
+    // ask_user immer mit dabei.
+    if !wanted.iter().any(|t| t == ASK_TOOL) {
+        wanted.push(ASK_TOOL.to_string());
+    }
+    all_tools()
+        .into_iter()
+        .filter(|spec| wanted.iter().any(|t| t == spec.name))
+        .collect()
 }
 
 pub fn is_write_tool(name: &str) -> bool {
@@ -382,24 +411,8 @@ pub fn is_delegate_tool(name: &str) -> bool {
     name == DELEGATE_TOOL
 }
 
-/// `GET /skills`-Payload (Frontend-`Skill`-Vertrag).
-pub fn skills_json() -> Value {
-    json!([{
-        "name": "files",
-        "title": "Dateien",
-        "description": "Workspace-Dateien lesen und (mit Freigabe) ergänzen.",
-        "icon": "Folder",
-        "tools": ["list_files", "read_file", GREP_TOOL, READ_PDF_TOOL,
-                  READ_DOCX_TOOL, READ_XLSX_TOOL, WRITE_TOOL,
-                  WRITE_XLSX_TOOL, WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL,
-                  APPEND_DOCX_TOOL, UPDATE_CELLS_TOOL, REWRITE_TOOL,
-                  DELEGATE_TOOL, ASK_TOOL],
-        "hitl": { "default": true },
-        "language": "de",
-        "body": "",
-        "acceptsAttachments": []
-    }])
-}
+// `skills_json` (Phase 6b-1) entfernt — das `GET /skills`-Payload kommt
+// jetzt aus der `SkillRegistry` (Phase 6c-2), siehe `routes::skills`.
 
 // --- Ausführung -----------------------------------------------------------
 

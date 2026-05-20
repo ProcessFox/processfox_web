@@ -33,7 +33,11 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=frontend /app/dist /app/static
 COPY --from=backend /app/target/release/processfox-web /app/processfox-web
+# Built-in SKILL.md-Dateien (Phase 6c-2). `SKILLS_DIR` per Default auf
+# diesen Pfad — siehe `config::Config::from_env`.
+COPY backend/skills_builtin /app/skills_builtin
 ENV STATIC_DIR=/app/static
+ENV SKILLS_DIR=/app/skills_builtin
 ENV PORT=3000
 EXPOSE 3000
 CMD ["/app/processfox-web"]

@@ -10,6 +10,7 @@ pub mod secrets;
 pub mod settings;
 pub mod workspaces;
 
+use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
@@ -38,7 +39,16 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
-// Mit dem Backend gebündelte Skills (read-only, Phase 6b-1).
-async fn skills() -> Json<serde_json::Value> {
-    Json(crate::tools::skills_json())
+// Im Image eingebundene Skill-Registry, read-only (Phase 6c-2). Liest
+// `SKILL.md`-Frontmatter direkt aus dem `SkillRegistry`-Cache, sortiert
+// deterministisch nach `name` — gleicher JSON-Shape wie zuvor, damit das
+// Frontend unverändert weiterläuft.
+async fn skills(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let items: Vec<serde_json::Value> = state
+        .skills
+        .list()
+        .iter()
+        .map(|s| serde_json::to_value(s.as_ref()).unwrap_or(serde_json::Value::Null))
+        .collect();
+    Json(serde_json::Value::Array(items))
 }

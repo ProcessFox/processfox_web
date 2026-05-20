@@ -27,7 +27,7 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 ---
 
-## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + Read-Tools `grep_in_files`/`read_pdf`/`read_docx`/`read_xlsx_range` + `rewrite_file`)
+## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + Read-Tools + `rewrite_file` + Skill-Registry 6c-1/-2)
 
 > **Wichtig:** Der Rest dieses Dokuments (§2–§16) beschreibt Architektur &
 > Konventionen. Dieser Abschnitt beschreibt den **realen Umsetzungsstand**.
@@ -61,6 +61,13 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
   Überschreiben einer Text-Datei mit HITL-Diff-Vorschau via `diffLines`
   im Frontend; Endungen `.md`/`.markdown`/`.txt`/`.text`/`.csv`,
   5-MiB-Bestands-Cap).
+- **Skill-Registry (Phase 6c-1/-2):** `backend/skills_builtin/` enthält
+  fünf `SKILL.md`-Bündel (`folder-search`, `document-read`,
+  `document-write`, `table-read`, `table-write`); beim App-Start in eine
+  `SkillRegistry` (Frontmatter-YAML + Markdown-Body) eingelesen,
+  via `GET /api/v1/skills` serviert. Migration `0004` migriert Agents
+  vom Legacy-Slot `["files"]` auf das neue 5er-Set. Progressive Tool-
+  Disclosure (`read_skill` + dynamische Tool-Schemas) kommt in 6c-3.
 - **CI/Deploy:** GitHub Actions baut das Multi-Stage-Image → GHCR;
   Coolify zieht das Image (Docker-Image-Resource, kein VPS-Build),
   Postgres + lokales Persistent Volume `/data`, Domain in Coolify.
@@ -229,13 +236,19 @@ processfox_web/
 │       └── workspace/           # NEU: WorkspaceSwitcher, MemberList, InviteDialog
 └── backend/                     # Rust-Backend (Axum) — flaches Modul-Layout
     ├── Cargo.toml
+    ├── skills_builtin/          # eingebaute SKILL.md-Dateien (Phase 6c-2)
+    │   ├── folder-search/SKILL.md
+    │   ├── document-read/SKILL.md
+    │   ├── document-write/SKILL.md
+    │   ├── table-read/SKILL.md
+    │   └── table-write/SKILL.md
     └── src/
         ├── main.rs              # Bootstrap, AppState, axum::serve
         ├── lib.rs               # build_app(), AppState-Struct, Modul-Mounts
-        ├── config.rs            # Env-Vars (DATABASE_URL, STORAGE_DIR, ...)
+        ├── config.rs            # Env-Vars (DATABASE_URL, STORAGE_DIR, SKILLS_DIR, ...)
         ├── error.rs             # ApiError (thiserror) + IntoResponse
         ├── db/
-        │   ├── migrations/      # 0001_init, 0002_magic_link, 0003_*
+        │   ├── migrations/      # 0001_init, 0002_magic_link, 0003_*, 0004_skills_resharded
         │   └── mod.rs           # connect() + migrate!
         ├── auth/                # mod, jwt, token, extractor (JWT-Middleware)
         ├── routes/              # ein Modul pro Feature
@@ -244,6 +257,7 @@ processfox_web/
         ├── ws.rs                # WsHub (broadcast), ws_handler, pump
         ├── perm.rs              # require_member/_editor/_org_owner
         ├── sandbox.rs           # ensure_in_workspace / sanitize_filename
+        ├── skills.rs            # SKILL.md-Parser + SkillRegistry (Phase 6c-1/-2)
         ├── storage.rs           # lokales Volume (STORAGE_DIR), Pfad-Mapping
         ├── crypto.rs            # AES-256-GCM für API-Keys
         ├── ratelimit.rs         # IP-Rate-Limit für Auth
@@ -454,6 +468,7 @@ Eckpunkte:
 | `MAGIC_LINK_WEBHOOK_SECRET` | optional; Header `X-Webhook-Secret` |
 | `PORT` | Backend-Port (Default: 3000) |
 | `STATIC_DIR` | Frontend-Verzeichnis (Default `/app/static`) |
+| `SKILLS_DIR` | Verzeichnis mit den eingebauten `SKILL.md`-Dateien (Default `/app/skills_builtin`; Phase 6c-2) |
 
 ### Coolify-Workflow (Details: `DEPLOY.md`)
 

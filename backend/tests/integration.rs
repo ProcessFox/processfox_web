@@ -27,16 +27,25 @@ use uuid::Uuid;
 use processfox_web::auth::encode_access_token;
 use processfox_web::config::Config;
 use processfox_web::ratelimit::RateLimiter;
+use processfox_web::skills::SkillRegistry;
 use processfox_web::storage::Storage;
 use processfox_web::ws::WsHub;
 use processfox_web::{build_app, AppState};
 
 const JWT_SECRET: &str = "test-jwt-secret-at-least-32-bytes-long!!";
 
+/// Pfad zur Built-in-`SKILL.md`-Sammlung im Repo. `CARGO_MANIFEST_DIR`
+/// zeigt zur Build-Zeit auf `backend/`, dort liegt der Ordner.
+fn skills_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills_builtin")
+}
+
 fn test_state(pool: PgPool) -> AppState {
+    let dir = skills_dir();
     let config = Config {
         database_url: String::new(),
         storage_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+        skills_dir: dir.to_string_lossy().into_owned(),
         jwt_secret: JWT_SECRET.to_string(),
         api_key_encryption_key: [7u8; 32],
         port: 0,
@@ -48,10 +57,13 @@ fn test_state(pool: PgPool) -> AppState {
         magic_link_webhook_url: "http://127.0.0.1:9/unreachable".to_string(),
         magic_link_webhook_secret: None,
     };
+    let skills =
+        Arc::new(SkillRegistry::load_from_dir(&dir).expect("Built-in-Skills müssen sauber laden"));
     AppState {
         pool,
         storage: Storage::new(&config.storage_dir),
         config: Arc::new(config),
+        skills,
         // Hoch genug, dass das Rate-Limit die Tests nicht stört.
         ratelimit: Arc::new(RateLimiter::new(10_000, Duration::from_secs(300))),
         http: reqwest::Client::new(),
@@ -156,6 +168,79 @@ fn bearer_for(user_id: Uuid, org_id: Uuid, role: &str) -> String {
 }
 
 // --- Tests: Verdrahtung & Auth-Guard --------------------------------------
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn skills_endpoint_returns_built_in_set(pool: PgPool) {
+    let r = call(&pool, "GET", "/api/v1/skills", None, None, None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let arr = r.body.as_array().expect("skills muss Array sein");
+    let names: Vec<String> = arr
+        .iter()
+        .map(|v| v["name"].as_str().unwrap_or("").to_string())
+        .collect();
+    // Deterministisch alphabetisch — Phase 6c-1 garantiert das.
+    assert_eq!(
+        names,
+        vec![
+            "document-read",
+            "document-write",
+            "folder-search",
+            "table-read",
+            "table-write",
+        ]
+    );
+    // Frontend-Vertrag: jedes Element hat Titel, Description, Tools-Liste,
+    // hitl-Default und Sprache.
+    for v in arr {
+        assert!(!v["title"].as_str().unwrap_or("").is_empty(), "{v}");
+        assert!(!v["description"].as_str().unwrap_or("").is_empty(), "{v}");
+        assert!(v["tools"].as_array().is_some(), "{v}");
+        assert!(v["hitl"]["default"].is_boolean(), "{v}");
+        assert_eq!(v["language"], "de", "{v}");
+    }
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn migration_resharded_existing_agents(pool: PgPool) {
+    // Simuliere einen Vor-6c-Agenten mit dem alten Legacy-Slot. Migration
+    // 0004 lief beim Test-Setup schon einmal vorab; ein NACH der Migration
+    // angelegter Agent mit `["files"]` wird vom UPDATE nicht mehr erfasst.
+    // Deshalb hier explizit nochmal das Resharding-SQL auf den frisch
+    // angelegten Agenten anwenden.
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let owner = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let agent_id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO agents (workspace_id, name, system_prompt, provider, \
+         model_id, skills) VALUES ($1, 'A', '', 'openai', 'gpt-4', \
+         '[\"files\"]'::jsonb) RETURNING id",
+    )
+    .bind(ws)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let _ = owner; // wir nutzen ihn nicht für den Token hier
+
+    sqlx::query(
+        "UPDATE agents SET skills = \
+         '[\"folder-search\",\"document-read\",\"document-write\",\
+           \"table-read\",\"table-write\"]'::jsonb \
+         WHERE skills = '[\"files\"]'::jsonb",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let after: serde_json::Value = sqlx::query_scalar("SELECT skills FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let arr = after.as_array().expect("skills muss Array sein");
+    assert_eq!(arr.len(), 5);
+    assert!(arr.iter().any(|v| v == "folder-search"));
+    assert!(arr.iter().any(|v| v == "table-write"));
+}
 
 #[sqlx::test(migrations = "./src/db/migrations")]
 async fn health_is_public(pool: PgPool) {

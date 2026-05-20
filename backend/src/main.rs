@@ -4,6 +4,7 @@ use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
 use processfox_web::config::Config;
+use processfox_web::skills::SkillRegistry;
 use processfox_web::storage::Storage;
 use processfox_web::{build_app, db, AppState};
 
@@ -27,6 +28,17 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(dir = %config.storage_dir, "Datei-Storage (lokales Volume)");
     let storage = Storage::new(&config.storage_dir);
 
+    // Skill-Registry beim Start laden (Phase 6c-2). Harter Fehler bei
+    // kaputter SKILL.md — built-ins sind unter unserer Kontrolle.
+    let skills = SkillRegistry::load_from_dir(std::path::Path::new(&config.skills_dir))
+        .map_err(|e| anyhow::anyhow!("Skill-Registry konnte nicht geladen werden: {e}"))?;
+    tracing::info!(
+        dir = %config.skills_dir,
+        count = skills.len(),
+        "Skill-Registry geladen"
+    );
+    let skills = Arc::new(skills);
+
     // Max. 10 Auth-Versuche pro IP in 5 Minuten.
     let ratelimit = Arc::new(processfox_web::ratelimit::RateLimiter::new(
         10,
@@ -37,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         pool,
         storage,
         config: Arc::new(config),
+        skills,
         ratelimit,
         http: reqwest::Client::new(),
         ws: processfox_web::ws::WsHub::new(),
