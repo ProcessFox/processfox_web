@@ -581,6 +581,163 @@ respektiert den 20-MiB-Input- und 200-KiB-Output-Cap, blockiert den
 Tokio-Runtime nicht und bleibt bei kaputten PDFs stabil (freundlicher
 Tool-Result statt 500).
 
+## Phase 6b-2j — read_docx (Word-Text-Extraktion) ✅ ABGESCHLOSSEN (2026-05-20)
+
+**Ergebnis:** Tool registriert (`backend/src/tools.rs`,
+`READ_DOCX_TOOL = "read_docx"`), als Eintrag im `files`-Skill
+(`skills_json()`), Dispatch in `execute_read_tool` ohne HITL/Broadcast.
+Lesepfad: `sanitize_filename` + `.docx`-Endung → DB-Vorabcheck (Existenz
++ 20-MiB-Cap **vor** dem Inflaten) → `ensure_in_workspace` → Bytes vom
+Volume → `tokio::task::spawn_blocking` für ZIP-Inflate + XML-Parse
+(gleiche §11-Ausnahme wie `read_pdf`). Output analog `read_pdf`:
+Header `--- filename (N Bytes) ---`, 200-KiB-Truncation-Footer,
+Hinweis bei leerer Extraktion. Kaputte DOCX werden zu einer freundlichen
+Tool-Result-Meldung, **kein** 500.
+
+Refactor mit umgesetzt: die naive `<w:t>`-Find-Schleife (alter
+`docx_text`-Helfer) ist durch `extract_docx_text_from_xml` ersetzt
+(`quick_xml`-Events, `<w:t>`-Text, `<w:br>` → `\n`, `<w:p>`-Ende →
+`\n\n`, Drei-Newline-Kollaps). Genutzt vom neuen Tool **und** der
+HITL-Tail-Vorschau in `appenddocx_preview` — eine Quelle, kein Drift.
+Keine neue Cargo-Dependency (`quick_xml` und `zip` waren schon drin
+für Office-Vorschau und -Schreiben).
+
+Tests: 6 Integrationstests in `backend/tests/integration.rs`
+(Happy-Path mit hand-gebauter Mini-DOCX `make_minimal_docx`, falsche
+Endung → 400, fehlende Datei → freundlich, Cross-Workspace-No-Leak,
+20-MiB-Cap, kaputte Bytes → freundlich) plus zwei DB-unabhängige
+Unit-Tests `tools::docx_fixture_tests::roundtrips_paragraph_text` und
+`rejects_non_zip_input`, die das eigene `build_docx` gegen den neuen
+Extraktor round-trippen.
+
+Gates grün: `cargo fmt --check`, `cargo clippy --all-targets
+-D warnings`, `cargo test --lib` (11 Tests), `cargo test --no-run`
+(Integration kompiliert), `npm run build`. Doku-Patches: CLAUDE.md
+§1a-Header + Backend-Bullet (Tool-Inventar mit Hinweis auf den
+geteilten Extraktor), DEPLOY.md §8 (neue Grenzen).
+
+Ziel: Read-only-Tool, das den Lauftext einer Workspace-`.docx` für das
+LLM liefert. Pendant zu `read_docx` aus ProcessFox Local
+(`processfox_local/src-tauri/src/core/tool/tools/read_docx.rs`).
+Aktueller Web-Stand: Browser-Vorschau (`preview.rs::docx`) liefert
+JSON nur fürs UI; der interne Helfer `tools.rs::read_docx_doc_opt` +
+`docx_text` deckt nur die HITL-Tail-Anzeige bei `append_to_docx` ab
+und ist über die Tool-API nicht erreichbar. Frontend-Icon
+(`src/lib/toolIcons.ts:20`, `read_docx: FileText`) ist da.
+
+**Aufruf-Vertrag (Tool-Input):**
+- `filename: string` — Workspace-Datei, muss auf `.docx` enden.
+
+Bewusst **kein** `path` (Web-Workspace ist flach). Konsistent mit
+`read_file`/`read_pdf`/`grep_in_files`.
+
+**Keine neue Dependency:** `zip` (Cargo.toml Zeile 60, deflate-Feature)
+und `quick_xml` (Zeile 61) sind beide bereits eingebunden — für die
+Office-Vorschau und das XLSX-/DOCX-Schreiben.
+
+**Implementierung in `backend/src/tools.rs`:**
+
+1. Konstante `READ_DOCX_TOOL: &str = "read_docx"`.
+2. Caps konsistent zu `read_pdf`:
+   - `READ_DOCX_MAX_INPUT_BYTES: i64 = 20 * 1024 * 1024` (Eingaberobust,
+     Upload-Limit bleibt 50 MiB).
+   - `READ_DOCX_MAX_OUTPUT_BYTES: usize = 200 * 1024`.
+3. `ToolSpec` in `all_tools()` direkt nach dem `read_pdf`-Eintrag.
+   Beschreibung nennt: extrahiert nur Lauftext (Tabellen-Zellen-Inhalte
+   bleiben implizit erhalten, da `<w:t>` in `<w:tc>` steckt; Bilder/
+   eingebettete Objekte werden gestrippt), Paragraph-Trennung mit
+   Leerzeile.
+4. `skills_json()` `tools`-Array um `"read_docx"` erweitern.
+5. Neue Hilfsfunktion `extract_docx_text(bytes: &[u8]) -> ApiResult<String>`
+   (oben im Datei, neben den anderen DOCX-Helpern):
+   - ZIP aus `&[u8]` (`std::io::Cursor`), `word/document.xml` lesen.
+   - `quick_xml::Reader::from_str` mit `trim_text(false)`, Events
+     durchgehen: `<w:t>` → Text einsammeln (mit `unescape()`),
+     `<w:p>` Ende → `"\n\n"`, `<w:br/>` (Empty) → `"\n"`. Namespace-
+     Prefix `w:` per kleinem `local_name`-Helfer abschneiden.
+   - Drei-oder-mehr-Newlines auf zwei kollabieren.
+   - Parse-Fehler → `ApiError::BadRequest("DOCX-XML konnte nicht
+     gelesen werden: …")`.
+6. Funktion `async fn read_docx(state, wid, input) -> ApiResult<String>`:
+   - `filename` extrahieren → `sanitize_filename` → `.docx`-Endung
+     erzwingen (sonst `400`).
+   - DB-Vorabcheck `workspace_files` (Existenz + 20-MiB-Cap) **vor**
+     dem ZIP-Entpacken. „DB ist Wahrheit, Volume ist Bytes".
+   - `ensure_in_workspace` (Defense-in-Depth).
+   - Bytes laden (`std::fs::read`); wenn das Volume die Datei nicht
+     hat → freundliche „nicht gefunden"-Meldung (nicht 500).
+   - **`tokio::task::spawn_blocking`** für `extract_docx_text(&bytes)` —
+     gleiche §11-Ausnahme wie bei `read_pdf` (ZIP-Inflate + XML-Parse
+     sind CPU-gebunden; v. a. Decks mit großen `document.xml` würden
+     sonst den Tokio-Runtime blocken).
+   - Fehler aus dem Parser → freundlicher Tool-Result-String (Chat-
+     Loop-Stabilität).
+   - Output-Form analog `read_pdf`:
+     - `--- {fname} ({N} Bytes) ---` Header.
+     - Leerer Trim → `"[leere Extraktion — Dokument enthält keinen
+       Lauftext]"`.
+     - > 200 KiB → erste ~50 000 Zeichen + Footer `"[gekürzt — Extraktion
+       überschreitet 200 KB]"`.
+     - Sonst: Volltext.
+7. Dispatcher-Arm in `execute_read_tool` für `READ_DOCX_TOOL` — kein
+   HITL, kein Broadcast.
+8. **Refactor:** Den bestehenden internen `docx_text`-Helfer (naive
+   `<w:t>`-Find-Schleife) durch die neue `extract_docx_text` ersetzen
+   und `appenddocx_preview` darauf umstellen. Damit nutzen Tool und
+   HITL-Tail-Vorschau **denselben** Extraktor — eine Wahrheit, weniger
+   Drift. `read_docx_doc_opt` bleibt als kombinierte „Bytes + raw XML"-
+   Hilfe für `do_append_docx` (dort wird das XML auch geschrieben).
+
+**Sandbox & Sicherheit:**
+- `sanitize_filename` + `ensure_in_workspace`.
+- Größen-Cap vor dem Parsen (DoS-Schutz).
+- ZIP-Bomb-Risiko: wir lesen ausschließlich `word/document.xml`, nicht
+  rekursiv alle Entries — die ZIP-Bibliothek dekomprimiert nur einen
+  Entry. Sollte ein extrem aufgeblähtes `document.xml` eine ZIP-Bomb
+  liefern, fängt der 200-KiB-Output-Cap das im Result ab (der Parser
+  selbst läuft auf einem zur Verfügung gestellten String — die
+  unkomprimierte Größe ist durch die ZIP-Entry-Größe begrenzt, die
+  wiederum durch den 20-MiB-Input-Cap der gesamten Datei limitiert
+  ist).
+
+**Frontend:**
+- Icon ist schon da.
+- Keine WS-Channel-Änderungen, läuft im bestehenden Tool-Stream.
+
+**Tests (`backend/tests/integration.rs`):**
+- **Happy-Path:** `build_docx(&["Hallo Welt", "Zweite Zeile"])` (eigene
+  schon vorhandene Builder-Funktion, siehe Phase 6b-2c) liefert
+  Test-Bytes → seeden → `read_docx` enthält beide Strings mit
+  Paragraph-Trennung (`\n\n`).
+- **Falsche Endung:** `filename: "notes.txt"` → `400`.
+- **Nicht vorhandene Datei:** → freundliche „nicht gefunden"-Meldung.
+- **Cross-Workspace-No-Leak:** DOCX in `ws_a`, Abfrage aus `ws_b` →
+  „nicht gefunden".
+- **20-MiB-Cap:** `workspace_files`-Zeile mit `size_bytes = 30 MiB`
+  → `400` mit Größen-Hinweis.
+- **Kaputte Bytes / kein gültiges ZIP:** `b"definitiv kein DOCX"` mit
+  `.docx`-Endung → freundliche Meldung, **kein** `unwrap_err()`.
+- **Roundtrip-Smoketest** als zusätzlicher Unit-Test in `tools.rs`
+  (`#[cfg(test)] mod docx_fixture_tests`): `build_docx` → `extract_docx_text`
+  → Text enthält die erwarteten Absätze. DB-frei, läuft lokal.
+
+**Doku-Patches:**
+- `CLAUDE.md` §1a-Backend-Bullet um `read_docx` ergänzen.
+- `DEPLOY.md` §8: neue Zeile zu `read_docx`-Grenzen
+  (20-MiB-Eingabe, 200-KiB-Ausgabe, nur Lauftext — Tabellen-Inhalt ja,
+  Bilder/eingebettete Objekte werden gestrippt).
+
+**Build-Gates:** `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test --all-targets`, `npm run build`.
+
+**Abnahme:** Agent mit `files`-Skill kann eine im Workspace liegende
+DOCX per `read_docx` lesen, bekommt den Lauftext mit Header-/Empty-/
+Truncation-Hinweis zurück, scannt nichts außerhalb des Workspaces,
+respektiert den 20-MiB-Input- und 200-KiB-Output-Cap, blockiert den
+Tokio-Runtime nicht und bleibt bei kaputten DOCX stabil (freundlicher
+Tool-Result statt 500). Tool **und** HITL-Tail-Vorschau bei
+`append_to_docx` nutzen denselben Extraktor.
+
 ## Querschnitt — Härtung ✅ ABGESCHLOSSEN (2026-05-19)
 
 - HTTP/DB-Integrationstests `backend/tests/integration.rs`: echte Axum-

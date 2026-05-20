@@ -974,6 +974,248 @@ async fn read_pdf_broken_bytes_yield_friendly_result(pool: PgPool) {
     std::fs::remove_dir_all(&root).ok();
 }
 
+// --- Tests: read_docx (Phase 6b-2j) ---------------------------------------
+
+/// Baut eine minimale, gültige `.docx` mit den gegebenen Absätzen — ZIP
+/// mit `[Content_Types].xml`, `_rels/.rels`, `word/document.xml`. Wir
+/// nutzen das Backend nicht, weil die Tests an `tools.rs` privat sind;
+/// stattdessen die Struktur direkt selbst zusammenbauen. Klein genug,
+/// um inline zu leben.
+fn make_minimal_docx(paragraphs: &[&str]) -> Vec<u8> {
+    use std::io::Write;
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+    let body: String = paragraphs
+        .iter()
+        .map(|p| {
+            format!(
+                "<w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
+                xml_escape(p)
+            )
+        })
+        .collect();
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+<w:body>{body}<w:sectPr/></w:body></w:document>"
+    );
+    const CONTENT_TYPES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" \
+ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+</Types>";
+    const RELS: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" \
+Target=\"word/document.xml\"/>\
+</Relationships>";
+    let mut buf = Vec::<u8>::new();
+    {
+        let cursor = std::io::Cursor::new(&mut buf);
+        let mut zw = zip::ZipWriter::new(cursor);
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(CONTENT_TYPES.as_bytes()).unwrap();
+        zw.start_file("_rels/.rels", opts).unwrap();
+        zw.write_all(RELS.as_bytes()).unwrap();
+        zw.start_file("word/document.xml", opts).unwrap();
+        zw.write_all(document.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    }
+    buf
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_docx_extracts_paragraphs(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_DOCX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    let bytes = make_minimal_docx(&["Hallo Welt", "Zweite Zeile"]);
+    seed_file(&pool, &root, ws, user, "doc.docx", &bytes).await;
+
+    let out = execute_read_tool(
+        &state,
+        ws,
+        READ_DOCX_TOOL,
+        &json!({ "filename": "doc.docx" }),
+    )
+    .await
+    .unwrap();
+
+    assert!(out.starts_with("--- doc.docx ("), "{out}");
+    assert!(out.contains("Hallo Welt"), "{out}");
+    assert!(out.contains("Zweite Zeile"), "{out}");
+    assert!(
+        out.contains("Hallo Welt\n\nZweite Zeile"),
+        "Paragraph-Trennung fehlt: {out}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_docx_rejects_non_docx_extension(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_DOCX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, _root) = tool_state(pool.clone());
+
+    let err = execute_read_tool(
+        &state,
+        ws,
+        READ_DOCX_TOOL,
+        &json!({ "filename": "notes.txt" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, processfox_web::error::ApiError::BadRequest(_)),
+        "falsche Endung muss 400 werden: {err:?}"
+    );
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_docx_missing_file_is_friendly(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_DOCX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, _root) = tool_state(pool.clone());
+
+    let out = execute_read_tool(
+        &state,
+        ws,
+        READ_DOCX_TOOL,
+        &json!({ "filename": "missing.docx" }),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("nicht gefunden"), "{out}");
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_docx_does_not_leak_across_workspaces(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_DOCX_TOOL};
+
+    let org_a = seed_org(&pool, "Acme", "AAAA23").await;
+    let user_a = seed_user(&pool, org_a, "a@acme.test", "owner").await;
+    let ws_a = seed_workspace(&pool, org_a, "A").await;
+
+    let org_b = seed_org(&pool, "Globex", "BBBB23").await;
+    seed_user(&pool, org_b, "b@globex.test", "owner").await;
+    let ws_b = seed_workspace(&pool, org_b, "B").await;
+
+    let (state, root) = tool_state(pool.clone());
+    let bytes = make_minimal_docx(&["Acme Top Secret"]);
+    seed_file(&pool, &root, ws_a, user_a, "secret.docx", &bytes).await;
+
+    let probe = execute_read_tool(
+        &state,
+        ws_b,
+        READ_DOCX_TOOL,
+        &json!({ "filename": "secret.docx" }),
+    )
+    .await
+    .unwrap();
+    assert!(probe.contains("nicht gefunden"), "{probe}");
+    assert!(!probe.contains("Acme Top Secret"), "{probe}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_docx_input_cap_rejects_huge_files(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_DOCX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    // DB-Zeile mit über 20 MiB; Volume bleibt leer — der Cap feuert vor
+    // dem Lesen.
+    let key = format!("workspaces/{ws}/huge.docx");
+    sqlx::query(
+        "INSERT INTO workspace_files \
+         (workspace_id, filename, s3_key, size_bytes, content_type, uploaded_by) \
+         VALUES ($1, 'huge.docx', $2, $3, \
+           'application/vnd.openxmlformats-officedocument.wordprocessingml.document', $4)",
+    )
+    .bind(ws)
+    .bind(&key)
+    .bind(30_i64 * 1024 * 1024)
+    .bind(user)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = execute_read_tool(
+        &state,
+        ws,
+        READ_DOCX_TOOL,
+        &json!({ "filename": "huge.docx" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, processfox_web::error::ApiError::BadRequest(_)),
+        "über dem Cap muss 400 werden: {err:?}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_docx_broken_bytes_yield_friendly_result(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_DOCX_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    // Nicht-ZIP-Bytes mit `.docx`-Endung — der Tool-Loop bekommt eine
+    // freundliche Meldung statt 500.
+    seed_file(
+        &pool,
+        &root,
+        ws,
+        user,
+        "broken.docx",
+        b"definitiv kein DOCX\n",
+    )
+    .await;
+
+    let out = execute_read_tool(
+        &state,
+        ws,
+        READ_DOCX_TOOL,
+        &json!({ "filename": "broken.docx" }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        out.contains("konnte nicht gelesen werden"),
+        "kaputtes DOCX muss freundlich beendet werden: {out}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[sqlx::test(migrations = "./src/db/migrations")]
 async fn grep_caps_hits_at_one_hundred(pool: PgPool) {
     use processfox_web::tools::{execute_read_tool, GREP_TOOL};

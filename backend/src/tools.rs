@@ -27,6 +27,7 @@ pub const DELEGATE_TOOL: &str = "delegate_into_xlsx_column";
 pub const ASK_TOOL: &str = "ask_user";
 pub const GREP_TOOL: &str = "grep_in_files";
 pub const READ_PDF_TOOL: &str = "read_pdf";
+pub const READ_DOCX_TOOL: &str = "read_docx";
 /// Sicherheits-Obergrenze für Bulk-Delegation (eine Inferenz je Zeile).
 pub const DELEGATE_MAX_ROWS: usize = 200;
 
@@ -42,6 +43,10 @@ const GREP_SNIPPET_CHARS: usize = 200;
 /// Local (200 KiB Plain-Text).
 const READ_PDF_MAX_INPUT_BYTES: i64 = 20 * 1024 * 1024;
 const READ_PDF_MAX_OUTPUT_BYTES: usize = 200 * 1024;
+
+/// Caps für `read_docx` (analog `read_pdf`).
+const READ_DOCX_MAX_INPUT_BYTES: i64 = 20 * 1024 * 1024;
+const READ_DOCX_MAX_OUTPUT_BYTES: usize = 200 * 1024;
 /// Whitelist textbasierter Endungen — Office-Formate (pdf/docx/xlsx/pptx)
 /// und Bilder werden bewusst ausgeschlossen.
 const GREP_SCAN_EXTENSIONS: &[&str] = &[
@@ -101,6 +106,24 @@ fn all_tools() -> Vec<ToolSpec> {
                     "filename": {
                         "type": "string",
                         "description": "Workspace-Datei, muss auf .pdf enden."
+                    }
+                },
+                "required": ["filename"]
+            }),
+        },
+        ToolSpec {
+            name: READ_DOCX_TOOL,
+            description: "Extrahiert den Lauftext aus einer Word-Datei \
+                (.docx) im Workspace. Absätze sind durch Leerzeilen \
+                getrennt; Tabellen-Zellen-Inhalt bleibt erhalten, \
+                Bilder/eingebettete Objekte werden gestrippt. Eingabe \
+                max. 20 MB, Ausgabe max. ~200 KB (danach gekürzt).",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Workspace-Datei, muss auf .docx enden."
                     }
                 },
                 "required": ["filename"]
@@ -283,9 +306,9 @@ pub fn skills_json() -> Value {
         "description": "Workspace-Dateien lesen und (mit Freigabe) ergänzen.",
         "icon": "Folder",
         "tools": ["list_files", "read_file", GREP_TOOL, READ_PDF_TOOL,
-                  WRITE_TOOL, WRITE_XLSX_TOOL, WRITE_DOCX_TOOL,
-                  WRITE_DOCX_TPL_TOOL, APPEND_DOCX_TOOL, UPDATE_CELLS_TOOL,
-                  DELEGATE_TOOL, ASK_TOOL],
+                  READ_DOCX_TOOL, WRITE_TOOL, WRITE_XLSX_TOOL,
+                  WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL, APPEND_DOCX_TOOL,
+                  UPDATE_CELLS_TOOL, DELEGATE_TOOL, ASK_TOOL],
         "hitl": { "default": true },
         "language": "de",
         "body": "",
@@ -506,6 +529,83 @@ async fn read_pdf(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<Strin
     Ok(body)
 }
 
+/// DOCX-Text-Extraktion (Phase 6b-2j). ZIP-Inflate + XML-Parse sind
+/// CPU-gebunden → Blocking-Pool, gleiche §11-Ausnahme wie `read_pdf`.
+async fn read_docx(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<String> {
+    let filename = input
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("filename fehlt".into()))?;
+    let fname = sanitize_filename(filename)?;
+    if !fname.to_lowercase().ends_with(".docx") {
+        return Err(ApiError::BadRequest(
+            "Dateiname muss auf .docx enden.".into(),
+        ));
+    }
+
+    // DB-Vorabcheck (Existenz + Cap) vor dem Inflaten.
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT size_bytes FROM workspace_files \
+         WHERE workspace_id = $1 AND filename = $2",
+    )
+    .bind(wid)
+    .bind(&fname)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    let Some((size_bytes,)) = row else {
+        return Ok(format!("(Datei '{fname}' nicht gefunden)"));
+    };
+    if size_bytes > READ_DOCX_MAX_INPUT_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "DOCX zu groß ({size_bytes} Bytes, Limit {} MB).",
+            READ_DOCX_MAX_INPUT_BYTES / (1024 * 1024)
+        )));
+    }
+
+    let key = workspace_key(wid, &fname);
+    ensure_in_workspace(wid, &key)?;
+    let path = state.storage.path(&key);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(format!("(Datei '{fname}' nicht gefunden)"));
+    };
+
+    // ZIP + XML-Parse auf den Blocking-Pool — kann bei großen Dokumenten
+    // mehrere ms kosten, das soll nicht den Async-Reaktor blockieren.
+    let extract_join = tokio::task::spawn_blocking(move || extract_docx_text(&bytes)).await;
+
+    let extracted = match extract_join {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => {
+            return Ok(format!("DOCX konnte nicht gelesen werden ('{fname}'): {e}"));
+        }
+        Err(e) => {
+            return Ok(format!("DOCX-Extraktion abgebrochen ('{fname}'): {e}"));
+        }
+    };
+
+    let total_bytes = extracted.len();
+    let body = if extracted.trim().is_empty() {
+        format!(
+            "--- {fname} ({total_bytes} Bytes) ---\n\
+             [leere Extraktion — Dokument enthält keinen Lauftext]"
+        )
+    } else if total_bytes > READ_DOCX_MAX_OUTPUT_BYTES {
+        let truncated: String = extracted
+            .chars()
+            .take(READ_DOCX_MAX_OUTPUT_BYTES / 4)
+            .collect();
+        format!(
+            "--- {fname} ({total_bytes} Bytes, gekürzt) ---\n{truncated}\n\
+             \n[gekürzt — Extraktion überschreitet {} KB]",
+            READ_DOCX_MAX_OUTPUT_BYTES / 1024
+        )
+    } else {
+        format!("--- {fname} ({total_bytes} Bytes) ---\n{extracted}")
+    };
+    Ok(body)
+}
+
 /// Read-Tools ohne Seiteneffekt (kein HITL nötig).
 pub async fn execute_read_tool(
     state: &AppState,
@@ -524,6 +624,7 @@ pub async fn execute_read_tool(
         }
         GREP_TOOL => grep_in_files(state, wid, input).await,
         READ_PDF_TOOL => read_pdf(state, wid, input).await,
+        READ_DOCX_TOOL => read_docx(state, wid, input).await,
         other => Err(ApiError::BadRequest(format!("Unbekanntes Tool: {other}"))),
     }
 }
@@ -1409,27 +1510,77 @@ fn read_docx_doc_opt(
     Ok(Some((bytes, s)))
 }
 
-/// Sichtbarer Text aus document.xml (für die Tail-Vorschau).
-fn docx_text(doc: &str) -> String {
-    let mut out = String::new();
-    let mut rest = doc;
-    while let Some(start) = rest.find("<w:t") {
-        let after = &rest[start..];
-        let Some(gt) = after.find('>') else { break };
-        let body = &after[gt + 1..];
-        let Some(end) = body.find("</w:t>") else {
-            break;
-        };
-        out.push_str(
-            &body[..end]
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&amp;", "&"),
-        );
-        out.push(' ');
-        rest = &body[end + 6..];
+/// Extrahiert den Lauftext aus dem `word/document.xml`-String eines DOCX:
+/// sammelt `<w:t>`-Inhalte, setzt `<w:br/>` als `\n` und `<w:p>`-Ende als
+/// `\n\n`, kollabiert dreifache+ Newlines. Aus Local portiert (Phase 6b-2j);
+/// ersetzt den naiven `<w:t>`-Find-Helfer. Gemeinsam genutzt von
+/// `read_docx` und der HITL-Tail-Vorschau bei `append_to_docx` — eine
+/// Wahrheit, kein Drift.
+fn extract_docx_text_from_xml(doc: &str) -> ApiResult<String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    fn local_name(qname: &[u8]) -> &[u8] {
+        qname
+            .iter()
+            .position(|&b| b == b':')
+            .map(|i| &qname[i + 1..])
+            .unwrap_or(qname)
     }
-    out
+
+    let mut reader = Reader::from_str(doc);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut out = String::new();
+    let mut in_text = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"t" => {
+                in_text = true;
+            }
+            Ok(Event::Text(e)) if in_text => {
+                out.push_str(&e.unescape().unwrap_or_default());
+            }
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"t" => {
+                in_text = false;
+            }
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"br" => {
+                out.push('\n');
+            }
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"p" => {
+                out.push_str("\n\n");
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(ApiError::BadRequest(format!(
+                    "DOCX-XML konnte nicht gelesen werden: {e}"
+                )));
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    // Drei-oder-mehr-Newlines auf zwei kollabieren (sonst entstehen
+    // große Lücken zwischen leeren Absätzen).
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    Ok(out)
+}
+
+/// Lauftext direkt aus DOCX-Bytes: ZIP entpacken, `word/document.xml`
+/// laden, in `extract_docx_text_from_xml` reinwerfen. Eintragspunkt für
+/// `read_docx`.
+fn extract_docx_text(bytes: &[u8]) -> ApiResult<String> {
+    use std::io::Read;
+    let mut zin = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| ApiError::BadRequest(format!("Keine gültige .docx: {e}")))?;
+    let mut xml = String::new();
+    zin.by_name("word/document.xml")
+        .map_err(|_| ApiError::BadRequest("Datei ohne word/document.xml.".into()))?
+        .read_to_string(&mut xml)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+    extract_docx_text_from_xml(&xml)
 }
 
 fn appenddocx_preview(
@@ -1440,8 +1591,11 @@ fn appenddocx_preview(
 ) -> ApiResult<Value> {
     let fname = sanitize_filename(filename)?;
     let existing = read_docx_doc_opt(state, wid, &fname)?;
+    // Fallback auf leeres Tail bei Parser-Fehler — die HITL-Vorschau soll
+    // nicht an einer kaputten Bestands-Datei scheitern; das eigentliche
+    // Schreiben in `do_append_docx` läuft auf den Roh-Bytes weiter.
     let tail = existing.as_ref().map(|(_, d)| {
-        let t = docx_text(d);
+        let t = extract_docx_text_from_xml(d).unwrap_or_default();
         let start = t.len().saturating_sub(400);
         t[start..].to_string()
     });
@@ -1675,5 +1829,34 @@ mod pdf_fixture_tests {
         let text =
             pdf_extract::extract_text_from_mem(&bytes).expect("hand-gebauter PDF muss parsen");
         assert!(text.contains("ProcessFox PDF Test"), "extrahiert: {text:?}");
+    }
+}
+
+#[cfg(test)]
+mod docx_fixture_tests {
+    //! DB-freier Roundtrip: das eigene `build_docx` baut ein .docx → der
+    //! neue `extract_docx_text` liest es. Hält Schreib- und Lese-Pfad
+    //! aufeinander geeicht, ohne dass Postgres läuft.
+
+    use super::{build_docx, extract_docx_text};
+
+    #[test]
+    fn roundtrips_paragraph_text() {
+        let paras = vec!["Hallo Welt".to_string(), "Zweite Zeile".to_string()];
+        let bytes = build_docx(&paras).expect("build_docx muss gelingen");
+        let text = extract_docx_text(&bytes).expect("extract_docx_text muss gelingen");
+        assert!(text.contains("Hallo Welt"), "fehlt: {text:?}");
+        assert!(text.contains("Zweite Zeile"), "fehlt: {text:?}");
+        // Absätze werden durch Leerzeile getrennt.
+        assert!(text.contains("\n\n"), "keine Paragraph-Trennung: {text:?}");
+    }
+
+    #[test]
+    fn rejects_non_zip_input() {
+        let err = extract_docx_text(b"definitiv kein DOCX").unwrap_err();
+        assert!(
+            matches!(err, crate::error::ApiError::BadRequest(_)),
+            "kein-ZIP muss BadRequest werden: {err:?}"
+        );
     }
 }
