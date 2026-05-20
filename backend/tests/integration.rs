@@ -742,6 +742,238 @@ async fn grep_rejects_invalid_regex(pool: PgPool) {
     );
 }
 
+// --- Tests: read_pdf (Phase 6b-2i) ----------------------------------------
+
+/// Baut eine minimale, gültige PDF-1.4-Datei mit genau einem Text-Run
+/// (Helvetica, eine der 14 Standardschriften — `pdf-extract` braucht kein
+/// eingebettetes Fontfile). Wird zur Laufzeit zusammengesetzt, damit wir
+/// keine Binär-Fixture im Repo brauchen. xref-Offsets werden mitgezählt
+/// und stimmen daher per Konstruktion.
+fn make_minimal_pdf(text: &str) -> Vec<u8> {
+    // Content-Stream: PDF-Operatoren BT/ET umschließen Text; Td positioniert,
+    // Tj zeichnet. `(text)` ist die Literal-String-Syntax in PDF.
+    let stream = format!("BT /F1 24 Tf 72 720 Td ({text}) Tj ET\n");
+    let stream_bytes = stream.as_bytes();
+    let mut out = Vec::<u8>::new();
+    let mut offsets = [0usize; 6]; // 0 = freie Liste, 1..=5 = Objekte
+    out.extend_from_slice(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n");
+    offsets[1] = out.len();
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets[2] = out.len();
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets[3] = out.len();
+    out.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+    );
+    offsets[4] = out.len();
+    out.extend_from_slice(
+        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    );
+    offsets[5] = out.len();
+    let header = format!("5 0 obj\n<< /Length {} >>\nstream\n", stream_bytes.len());
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(stream_bytes);
+    out.extend_from_slice(b"endstream\nendobj\n");
+    let xref_offset = out.len();
+    out.extend_from_slice(b"xref\n0 6\n");
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for off in offsets.iter().skip(1) {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_pdf_extracts_text_with_header(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_PDF_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    let bytes = make_minimal_pdf("ProcessFox PDF Test");
+    seed_file(&pool, &root, ws, user, "report.pdf", &bytes).await;
+
+    let out = execute_read_tool(
+        &state,
+        ws,
+        READ_PDF_TOOL,
+        &json!({ "filename": "report.pdf" }),
+    )
+    .await
+    .unwrap();
+
+    assert!(out.starts_with("--- report.pdf ("), "{out}");
+    assert!(
+        out.contains("ProcessFox PDF Test"),
+        "Text nicht extrahiert: {out}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_pdf_rejects_non_pdf_extension(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_PDF_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, _root) = tool_state(pool.clone());
+
+    let err = execute_read_tool(
+        &state,
+        ws,
+        READ_PDF_TOOL,
+        &json!({ "filename": "notes.txt" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, processfox_web::error::ApiError::BadRequest(_)),
+        "falsche Endung muss 400 werden: {err:?}"
+    );
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_pdf_missing_file_is_friendly(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_PDF_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, _root) = tool_state(pool.clone());
+
+    // Kein Seed → DB-Zeile fehlt → freundlicher Text statt 500.
+    let out = execute_read_tool(
+        &state,
+        ws,
+        READ_PDF_TOOL,
+        &json!({ "filename": "missing.pdf" }),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("nicht gefunden"), "{out}");
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_pdf_does_not_leak_across_workspaces(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_PDF_TOOL};
+
+    let org_a = seed_org(&pool, "Acme", "AAAA23").await;
+    let user_a = seed_user(&pool, org_a, "a@acme.test", "owner").await;
+    let ws_a = seed_workspace(&pool, org_a, "A").await;
+
+    let org_b = seed_org(&pool, "Globex", "BBBB23").await;
+    seed_user(&pool, org_b, "b@globex.test", "owner").await;
+    let ws_b = seed_workspace(&pool, org_b, "B").await;
+
+    let (state, root) = tool_state(pool.clone());
+    let bytes = make_minimal_pdf("Acme Secret Memo");
+    seed_file(&pool, &root, ws_a, user_a, "secret.pdf", &bytes).await;
+
+    // ws_b kennt die Datei nicht (gleicher Volumes-Root, aber andere
+    // workspace_id → DB-Lookup leer).
+    let probe = execute_read_tool(
+        &state,
+        ws_b,
+        READ_PDF_TOOL,
+        &json!({ "filename": "secret.pdf" }),
+    )
+    .await
+    .unwrap();
+    assert!(probe.contains("nicht gefunden"), "{probe}");
+    assert!(!probe.contains("Acme Secret Memo"), "{probe}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_pdf_input_cap_rejects_huge_files(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_PDF_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    // DB-Zeile mit über 20 MiB. Volume bleibt leer — der Cap-Check feuert
+    // vor dem Lesen.
+    let key = format!("workspaces/{ws}/huge.pdf");
+    sqlx::query(
+        "INSERT INTO workspace_files \
+         (workspace_id, filename, s3_key, size_bytes, content_type, uploaded_by) \
+         VALUES ($1, 'huge.pdf', $2, $3, 'application/pdf', $4)",
+    )
+    .bind(ws)
+    .bind(&key)
+    .bind(30_i64 * 1024 * 1024)
+    .bind(user)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = execute_read_tool(
+        &state,
+        ws,
+        READ_PDF_TOOL,
+        &json!({ "filename": "huge.pdf" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, processfox_web::error::ApiError::BadRequest(_)),
+        "über dem Cap muss 400 werden: {err:?}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[sqlx::test(migrations = "./src/db/migrations")]
+async fn read_pdf_broken_bytes_yield_friendly_result(pool: PgPool) {
+    use processfox_web::tools::{execute_read_tool, READ_PDF_TOOL};
+
+    let org = seed_org(&pool, "Acme", "ABCD23").await;
+    let user = seed_user(&pool, org, "owner@acme.test", "owner").await;
+    let ws = seed_workspace(&pool, org, "Projekt").await;
+    let (state, root) = tool_state(pool.clone());
+
+    // Nicht-PDF-Bytes mit `.pdf`-Endung — `pdf-extract` schlägt fehl,
+    // aber der Tool-Loop bekommt eine freundliche Meldung statt 500.
+    seed_file(
+        &pool,
+        &root,
+        ws,
+        user,
+        "broken.pdf",
+        b"definitiv kein PDF\n",
+    )
+    .await;
+
+    let out = execute_read_tool(
+        &state,
+        ws,
+        READ_PDF_TOOL,
+        &json!({ "filename": "broken.pdf" }),
+    )
+    .await
+    .unwrap();
+    // Beide Wege zulässig: extract liefert leeren String → „leere
+    // Extraktion …" oder einen Parse-Fehler → „PDF konnte nicht gelesen
+    // werden …".
+    assert!(
+        out.contains("leere Extraktion") || out.contains("konnte nicht gelesen werden"),
+        "kaputtes PDF muss freundlich beendet werden: {out}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[sqlx::test(migrations = "./src/db/migrations")]
 async fn grep_caps_hits_at_one_hundred(pool: PgPool) {
     use processfox_web::tools::{execute_read_tool, GREP_TOOL};

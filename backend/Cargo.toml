@@ -66,6 +66,10 @@ rust_xlsxwriter = "0.79"
 # Workspace-Volltextsuche (Phase 6b-2h, grep_in_files)
 regex = "1"
 
+# PDF-Text-Extraktion (Phase 6b-2i, read_pdf). Pure Rust, läuft im
+# `spawn_blocking`-Pool — siehe `tools::read_pdf` und CLAUDE.md §11.
+pdf-extract = "0.7"
+
 [dev-dependencies]
 # HTTP/DB-Integrationstests (Härtung): Axum-Handler via `tower::oneshot`
 # gegen eine pro Test frische Postgres-DB (`#[sqlx::test]`).

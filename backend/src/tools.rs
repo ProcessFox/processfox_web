@@ -26,6 +26,7 @@ pub const UPDATE_CELLS_TOOL: &str = "update_cells";
 pub const DELEGATE_TOOL: &str = "delegate_into_xlsx_column";
 pub const ASK_TOOL: &str = "ask_user";
 pub const GREP_TOOL: &str = "grep_in_files";
+pub const READ_PDF_TOOL: &str = "read_pdf";
 /// Sicherheits-Obergrenze für Bulk-Delegation (eine Inferenz je Zeile).
 pub const DELEGATE_MAX_ROWS: usize = 200;
 
@@ -34,6 +35,13 @@ const GREP_MAX_FILES: usize = 300;
 const GREP_MAX_FILE_BYTES: i64 = 2 * 1024 * 1024;
 const GREP_MAX_HITS: usize = 100;
 const GREP_SNIPPET_CHARS: usize = 200;
+
+/// Caps für `read_pdf`. Eingabe: tighter als das Upload-Limit (50 MiB),
+/// weil Parsen einer großen PDF einen Worker-Thread sekundenlang belegen
+/// kann — Multi-Tenant-Schutz, den Local nicht brauchte. Ausgabe: analog
+/// Local (200 KiB Plain-Text).
+const READ_PDF_MAX_INPUT_BYTES: i64 = 20 * 1024 * 1024;
+const READ_PDF_MAX_OUTPUT_BYTES: usize = 200 * 1024;
 /// Whitelist textbasierter Endungen — Office-Formate (pdf/docx/xlsx/pptx)
 /// und Bilder werden bewusst ausgeschlossen.
 const GREP_SCAN_EXTENSIONS: &[&str] = &[
@@ -78,6 +86,24 @@ fn all_tools() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["pattern"]
+            }),
+        },
+        ToolSpec {
+            name: READ_PDF_TOOL,
+            description: "Extrahiert den Text aus einer PDF-Datei im \
+                Workspace. Liefert Klartext (max. ~200 KB, danach \
+                gekürzt). Funktioniert für digitale PDFs; gescannte \
+                PDFs ohne OCR-Layer liefern leeren oder unbrauchbaren \
+                Text. Eingabe max. 20 MB.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Workspace-Datei, muss auf .pdf enden."
+                    }
+                },
+                "required": ["filename"]
             }),
         },
         ToolSpec {
@@ -256,10 +282,10 @@ pub fn skills_json() -> Value {
         "title": "Dateien",
         "description": "Workspace-Dateien lesen und (mit Freigabe) ergänzen.",
         "icon": "Folder",
-        "tools": ["list_files", "read_file", GREP_TOOL, WRITE_TOOL,
-                  WRITE_XLSX_TOOL, WRITE_DOCX_TOOL, WRITE_DOCX_TPL_TOOL,
-                  APPEND_DOCX_TOOL, UPDATE_CELLS_TOOL, DELEGATE_TOOL,
-                  ASK_TOOL],
+        "tools": ["list_files", "read_file", GREP_TOOL, READ_PDF_TOOL,
+                  WRITE_TOOL, WRITE_XLSX_TOOL, WRITE_DOCX_TOOL,
+                  WRITE_DOCX_TPL_TOOL, APPEND_DOCX_TOOL, UPDATE_CELLS_TOOL,
+                  DELEGATE_TOOL, ASK_TOOL],
         "hitl": { "default": true },
         "language": "de",
         "body": "",
@@ -393,6 +419,93 @@ async fn grep_in_files(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<
     Ok(body)
 }
 
+/// PDF-Text-Extraktion (Phase 6b-2i). `pdf-extract` ist CPU-gebunden und
+/// läuft daher auf dem Blocking-Pool — schmal abgegrenzte Ausnahme zur
+/// CLAUDE.md-§11-Regel, die für den LLM-Pfad gemünzt ist.
+async fn read_pdf(state: &AppState, wid: Uuid, input: &Value) -> ApiResult<String> {
+    let filename = input
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("filename fehlt".into()))?;
+    let fname = sanitize_filename(filename)?;
+    if !fname.to_lowercase().ends_with(".pdf") {
+        return Err(ApiError::BadRequest(
+            "Dateiname muss auf .pdf enden.".into(),
+        ));
+    }
+
+    // DB-Vorabcheck: Existenz + Größe. „DB ist Wahrheit, Volume ist Bytes" —
+    // wenn die Zeile fehlt, ist die Datei für den Workspace nicht sichtbar,
+    // egal was im Volume liegt.
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT size_bytes FROM workspace_files \
+         WHERE workspace_id = $1 AND filename = $2",
+    )
+    .bind(wid)
+    .bind(&fname)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    let Some((size_bytes,)) = row else {
+        return Ok(format!("(Datei '{fname}' nicht gefunden)"));
+    };
+    if size_bytes > READ_PDF_MAX_INPUT_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "PDF zu groß ({size_bytes} Bytes, Limit {} MB).",
+            READ_PDF_MAX_INPUT_BYTES / (1024 * 1024)
+        )));
+    }
+
+    let key = workspace_key(wid, &fname);
+    ensure_in_workspace(wid, &key)?;
+    let path = state.storage.path(&key);
+    if !path.is_file() {
+        return Ok(format!("(Datei '{fname}' nicht gefunden)"));
+    }
+
+    // `pdf-extract` ist CPU-gebunden → Blocking-Pool, damit ein langes
+    // PDF nicht den Async-Reaktor (und damit andere Nutzer) blockiert.
+    let path_for_blocking = path.clone();
+    let extract_join =
+        tokio::task::spawn_blocking(move || pdf_extract::extract_text(&path_for_blocking)).await;
+
+    let extracted = match extract_join {
+        Ok(Ok(text)) => text,
+        // Beide Fehler-Fälle (Panic im Blocking-Task; pdf-extract-Fehler)
+        // werden zu einem freundlichen Tool-Result, damit ein kaputtes
+        // PDF nicht den Chat-Turn abreißt.
+        Ok(Err(e)) => {
+            return Ok(format!("PDF konnte nicht gelesen werden ('{fname}'): {e}"));
+        }
+        Err(e) => {
+            return Ok(format!("PDF-Extraktion abgebrochen ('{fname}'): {e}"));
+        }
+    };
+
+    let total_bytes = extracted.len();
+    let body = if extracted.trim().is_empty() {
+        format!(
+            "--- {fname} ({total_bytes} Bytes) ---\n\
+             [leere Extraktion — vermutlich gescanntes PDF ohne OCR]"
+        )
+    } else if total_bytes > READ_PDF_MAX_OUTPUT_BYTES {
+        // Char-basiert kürzen, damit wir nicht mitten in einem
+        // Multi-Byte-Codepoint abschneiden.
+        let truncated: String = extracted
+            .chars()
+            .take(READ_PDF_MAX_OUTPUT_BYTES / 4)
+            .collect();
+        format!(
+            "--- {fname} ({total_bytes} Bytes, gekürzt) ---\n{truncated}\n\
+             \n[gekürzt — Extraktion überschreitet {} KB]",
+            READ_PDF_MAX_OUTPUT_BYTES / 1024
+        )
+    } else {
+        format!("--- {fname} ({total_bytes} Bytes) ---\n{extracted}")
+    };
+    Ok(body)
+}
+
 /// Read-Tools ohne Seiteneffekt (kein HITL nötig).
 pub async fn execute_read_tool(
     state: &AppState,
@@ -410,6 +523,7 @@ pub async fn execute_read_tool(
             read_file(state, wid, fname)
         }
         GREP_TOOL => grep_in_files(state, wid, input).await,
+        READ_PDF_TOOL => read_pdf(state, wid, input).await,
         other => Err(ApiError::BadRequest(format!("Unbekanntes Tool: {other}"))),
     }
 }
@@ -1509,5 +1623,57 @@ pub async fn execute_write(
         }
         UPDATE_CELLS_TOOL => do_update_cells(state, wid, uploaded_by, input).await,
         other => Err(ApiError::BadRequest(format!("Kein Write-Tool: {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod pdf_fixture_tests {
+    //! Roundtrip-Smoketest für die hand-gebaute Mini-PDF, die in den
+    //! Integrationstests (`tests/integration.rs::make_minimal_pdf`) erzeugt
+    //! wird. Hält die Konstruktion ohne Postgres ehrlich.
+
+    fn minimal_pdf(text: &str) -> Vec<u8> {
+        let stream = format!("BT /F1 24 Tf 72 720 Td ({text}) Tj ET\n");
+        let stream_bytes = stream.as_bytes();
+        let mut out = Vec::<u8>::new();
+        let mut offsets = [0usize; 6];
+        out.extend_from_slice(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n");
+        offsets[1] = out.len();
+        out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets[2] = out.len();
+        out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offsets[3] = out.len();
+        out.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+        );
+        offsets[4] = out.len();
+        out.extend_from_slice(
+            b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+        offsets[5] = out.len();
+        let header = format!("5 0 obj\n<< /Length {} >>\nstream\n", stream_bytes.len());
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(stream_bytes);
+        out.extend_from_slice(b"endstream\nendobj\n");
+        let xref_offset = out.len();
+        out.extend_from_slice(b"xref\n0 6\n");
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets.iter().skip(1) {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn extract_roundtrips_known_text() {
+        let bytes = minimal_pdf("ProcessFox PDF Test");
+        let text =
+            pdf_extract::extract_text_from_mem(&bytes).expect("hand-gebauter PDF muss parsen");
+        assert!(text.contains("ProcessFox PDF Test"), "extrahiert: {text:?}");
     }
 }

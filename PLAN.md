@@ -440,6 +440,147 @@ respektiert die Caps (300 Dateien, 2 MiB pro Datei, 100 Hits, Whitelist)
 und ist read-only. CLAUDE.md §1a um „grep_in_files" im Tool-Inventar
 ergänzen.
 
+## Phase 6b-2i — read_pdf (PDF-Text-Extraktion) ✅ ABGESCHLOSSEN (2026-05-20)
+
+**Ergebnis:** Tool registriert (`backend/src/tools.rs`,
+`READ_PDF_TOOL = "read_pdf"`), Eintrag im `files`-Skill (`skills_json()`),
+Dispatch in `execute_read_tool` ohne HITL/Broadcast. Lesepfad:
+`sanitize_filename` + `.pdf`-Endung erzwingen → DB-Vorabcheck auf
+`workspace_files` (Existenz + 20-MiB-Cap **vor** dem Parsen) →
+`ensure_in_workspace` (Defense-in-Depth) → `pdf_extract::extract_text`
+in `tokio::task::spawn_blocking` (schmal abgegrenzte §11-Ausnahme,
+CLAUDE.md §11 entsprechend ergänzt). Output analog Local:
+`--- filename (N Bytes) ---`-Header, 200-KiB-Truncation, expliziter
+Hinweis bei leerer Extraktion. Kaputte PDFs werden zu einer freundlichen
+Tool-Result-Meldung, **nicht** zu einem 500er — Stabilität für den
+Chat-Loop. `pdf-extract = "0.7"` als neue Dependency (pure Rust, keine
+native Lib → keine Dockerfile-Änderung).
+
+Tests: 6 Integrationstests in `backend/tests/integration.rs`
+(Happy-Path mit hand-gebauter Mini-PDF + bekanntem Text, falsche Endung
+→ 400, fehlende Datei → freundliche Meldung, Cross-Workspace-No-Leak,
+20-MiB-Cap, kaputte Bytes → freundliche Meldung) plus ein
+DB-unabhängiger Unit-Test `tools::pdf_fixture_tests::
+extract_roundtrips_known_text`, der die Fixture-Konstruktion (PDF mit
+berechneten xref-Offsets, Helvetica als Standard-Font) gegen
+`pdf-extract` round-trippt. Gates grün: `cargo fmt --check`,
+`cargo clippy --all-targets -D warnings`, `cargo test --lib` (9 Tests),
+`cargo test --no-run` (Integration kompiliert), `npm run build`.
+Doku-Patches: CLAUDE.md §1a-Header + Backend-Bullet + §11
+(`spawn_blocking`-Klarstellung), DEPLOY.md §8 (neue Grenzen).
+
+Ziel: Read-only-Tool, mit dem ein Agent den Text einer hochgeladenen
+PDF (`*.pdf` im Workspace) extrahiert. Pendant zu `read_pdf` aus
+ProcessFox Local (`processfox_local/src-tauri/src/core/tool/tools/
+read_pdf.rs`). Bisheriger Web-Stand: `.pdf` ist als Upload-Format
+zugelassen (`routes/files.rs:41`), das Frontend-Icon
+(`src/lib/toolIcons.ts:22`) ist da — aber das Tool selbst fehlt.
+
+**Aufruf-Vertrag (Tool-Input):**
+- `filename: string` — Workspace-Datei, muss auf `.pdf` enden.
+
+Bewusst **kein** `path` (Web-Workspace ist flach, `sanitize_filename`
+strippt Verzeichnisse). Bewusst **kein** `pageRange` in v1 — Local hat es
+auch nicht; Truncation am Ende fängt zu lange Dokumente sauber ab.
+
+**Dependency:** `pdf-extract = "0.7"` in `backend/Cargo.toml` (pure
+Rust, keine native Lib — fügt sich ins schmale `debian:bookworm-slim`-
+Runtime-Image ohne weitere Pakete).
+
+**Implementierung in `backend/src/tools.rs`:**
+
+1. Konstante `READ_PDF_TOOL: &str = "read_pdf"`.
+2. Caps: `READ_PDF_MAX_INPUT_BYTES: i64 = 20 * 1024 * 1024` (20 MiB —
+   Schutz vor pathologischen Parsen; Upload-Limit ist 50 MiB, hier
+   tighter), `READ_PDF_MAX_OUTPUT_BYTES: usize = 200 * 1024` (analog
+   Local).
+3. `ToolSpec` in `all_tools()` direkt nach dem `grep_in_files`-Eintrag:
+   Beschreibung nennt Limits und den Hinweis, dass gescannte PDFs ohne
+   OCR-Layer leer zurückkommen können (der Agent muss das verstehen).
+4. `skills_json()` `tools`-Array um `"read_pdf"` erweitern.
+5. Funktion `async fn read_pdf(state, wid, input) -> ApiResult<String>`:
+   - `filename` extrahieren → `sanitize_filename` → muss auf `.pdf`
+     enden (lower-case-Vergleich), sonst `400 BadRequest`.
+   - **Größen-Vorab-Prüfung aus der DB:**
+     `SELECT size_bytes FROM workspace_files WHERE workspace_id = $1
+     AND filename = $2` → wenn `> READ_PDF_MAX_INPUT_BYTES` →
+     `400 BadRequest` mit lesbarer Meldung. „DB ist Wahrheit, Volume
+     ist Bytes" — Sichtbarkeit/Existenz kommt aus der DB, nicht aus
+     `std::fs::metadata`.
+   - `workspace_key` + `ensure_in_workspace` (Defense-in-Depth).
+   - Existenz auf dem Volume prüfen (`path.is_file()`); wenn nicht →
+     freundliche Meldung „(Datei nicht gefunden)" (gleicher Stil wie
+     `read_file`), **nicht** als Fehler, damit das LLM elegant
+     fortsetzen kann.
+   - **CPU-Bound auf den Blocking-Pool:**
+     `tokio::task::spawn_blocking(move || pdf_extract::extract_text(&path))`.
+     Begründete Ausnahme zu CLAUDE.md §11 („kein `spawn_blocking` nötig"
+     — das galt für den LLM-Pfad; PDF-Parsing blockiert sonst den
+     Tokio-Runtime). §11 in einem zweiten Patch um eine Klarstellung
+     ergänzen.
+   - Fehler aus `pdf-extract` → freundlicher String (kein 500), damit
+     ein kaputtes PDF den ganzen Chat-Turn nicht abreißt; Form analog
+     Local (`"PDF konnte nicht gelesen werden: …"`).
+   - Output-Form analog Local:
+     - Header: `--- {filename} ({total_bytes} Bytes) ---`.
+     - Bei `extracted.trim().is_empty()`: Header + Hinweis „leere
+       Extraktion — vermutlich gescanntes PDF ohne OCR".
+     - Bei `total_bytes > 200 KiB`: erste ~50 000 Zeichen + Footer
+       `[gekürzt — Extraktion überschreitet 200 KB]`.
+     - Sonst: Header + Volltext.
+6. Dispatcher-Arm in `execute_read_tool` für `READ_PDF_TOOL` — kein
+   HITL, kein Broadcast.
+
+**Sandbox & Sicherheit:**
+- `sanitize_filename` strippt Pfad-Trennzeichen + `..`.
+- `ensure_in_workspace` über den Storage-Key.
+- 20-MiB-Input-Cap **vor** dem Parse: schützt gegen DoS durch sehr
+  große PDFs (Single-Tenant-Local hatte das Problem nicht; Multi-Tenant-
+  Web schon).
+- `spawn_blocking` isoliert CPU-Last vom Async-Reaktor; eine teure PDF
+  blockiert nicht die WS- und HTTP-Antworten der anderen Nutzer.
+
+**Frontend:**
+- `src/lib/toolIcons.ts:22` (`read_pdf: FileType`) ist schon da.
+- Keine neuen WS-Channels, läuft im bestehenden Tool-Stream.
+
+**Tests (`backend/tests/integration.rs`, analog `grep_in_files`):**
+- **Happy-Path:** Mini-PDF (Bytes via `include_bytes!("fixtures/
+  hello.pdf")` — die Fixture enthält einen bekannten String wie
+  „ProcessFox PDF Test"), in einen Workspace seedet, `read_pdf`
+  liefert den String + den `---`-Header.
+- **Falsche Endung:** `filename: "notes.txt"` → `400 BadRequest`.
+- **Nicht vorhandene Datei:** `filename: "missing.pdf"` →
+  Treffer „Datei nicht gefunden" (kein Fehler, da das LLM gracefully
+  fortsetzen können soll).
+- **Cross-Workspace-No-Leak:** PDF in `ws_a`, Abfrage aus `ws_b` →
+  „Datei nicht gefunden", keine Bytes geleakt.
+- **Größen-Cap:** `workspace_files`-Zeile mit `size_bytes = 30 *
+  1024 * 1024` (Volume-Bytes leer; der Cap-Check feuert vor dem
+  Lesen) → `400 BadRequest` mit Größen-Hinweis.
+- **Leere Extraktion / kaputtes PDF:** Bytes „nicht-PDF" hochladen →
+  Tool liefert eine **freundliche** Meldung („PDF konnte nicht
+  gelesen werden: …" oder „leere Extraktion …"), **kein** `unwrap_err()`
+  (Stabilität für den Chat-Loop).
+
+**Doku-Patches:**
+- `CLAUDE.md` §11 um eine knappe Klarstellung ergänzen: „`spawn_blocking`
+  nur dort, wo CPU-gebunden — z. B. `read_pdf`".
+- `CLAUDE.md` §1a-Backend-Bullet um `read_pdf` anhängen.
+- `DEPLOY.md` §8 (bekannte Grenzen) um „PDFs > 20 MiB werden für
+  `read_pdf` abgelehnt; gescannte PDFs ohne OCR liefern leeren Text"
+  ergänzen.
+
+**Build-Gates:** `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test --all-targets`, `npm run build`.
+
+**Abnahme:** Agent mit `files`-Skill kann ein im Workspace liegendes
+PDF per `read_pdf` lesen, bekommt den Text mit Header/Truncation-/
+Empty-Hinweis zurück, scannt nichts außerhalb des Workspaces,
+respektiert den 20-MiB-Input- und 200-KiB-Output-Cap, blockiert den
+Tokio-Runtime nicht und bleibt bei kaputten PDFs stabil (freundlicher
+Tool-Result statt 500).
+
 ## Querschnitt — Härtung ✅ ABGESCHLOSSEN (2026-05-19)
 
 - HTTP/DB-Integrationstests `backend/tests/integration.rs`: echte Axum-

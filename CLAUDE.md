@@ -27,7 +27,7 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
 
 ---
 
-## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + `grep_in_files`)
+## 1a. Ist-Stand (Stand: 2026-05-20 — Phase 6 + `grep_in_files` + `read_pdf`)
 
 > **Wichtig:** Der Rest dieses Dokuments (§2–§16) beschreibt Architektur &
 > Konventionen. Dieser Abschnitt beschreibt den **realen Umsetzungsstand**.
@@ -49,7 +49,9 @@ Dieses Dokument richtet sich an Claude Code (und andere LLM-gestützte Codier-As
   (Excel/Word/aus Vorlage/Anhängen/Zell-Edits) und Bulk-Delegation —
   jeweils live für alle Workspace-Mitglieder über die WS. Plus
   `grep_in_files` (read-only Regex-Suche über die Workspace-Textdateien,
-  Caps 300 Dateien/2 MiB/100 Hits, Endungs-Whitelist).
+  Caps 300 Dateien/2 MiB/100 Hits, Endungs-Whitelist) und `read_pdf`
+  (Text-Extraktion aus PDFs via `pdf-extract` auf dem Blocking-Pool,
+  Caps 20 MB Eingabe / 200 KB Ausgabe).
 - **CI/Deploy:** GitHub Actions baut das Multi-Stage-Image → GHCR;
   Coolify zieht das Image (Docker-Image-Resource, kein VPS-Build),
   Postgres + lokales Persistent Volume `/data`, Domain in Coolify.
@@ -387,7 +389,7 @@ Da kein lokales Modell unterstützt wird, vereinfacht sich die Provider-Logik ge
 
 - Rust 2021 Edition, `cargo fmt` + `cargo clippy -- -D warnings` müssen grün sein.
 - **Fehler-Handling:** `thiserror` für Domain-Errors, `anyhow` nur in `main.rs`. Kein `unwrap()` in Production-Code.
-- **Async:** `tokio`. DB-Calls async. Datei-I/O läuft via `std::fs` (kleine Dateien ≤ 50 MB, Single-Instance — bewusst simpel statt `tokio::fs`/Streaming); kein `spawn_blocking` nötig.
+- **Async:** `tokio`. DB-Calls async. Datei-I/O läuft via `std::fs` (kleine Dateien ≤ 50 MB, Single-Instance — bewusst simpel statt `tokio::fs`/Streaming); für I/O selbst kein `spawn_blocking` nötig. Ausnahme: genuin CPU-gebundene Parser/Decoder gehören auf den Blocking-Pool, sonst hängen sie den Tokio-Runtime. Beispiel: `pdf-extract` in `tools::read_pdf` (Phase 6b-2i). Neue CPU-gebundene Tools nach gleichem Muster wrappen.
 - **Serde:** `#[serde(rename_all = "camelCase")]` an der Grenze zum Frontend. Getaggte Enums: zusätzlich `rename_all_fields = "camelCase"` setzen.
 - **sqlx:** **Runtime-Queries** (`sqlx::query`/`query_as` mit `.bind()`) — **keine** `query!`/`query_as!`-Makros, damit das Docker-Image **ohne** DB-Verbindung baubar ist (vgl. §12). Kein ORM.
 - **Module-Layout:** Ein Axum-Router-Modul pro Feature unter `backend/src/routes/`.

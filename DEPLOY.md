@@ -184,6 +184,10 @@ Der Link ist 15 Minuten gültig und einmalig nutzbar.
 - **Grenze Zell-Edits/Delegation:** Schreiben erzeugt das Zielblatt neu;
   Formeln/Formate/weitere Blätter gehen verloren. Delegation max. 200
   Zeilen pro Lauf.
+- **Grenze `read_pdf`:** PDFs > 20 MB werden vor dem Parsen abgelehnt
+  (Multi-Tenant-Schutz, Upload-Limit bleibt 50 MB). Gescannte PDFs
+  ohne OCR-Layer liefern leeren Text — `read_pdf` weist explizit darauf
+  hin. Ausgabe-Cap 200 KB Klartext, danach Truncation-Footer.
 - **Härtung erledigt:** HTTP/DB-Integrationstests (`backend/tests/
   integration.rs`) laufen in CI (`.github/workflows/ci.yml`, Postgres-
   Service) — Auth, Refresh-Rotation, Workspace-Berechtigungen.
